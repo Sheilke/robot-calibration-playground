@@ -9,26 +9,29 @@
 **自动生成利于参数辨识的标定路点（excitation trajectory / informative waypoints）**：根据机器人模型与约束条件，生成使辨识问题条件数更优、参数可辨识性更好的标定路点或激励轨迹。
 
 ## 仓库结构
+
+```
 robot-calibration-playground/
 ├── README.md
 ├── .gitignore
-├── requirements.txt # 当前 Python 全局依赖
-├── docs/ # 文档、笔记、标定理论记录
-│ ├── theory/ # 可辨识性、激励轨迹设计笔记
-│ └── experiments/ # 实验记录、标定结果对比
-├── python/ # 当前阶段：纯 Python 开发
-│ ├── excitation_trajectory/ # 利于辨识的标定路点生成
-│ │ ├── generator.py # 路点生成主逻辑
-│ │ ├── optimizer.py # 可辨识性指标优化
-│ │ └── tests/ # 单元测试
-│ ├── identification/ # 参数辨识相关
-│ ├── robot_model/ # 机器人运动学/动力学模型抽象
-│ └── common/ # 工具函数、配置加载、日志
-├── ros2_ws/ # 预留：未来对接公司 ROS2 项目
-│ └── src/ # 后续放 ament_python / ament_cmake 包
-└── data/ # 配置模板与样本（大文件不入库）
-├── configs/ # 机器人模型参数、激励轨迹参数模板
-└── samples/ # 小样本数据
+├── requirements.txt              # 当前 Python 全局依赖
+├── docs/                         # 文档、笔记、标定理论记录
+│   ├── theory/                   # 可辨识性、激励轨迹设计笔记
+│   └── experiments/              # 实验记录、标定结果对比
+├── python/                       # 当前阶段：纯 Python 开发
+│   ├── excitation_trajectory/    # 利于辨识的标定路点生成
+│   │   ├── generator.py          # 路点生成主逻辑
+│   │   ├── optimizer.py          # 可辨识性指标优化
+│   │   └── tests/                # 单元测试
+│   ├── identification/           # 参数辨识相关
+│   ├── robot_model/              # 机器人运动学/动力学模型抽象
+│   └── common/                   # 工具函数、配置加载、日志
+├── ros2_ws/                      # 预留：未来对接公司 ROS2 项目
+│   └── src/                      # 后续放 ament_python / ament_cmake 包
+└── data/                         # 配置模板与样本（大文件不入库）
+    ├── configs/                  # 机器人模型参数、激励轨迹参数模板
+    └── samples/                  # 小样本数据
+```
 
 ## 模块边界
 
@@ -57,3 +60,4 @@ pip install -r requirements.txt
 实验记录
 
 标定方向中参数设置与实验条件强相关。每次路点生成使用的约束、可辨识性指标（如条件数）、辨识结果记录在 docs/experiments/ 下，按日期或机器人型号组织。
+```
