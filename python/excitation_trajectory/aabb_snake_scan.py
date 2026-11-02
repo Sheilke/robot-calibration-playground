@@ -26,6 +26,16 @@
       ``meta`` 增加 ``perturbed`` 标记（默认 true / --no-perturb false）;
       同 seed 两次运行输出逐字节一致（浮点统一 round 6，无时间戳/随机序）。
 
+迭代 4 —— 姿态可辨识性（条件数）前置校验:
+    * 路点用于最小二乘参数辨识，姿态集需要充分激励才不会让辨识矩阵病态;
+    * 对姿态集做 SVD 求条件数 ``sigma_max / sigma_min``，超过 ``--cond-max``
+      则**重新采样扰动**（可设上限 ``--cond-attempts``），达标后才进入 IK;
+    * 特征构造: 各姿态相对参考姿态的 SO(3) log 映射旋转向量（N x 3，去中心化）;
+      ``--cond-position`` 时再并入位置（与姿态等 RMS 归一化）;
+    * 校验在 IK **之前**：条件数只依赖位姿数据，重采样会作废全部 IK 结果，
+      而解析 IK（8 分支 + 限位过滤 + FK 复验）是流程中最贵的一段;
+    * ``--no-perturb`` / ``--skip-ik`` 下姿态完全相同，条件数退化，不做该校验。
+
 蛇形规则（本项目核心需求）::
 
     自 (X_min, Y_min, Z_min) 起"一格一格走"：任意相邻两路点恰在一个轴
@@ -79,6 +89,8 @@ DEFAULT_Q_SEED = "0,20,-20,0,40,0"                                  # IK 种子�
 DEFAULT_SEED = 0                                                    # 随机种子
 DEFAULT_OUT_JSON = "scan_result.json"
 DEFAULT_OUT_PNG = "scan_path.png"
+DEFAULT_COND_MAX = 5.0            # 姿态条件数阈值（超过则重采样）
+DEFAULT_COND_ATTEMPTS = 20        # 条件数不达标时的最大重新采样次数
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +381,187 @@ def solve_chain(rbt, T_list, q_seed, strict: bool = False) -> list[ChainStep]:
     return steps
 
 
+# --------------------------------------------------------------------------
+# 姿态可辨识性（条件数）校验
+# ---------------------------------------------------------------------------
+def rotation_vector(R: np.ndarray) -> np.ndarray:
+    """旋转矩阵 -> SO(3) log 映射的旋转向量（轴 * 角，rad）。
+
+    对小角度扰动，旋转矩阵的对称部分是二阶小量（O(ω²)），直接展平 9 个元素
+    做 SVD 会被数值噪声主导（实测条件数 10² 量级且无物理意义）；log 映射
+    保留一阶项，得到的是真正反映「三轴激励程度」的 3 维特征。
+
+    Args:
+        R: 3x3 旋转矩阵。
+
+    Returns:
+        旋转向量 [wx, wy, wz]，模长为旋转角（rad）。
+    """
+    R = np.asarray(R, dtype=float)
+    cos_angle = max(-1.0, min(1.0, (float(np.trace(R)) - 1.0) / 2.0))
+    angle = math.acos(cos_angle)
+    skew = np.array([R[2, 1] - R[1, 2],
+                     R[0, 2] - R[2, 0],
+                     R[1, 0] - R[0, 1]], dtype=float)
+    if angle < 1e-10:
+        return 0.5 * skew                       # 小角度: sin(angle) ≈ angle
+    if abs(math.pi - angle) < 1e-6:
+        # 近 180° 时 sin(angle) -> 0，用对称部分取轴
+        sym = (R + np.eye(3)) / 2.0
+        diag = np.sqrt(np.clip(np.diag(sym), 0.0, None))
+        k = int(np.argmax(diag))
+        if diag[k] < 1e-12:
+            return np.zeros(3)
+        axis = sym[:, k] / diag[k]
+        norm = float(np.linalg.norm(axis))
+        if norm < 1e-12:
+            return np.zeros(3)
+        return (axis / norm) * angle
+    return skew / (2.0 * math.sin(angle)) * angle
+
+
+def rotation_vectors(poses, reference: np.ndarray | None = None) -> np.ndarray:
+    """姿态序列 -> N x 3 旋转向量矩阵（相对参考姿态）。
+
+    Args:
+        poses: 4x4 位姿序列（只用旋转部分）。
+        reference: 参考 3x3 旋转；默认取第一个位姿的旋转。
+
+    Returns:
+        N x 3 数组，每行为 ``log(R_i @ R_ref.T)``。
+    """
+    rotations = [np.asarray(T, dtype=float)[:3, :3] for T in poses]
+    if not rotations:
+        return np.zeros((0, 3))
+    ref = rotations[0] if reference is None else np.asarray(reference, dtype=float)
+    return np.array([rotation_vector(R @ ref.T) for R in rotations], dtype=float)
+
+
+def _to_unit_rms(matrix: np.ndarray) -> np.ndarray:
+    """按整体 RMS 归一化，使不同量纲的特征块权重可比。"""
+    rms = float(np.sqrt(np.mean(matrix ** 2)))
+    return matrix / rms if rms > 0.0 else matrix
+
+
+def pose_condition_number(poses, include_position: bool = False) -> dict:
+    """用 SVD 求姿态集（可含位置）的条件数，衡量激励是否充分。
+
+    构造：各姿态相对参考姿态的旋转向量（N x 3）去中心化；
+    ``include_position`` 时把位置（N x 3）去中心化后与姿态**等 RMS** 拼接，
+    避免 mm 与 rad 的量纲差主导奇异值。
+
+    条件数 ``cond = sigma_max / sigma_min``：接近 1 表示三个转动自由度被均匀
+    激励；只绕单轴扰动时 sigma_min -> 0，cond 急剧变大。矩阵秩亏（如全部
+    姿态相同）时返回 ``inf``。
+
+    Args:
+        poses: 4x4 位姿序列。
+        include_position: 是否把位置也计入条件数。
+
+    Returns:
+        dict: ``condition_number`` / ``singular_values`` / ``n_points`` /
+        ``metric`` / ``include_position``。
+    """
+    poses = list(poses)
+    if not poses:
+        return {"condition_number": float("inf"), "singular_values": [],
+                "n_points": 0, "metric": "orientation-rotvec-centered",
+                "include_position": bool(include_position)}
+
+    feat = rotation_vectors(poses)
+    feat = feat - feat.mean(axis=0)                       # 去中心化: 度量离散度
+    if include_position:
+        pos = np.array([np.asarray(T, dtype=float)[:3, 3] for T in poses])
+        pos = pos - pos.mean(axis=0)
+        feat = np.hstack([_to_unit_rms(feat), _to_unit_rms(pos)])
+
+    singular = np.linalg.svd(feat, compute_uv=False)
+    scale = float(singular[0]) if len(singular) else 0.0
+    if scale <= 0.0 or float(singular[-1]) <= scale * 1e-12:
+        cond = float("inf")                              # 秩亏 / 无激励
+    else:
+        cond = float(singular[0] / singular[-1])
+
+    return {"condition_number": cond,
+            "singular_values": [float(v) for v in singular],
+            "n_points": len(poses),
+            "metric": ("orientation+position-equal-rms-centered"
+                       if include_position else "orientation-rotvec-centered"),
+            "include_position": bool(include_position)}
+
+
+def _sample_perturbations(waypoints, seed: int, attempt: int) -> None:
+    """按给定尝试序号采样姿态扰动并回填路点（原地修改）。
+
+    ``attempt == 0`` 时使用 ``default_rng(seed)``，与既有 ``--seed`` 行为逐位
+    一致（保证脚本向后兼容）；后续尝试改用 ``default_rng([seed, attempt])``,
+    使每次重采样互相独立且整体可复现。
+
+    Args:
+        waypoints: Waypoint 列表，回填 ``delta_rpy`` / ``rpy_pert``。
+        seed: 用户随机种子。
+        attempt: 0-based 尝试序号（0 = 首次采样）。
+    """
+    rng = (np.random.default_rng(seed) if attempt == 0
+           else np.random.default_rng([int(seed), int(attempt)]))
+    for wp in waypoints:
+        delta = (rng.uniform(-6.0, 6.0),
+                 rng.uniform(-5.0, 5.0),
+                 rng.uniform(-3.0, 3.0))
+        wp.delta_rpy = delta
+        wp.rpy_pert = tuple(r + d for r, d in zip(wp.rpy_ref, delta))
+
+
+def _check_pose_conditioning(args: argparse.Namespace, waypoints,
+                             build_poses) -> dict:
+    """迭代 4：条件数不达标则重采样姿态扰动（步骤在 IK 之前）。
+
+    Args:
+        args: CLI 参数（``--cond-max`` / ``--cond-attempts`` 等）。
+        waypoints: Waypoint 列表（会被重采样覆盖）。
+        build_poses: 由路点构造位姿序列的可调用对象。
+
+    Returns:
+        dict: 条件数报告（含 ``attempts_used`` / ``accepted``）。
+    """
+    max_attempts = max(1, int(args.cond_attempts))
+    best = None
+    for attempt in range(max_attempts):
+        _sample_perturbations(waypoints, args.seed, attempt)
+        info = pose_condition_number(build_poses(waypoints),
+                                     include_position=args.cond_position)
+        passed = info["condition_number"] <= args.cond_max
+        mark = "通过" if passed else "重采样"
+        print(f"[条件数] 采样 {attempt + 1}/{max_attempts}: "
+              f"cond={info['condition_number']:.3f} "
+              f"(σ={np.array2string(np.array(info['singular_values']), precision=3)})"
+              f" 阈值 {args.cond_max:g} -> {mark}")
+        if best is None or info["condition_number"] < best[1]["condition_number"]:
+            best = (attempt, info)
+        if passed:
+            return {"enabled": True, "metric": info["metric"],
+                    "include_position": info["include_position"],
+                    "threshold": float(args.cond_max),
+                    "attempts_used": attempt + 1, "accepted": True,
+                    "condition_number": info["condition_number"],
+                    "singular_values": info["singular_values"]}
+
+    # 全部尝试均未达标：保留最优结果并显式告警（绝不静默当作通过）
+    attempt, info = best
+    print(f"警告: {max_attempts} 次重采样均未达到条件数阈值 {args.cond_max:g}，"
+          f"采用最优 cond={info['condition_number']:.3f}（第 {attempt + 1} 次采样）")
+    if args.strict:
+        print("错误: strict 模式下姿态条件数不达标，中止")
+        sys.exit(2)
+    _sample_perturbations(waypoints, args.seed, attempt)   # 回填最优采样
+    return {"enabled": True, "metric": info["metric"],
+            "include_position": info["include_position"],
+            "threshold": float(args.cond_max),
+            "attempts_used": max_attempts, "accepted": False,
+            "condition_number": info["condition_number"],
+            "singular_values": info["singular_values"]}
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -377,8 +570,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m excitation_trajectory.aabb_snake_scan",
         description="AABB 网格蛇形寻位路点规划工具（CH2000 六轴焊接机器人）。"
-                    "迭代 3/3 最终形态：路点生成 + 随机姿态扰动（默认模式，"
-                    "--seed 可复现）+ 只对扰动后路点链式 IK 选解；"
+                    "路点生成 + 随机姿态扰动（--seed 可复现）+ 姿态条件数 SVD "
+                    "前置校验（超阈值则重采样）+ 只对扰动后路点链式 IK 选解；"
                     "--no-perturb 开发验证模式用参考姿态直接跑链。")
     parser.add_argument("x_min", type=float, metavar="X_MIN",
                         help="AABB X 下界 (mm)")
@@ -418,6 +611,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "预览图与 JSON")
     parser.add_argument("--intrinsic", action="store_true",
                         help="动轴欧拉角模式（extrinsic=False）")
+    parser.add_argument("--cond-max", type=float, default=DEFAULT_COND_MAX,
+                        help="姿态条件数阈值 σmax/σmin，超过则重新采样扰动，"
+                             f"默认 {DEFAULT_COND_MAX:g}")
+    parser.add_argument("--cond-attempts", type=int,
+                        default=DEFAULT_COND_ATTEMPTS,
+                        help="条件数不达标时的最大重采样次数，"
+                             f"默认 {DEFAULT_COND_ATTEMPTS}")
+    parser.add_argument("--cond-position", action="store_true",
+                        help="条件数同时计入位置（与姿态等 RMS 归一化）")
+    parser.add_argument("--no-cond-check", action="store_true",
+                        help="关闭姿态条件数前置校验（不重采样，仅报告）")
     parser.add_argument("--out", default=DEFAULT_OUT_JSON,
                         help="JSON 输出路径，默认 scan_result.json")
     parser.add_argument("--plot", default=DEFAULT_OUT_PNG,
@@ -435,6 +639,10 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     for name, n in (("xs", args.xs), ("ys", args.ys), ("zs", args.zs)):
         if n < 0:
             parser.error(f"--{name} 份数需 >= 0，当前为 {n}")
+    if args.cond_max < 1.0:
+        parser.error(f"--cond-max 必须 >= 1（条件数定义），当前为 {args.cond_max}")
+    if args.cond_attempts < 1:
+        parser.error(f"--cond-attempts 必须 >= 1，当前为 {args.cond_attempts}")
 
 
 def _fmt_g(value: float) -> str:
@@ -524,24 +732,45 @@ def _run_ik_chain(args: argparse.Namespace,
                                args.z_min, args.z_max,
                                args.xs, args.ys, args.zs, rpy_ref)
 
-    # ---- 3. 姿态扰动采样 + 位姿序列（迭代 3） ----
+    # ---- 3. 姿态扰动采样 + 姿态可辨识性（条件数）前置校验 ----
+    def _poses_of(rpy_getter):
+        """由路点姿态构造位姿序列（extrinsic 由 --intrinsic 控制）。"""
+        return [rbt.pose_to_T(wp.pos, rpy_getter(wp),
+                              extrinsic=not args.intrinsic)
+                for wp in waypoints]
+
+    def _ref_rpy(wp):
+        return wp.rpy_ref
+
+    def _pert_rpy(wp):
+        return wp.rpy_pert
+
+    conditioning = {"enabled": False, "metric": None,
+                    "include_position": bool(args.cond_position),
+                    "threshold": float(args.cond_max), "attempts_used": 0,
+                    "accepted": None, "condition_number": None,
+                    "singular_values": []}
     if args.no_perturb:
         # 开发验证模式：参考姿态直接建位姿跑链（不采样扰动，字段保持 None）
-        poses = [rbt.pose_to_T(wp.pos, wp.rpy_ref, extrinsic=not args.intrinsic)
-                 for wp in waypoints]
+        poses = _poses_of(_ref_rpy)
+        print("[条件数] 跳过: --no-perturb 下姿态全部相同，条件数退化")
+    elif args.no_cond_check:
+        # 关闭校验：仍采样一次并报告条件数，便于人工判断，但不重采样
+        _sample_perturbations(waypoints, args.seed, 0)
+        info = pose_condition_number(_poses_of(_pert_rpy),
+                                     include_position=args.cond_position)
+        print(f"[条件数] 已关闭校验: cond={info['condition_number']:.3f} "
+              f"(σ={np.array2string(np.array(info['singular_values']), precision=3)})")
+        conditioning.update(metric=info["metric"], attempts_used=1,
+                            condition_number=info["condition_number"],
+                            singular_values=info["singular_values"])
+        poses = _poses_of(_pert_rpy)
     else:
-        # 默认模式：逐路点依次独立采样 rx/ry/rz 扰动（顺序与 index 一致，
-        # 同 seed 可复现）；只对扰动后路点求 IK，未扰动位姿不求
-        rng = np.random.default_rng(args.seed)
-        for wp in waypoints:
-            delta = (rng.uniform(-6.0, 6.0),
-                     rng.uniform(-5.0, 5.0),
-                     rng.uniform(-3.0, 3.0))
-            wp.delta_rpy = delta
-            wp.rpy_pert = tuple(r + d for r, d in zip(wp.rpy_ref, delta))
-        poses = [rbt.pose_to_T(wp.pos, wp.rpy_pert,
-                               extrinsic=not args.intrinsic)
-                 for wp in waypoints]
+        # 条件数只依赖位姿，必须先于 IK 校验：不达标就重采样扰动，
+        # 避免把 8 分支解析 IK + 限位过滤 + FK 复验的算力浪费在废数据上。
+        conditioning = _check_pose_conditioning(
+            args, waypoints, lambda _wps: _poses_of(_pert_rpy))
+        poses = _poses_of(_pert_rpy)
 
     # ---- 4. 链式 IK 选解 ----
     chain = solve_chain(rbt, poses, q_seed, strict=args.strict)
@@ -564,6 +793,16 @@ def _run_ik_chain(args: argparse.Namespace,
     print(f"成功 {len(ok_steps)}/{len(chain)}")
     print(f"构型切换次数 {n_switch}")
     print(f"Σ dqL2 = {sum_dq_l2:.2f}")
+    if conditioning["condition_number"] is not None:
+        if conditioning["accepted"] is None:
+            state = "未校验"
+        elif conditioning["accepted"]:
+            state = "通过"
+        else:
+            state = "未达标"
+        print(f"姿态条件数 cond = {conditioning['condition_number']:.3f} "
+              f"(阈值 {conditioning['threshold']:g}, "
+              f"重采样 {conditioning['attempts_used']} 次, {state})")
 
     # ---- 7. 预览图（成功深灰 / 失败红，迭代 1 的 plot_path 复用） ----
     pts = np.array([wp.pos for wp in waypoints], dtype=float)
@@ -596,6 +835,17 @@ def _run_ik_chain(args: argparse.Namespace,
             }
             for wp in waypoints
         ],
+        "conditioning": {
+            "enabled": bool(conditioning["enabled"]),
+            "metric": conditioning["metric"],
+            "include_position": bool(conditioning["include_position"]),
+            "threshold": round(float(conditioning["threshold"]), 6),
+            "attempts_used": int(conditioning["attempts_used"]),
+            "accepted": conditioning["accepted"],
+            "condition_number": (None if conditioning["condition_number"] is None
+                                 else round(float(conditioning["condition_number"]), 6)),
+            "singular_values": _round6(conditioning["singular_values"]),
+        },
         "perturbed_ik": [
             {
                 "index": s.index,

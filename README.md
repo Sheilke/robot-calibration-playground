@@ -79,6 +79,11 @@ pip install -r requirements.txt
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
   800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 --seed 0
 
+# 1b. 姿态可辨识性校验：条件数超阈值即重新采样扰动（默认阈值 5）
+PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
+  800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 \
+  --cond-max 5 --cond-attempts 20
+
 # 2. 仅预览连续蛇形网格，不求解 IK
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
   0 200 0 200 0 200 --xs 2 --ys 2 --zs 2 --skip-ik
@@ -92,6 +97,18 @@ PYTHONPATH=python python -m robot_model.json_to_urdf \
 ```
 
 AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.png`；这两个运行产物已被 `.gitignore` 忽略。JSON 转换器的默认输出是 `data/configs/ch2000_origin.urdf`，但公司内部原始 `Robot_A.json` 始终由调用方显式传入，不会进入仓库。
+
+### 姿态条件数（可辨识性）校验
+
+路点用于最小二乘参数辨识，姿态集必须充分激励三个转动自由度。工具在 **IK 之前**对姿态集做 SVD：
+
+- 特征：各姿态相对参考姿态的 SO(3) log 映射旋转向量（N×3，去中心化）；
+- 条件数 `σmax/σmin` 超过 `--cond-max`（默认 5）则重新采样姿态扰动，最多 `--cond-attempts` 次（默认 20），达标后才进入 IK；
+- `--cond-position` 把位置也计入（与姿态等 RMS 归一化），`--no-cond-check` 只报告不重采样；
+- 全部尝试均未达标时保留最优采样并告警，`--strict` 下以退出码 2 中止；
+- 条件数与采样结果写入 JSON 的 `conditioning` 节，同 `--seed` 可复现。
+
+注意：这里度量的是**位姿集激励**的条件数。若要评估 DH 参数辨识矩阵的条件数（依赖关节角），需在 IK 之后另行计算。
 
 ## 实验记录
 
