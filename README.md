@@ -79,10 +79,15 @@ pip install -r requirements.txt
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
   800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 --seed 0
 
-# 1b. 姿态可辨识性校验：条件数超阈值即重新采样扰动（默认阈值 9）
+# 1b. 姿态激励条件数（一次性设计检查，门禁取设计值，默认阈值 9）
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
   800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 \
-  --cond-max 9 --cond-attempts 20
+  --cond-max 9
+
+# 1c. 自定义三轴扰动半宽（deg）：把最小轴从 3 提高到 10，设计条件数 6.7 -> 2.0
+PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
+  800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 \
+  --perturb-deg 20 15 10 --cond-max 9
 
 # 2. 仅预览连续蛇形网格，不求解 IK
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
@@ -98,18 +103,29 @@ PYTHONPATH=python python -m robot_model.json_to_urdf \
 
 AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.png`；这两个运行产物已被 `.gitignore` 忽略。JSON 转换器的默认输出是 `data/configs/ch2000_origin.urdf`，但公司内部原始 `Robot_A.json` 始终由调用方显式传入，不会进入仓库。
 
-### 姿态条件数（可辨识性）校验
+### 姿态激励条件数（姿态覆盖度诊断）
 
-路点用于最小二乘参数辨识，姿态集必须充分激励三个转动自由度。工具在 **IK 之前**对姿态集做 SVD：
+这是一次性的**设计方案检查**：路点用于最小二乘参数辨识，姿态集必须充分激励三个转动自由度。工具在 **IK 之前**计算两类条件数（`cond(X)=σmax/σmin`，X 为 N×3 激励设计矩阵，`σ` 为奇异值）：
 
-- 特征：各姿态相对参考姿态的 SO(3) log 映射旋转向量（N×3，去中心化）；
-- 条件数 `σmax/σmin` 超过 `--cond-max`（默认 9）则重新采样姿态扰动，最多 `--cond-attempts` 次（默认 20），达标后才进入 IK；
-- 条件数评估的是三轴**相对激励**，由扰动幅度比决定：默认幅度 ±20°/±15°/±3° 的固有条件数约 4.6~8.4，重采样不会改善幅度比；需要更小的条件数时应让三轴幅度更均衡（如 ±20°/±15°/±10° 约 2.1）；
-- `--cond-position` 把位置也计入（与姿态等 RMS 归一化），`--no-cond-check` 只报告不重采样；
-- 全部尝试均未达标时保留最优采样并告警，`--strict` 下以退出码 2 中止；
-- 条件数与采样结果写入 JSON 的 `conditioning` 节，同 `--seed` 可复现。
+- **设计条件数**（`design_condition_number`）：解析值，**与随机种子、采样次数无关**。各路点扰动独立均匀，切空间协方差 `Σ = J·diag(a²/3)·Jᵀ`（J 为旋转向量对 rpy 的雅可比），设计矩阵满足 `XᵀX ≈ N·Σ`，故 `cond(X) = sqrt(λmax(Σ)/λmin(Σ))`。轴对齐姿态下 `J` 正交，因此 `cond ≈ a_max/a_min`；默认幅度 ±20°/±15°/±3° → ≈6.7，均衡 10/10/10 → 1.0，`--perturb-deg 20 15 10` → ≈2.0，`--perturb-deg 20 15 0.5` → 40（会被拒绝）。
+- **实测条件数**（`pose_condition_number`）：对实际采样的姿态集做 SVD，按块报告——姿态块（相对标称参考姿态的 SO(3) log 旋转向量，rad）与位置块（mm），每块给出各自条件数与去中心化后的**绝对 RMS**（用于暴露绝对幅度）。
 
-注意：这里度量的是**位姿集激励**的条件数。若要评估 DH 参数辨识矩阵的条件数（依赖关节角），需在 IK 之后另行计算。
+门禁规则：
+
+- 门禁值 = **姿态块的设计条件数**（与 seed 无关）；`--cond-position` 时与位置块条件数取较大者。实测值是样本估计，只做诊断，不参与门禁（否则同一方案会因 seed 不同时过时不过）；
+- **秩亏例外**：实测姿态块为 `inf`（路点过少 / 姿态完全相同）时，无论设计值多小都直接判 `rejected`，因为设计值描述的是方案、不能代表这批样本真的展开；
+- 超过 `--cond-max`（默认 9）时打印**可执行建议**：
+  `需要 a_min >= a_max/cond_max = 2.22 deg（当前 0.5）；可用 --perturb-deg 调整或提高 --cond-max`，`--strict` 下以退出码 2 中止，否则继续执行；
+- `--no-cond-check` 只报告不门禁（`status="reported_only"`）；`--no-perturb` / `--skip-ik` 下姿态全同、实测度量退化，状态记 `not_run`（设计值仍报告，不打印误导性数字）；
+- **不再**「超阈值就重采样扰动」：重采样不改变三轴幅度比，只在同一分布内挑样本噪声（默认 20/15/3 下大量 seed 的首采样本本来就都低于阈值）。要降低条件数只能改设计参数——提高最小轴幅度（`--perturb-deg`），或放宽 `--cond-max`。
+
+语义换算与单位约定：
+
+- 阈值 9 等价于 `cond(XᵀX) = 81`，即约损失 1 位有效数字；需要 2 位有效数字时应把阈值降到约 3.2；
+- `--cond-position` 附带的合并 6D 条件数经**等 RMS 归一化**，抹掉了绝对幅度信息，**只能作诊断**（JSON 中标注 `metric: "...-equal-rms-combined"`、`combined_is_diagnostic_only: true`），不作为 6D 激励的证明，也不参与门禁；
+- 参考姿态统一取标称 RPY（`--rpy`），消除「参考 = 第一个路点」的顺序依赖（JSON 中 `reference_source: "explicit"`）。
+
+注意：这里度量的是**姿态集激励覆盖度**的条件数，不是 DH 参数辨识回归矩阵的条件数——后者依赖关节角，需在 IK 之后（对成功子集）另行计算。JSON 的 `conditioning` 节给出 `design` / `realized` / `post_ik`（IK 后成功子集，只报告）三段，非有限值一律写 `null`，`--seed` 相同则输出可复现。
 
 ## 实验记录
 
