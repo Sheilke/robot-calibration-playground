@@ -17,7 +17,7 @@
 
 迭代 3 —— 本批次范围（最终形态）:
     * 随机姿态扰动: 默认模式逐路点独立采样
-      ``delta = (U(-6,6), U(-5,5), U(-3,3))`` deg（对应 rx/ry/rz），
+      ``delta = (U(-20,20), U(-15,15), U(-3,3))`` deg（对应 rx/ry/rz），
       采样顺序与路点 index 一致（同 ``--seed`` 可复现），回填每个路点的
       ``delta_rpy`` 与 ``rpy_pert = rpy_ref + delta``（不 wrap）;
     * 默认流程只对扰动后路点求 IK（未扰动位姿不求）; ``--no-perturb``
@@ -89,8 +89,15 @@ DEFAULT_Q_SEED = "0,20,-20,0,40,0"                                  # IK 种子�
 DEFAULT_SEED = 0                                                    # 随机种子
 DEFAULT_OUT_JSON = "scan_result.json"
 DEFAULT_OUT_PNG = "scan_path.png"
-DEFAULT_COND_MAX = 5.0            # 姿态条件数阈值（超过则重采样）
+# 姿态条件数阈值。注意：该阈值与 PERTURB_AMPLITUDE_DEG 的幅度比耦合——
+# 条件数度量的是三轴**相对**激励强度，幅度比为 20:15:3 时固有条件数约 4.6~8.4
+# （300 seed 实测 p99 ≈ 7.8），重采样无法改善幅度比。取 9 可接受该幅度比，
+# 同时仍能明确拒绝缺轴激励（双轴 ≈ 39，单轴/无激励 = inf）。
+DEFAULT_COND_MAX = 9.0
 DEFAULT_COND_ATTEMPTS = 20        # 条件数不达标时的最大重新采样次数
+
+# 姿态扰动幅度（deg，对应 rx/ry/rz 的 ± 半宽）。
+PERTURB_AMPLITUDE_DEG = (20.0, 15.0, 3.0)
 
 
 # ---------------------------------------------------------------------------
@@ -504,10 +511,11 @@ def _sample_perturbations(waypoints, seed: int, attempt: int) -> None:
     """
     rng = (np.random.default_rng(seed) if attempt == 0
            else np.random.default_rng([int(seed), int(attempt)]))
+    ax, ay, az = PERTURB_AMPLITUDE_DEG
     for wp in waypoints:
-        delta = (rng.uniform(-6.0, 6.0),
-                 rng.uniform(-5.0, 5.0),
-                 rng.uniform(-3.0, 3.0))
+        delta = (rng.uniform(-ax, ax),
+                 rng.uniform(-ay, ay),
+                 rng.uniform(-az, az))
         wp.delta_rpy = delta
         wp.rpy_pert = tuple(r + d for r, d in zip(wp.rpy_ref, delta))
 

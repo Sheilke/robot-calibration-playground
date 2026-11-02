@@ -7,6 +7,7 @@ import numpy as np
 
 from robot_model.nexbot_ik import euler_to_rot
 from excitation_trajectory.aabb_snake_scan import (
+    DEFAULT_COND_MAX,
     plan_waypoints,
     pose_condition_number,
     rotation_vector,
@@ -84,9 +85,9 @@ class PoseConditionNumberTest(unittest.TestCase):
     """验证 SVD 条件数能区分「充分激励」与「病态姿态集」。"""
 
     reference_abc = (180.0, 0.0, -90.0)
-    threshold = 5.0                     # 与 CLI 默认 --cond-max 保持一致
+    threshold = DEFAULT_COND_MAX       # 与 CLI 默认 --cond-max 保持一致
 
-    def _perturbed(self, amp=(6.0, 5.0, 3.0), count=48, seed=0):
+    def _perturbed(self, amp=(20.0, 15.0, 3.0), count=48, seed=0):
         """构造绕三轴分别按 amp 幅度均匀扰动的位姿集。"""
         rng = np.random.default_rng(seed)
         ax, ay, az = self.reference_abc
@@ -105,18 +106,28 @@ class PoseConditionNumberTest(unittest.TestCase):
         self.assertLessEqual(info["condition_number"], self.threshold)
         self.assertEqual(len(info["singular_values"]), 3)
 
+    def test_balanced_amplitudes_condition_better_than_unequal(self):
+        """条件数由三轴**幅度比**决定：均衡幅度优于 20:15:3。"""
+        balanced = pose_condition_number(
+            self._perturbed(amp=(10.0, 10.0, 10.0), seed=3))
+        unequal = pose_condition_number(
+            self._perturbed(amp=(20.0, 15.0, 3.0), seed=3))
+        self.assertLess(balanced["condition_number"], 2.0)
+        self.assertGreater(unequal["condition_number"],
+                           balanced["condition_number"])
+
     def test_single_axis_excitation_is_rejected(self):
         ax, ay, az = self.reference_abc
         rng = np.random.default_rng(1)
-        poses = [_pose((ax + rng.uniform(-6, 6), ay, az)) for _ in range(48)]
+        poses = [_pose((ax + rng.uniform(-20, 20), ay, az)) for _ in range(48)]
         info = pose_condition_number(poses)
         self.assertGreater(info["condition_number"], self.threshold)
 
     def test_two_axis_excitation_is_rejected(self):
         ax, ay, az = self.reference_abc
         rng = np.random.default_rng(2)
-        poses = [_pose((ax + rng.uniform(-6, 6),
-                        ay + rng.uniform(-5, 5), az)) for _ in range(48)]
+        poses = [_pose((ax + rng.uniform(-20, 20),
+                        ay + rng.uniform(-15, 15), az)) for _ in range(48)]
         self.assertGreater(pose_condition_number(poses)["condition_number"],
                            self.threshold)
 

@@ -79,10 +79,10 @@ pip install -r requirements.txt
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
   800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 --seed 0
 
-# 1b. 姿态可辨识性校验：条件数超阈值即重新采样扰动（默认阈值 5）
+# 1b. 姿态可辨识性校验：条件数超阈值即重新采样扰动（默认阈值 9）
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
   800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 \
-  --cond-max 5 --cond-attempts 20
+  --cond-max 9 --cond-attempts 20
 
 # 2. 仅预览连续蛇形网格，不求解 IK
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
@@ -103,7 +103,8 @@ AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.
 路点用于最小二乘参数辨识，姿态集必须充分激励三个转动自由度。工具在 **IK 之前**对姿态集做 SVD：
 
 - 特征：各姿态相对参考姿态的 SO(3) log 映射旋转向量（N×3，去中心化）；
-- 条件数 `σmax/σmin` 超过 `--cond-max`（默认 5）则重新采样姿态扰动，最多 `--cond-attempts` 次（默认 20），达标后才进入 IK；
+- 条件数 `σmax/σmin` 超过 `--cond-max`（默认 9）则重新采样姿态扰动，最多 `--cond-attempts` 次（默认 20），达标后才进入 IK；
+- 条件数评估的是三轴**相对激励**，由扰动幅度比决定：默认幅度 ±20°/±15°/±3° 的固有条件数约 4.6~8.4，重采样不会改善幅度比；需要更小的条件数时应让三轴幅度更均衡（如 ±20°/±15°/±10° 约 2.1）；
 - `--cond-position` 把位置也计入（与姿态等 RMS 归一化），`--no-cond-check` 只报告不重采样；
 - 全部尝试均未达标时保留最优采样并告警，`--strict` 下以退出码 2 中止；
 - 条件数与采样结果写入 JSON 的 `conditioning` 节，同 `--seed` 可复现。
