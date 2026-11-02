@@ -1,0 +1,74 @@
+<?xml version="1.0"?>
+<robot name="nexbot_8_cantilever">
+  <!-- 由 inexbot Robot_A.json 自动转换 (json_to_urdf.py)
+       robotType=R_GENERAL_6S  totalAxisNum=6  mountMethod=0
+       标准 DH (mm/deg): a=[150.0, 780.0, 250.0, 0.0, 0.0, 0.0] alpha=[90.0, 0.0, 90.0, 90.0, -90.0, 0.0] d=[510.5, -47.5, 0.0, 1048.7, 0.0, 102.6] thetaOff=[0.0, 90.0, 0.0, 0.0, 0.0, 0.0]
+       注意: URDF 无法表达以下配置信息:
+         * 电机方向 Direction=[-1.0, 1.0, -1.0, -1.0, 1.0, 1.0] (模型正方向约定, 需在应用层处理)
+         * 5-6轴耦合系数 Couple_Coe_5_6=0.11481
+         * eulerAngle 约定 = XYZ
+         * effort 未知 -> limit effort="0"
+         * 无几何外观信息 -> 不含 visual/collision -->
+  <link name="base_link"/>
+  <link name="link1"/>
+  <link name="link2"/>
+  <link name="link3"/>
+  <link name="link4"/>
+  <link name="link5"/>
+  <link name="link6"/>
+  <link name="tool0"/>
+  <joint name="joint1" type="revolute">
+    <!-- DH: 前级连杆 a=0mm d=0mm alpha=0deg; 本关节 theta 偏置=0.0deg; 限位(原始 deg)=[-180.0, 180.0] -->
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="link1"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.1415926535897931" upper="3.1415926535897931" effort="0" velocity="2.379994434537716"/>
+  </joint>
+  <joint name="joint2" type="revolute">
+    <!-- DH: 前级连杆 a=150.0mm d=510.5mm alpha=90.0deg; 本关节 theta 偏置=90.0deg; 限位(原始 deg)=[-80.0, 93.0] -->
+    <origin xyz="0.14999999999999999 0 0.51049999999999995" rpy="1.5707963267948966 -1.5707963267948966 0"/>
+    <parent link="link1"/>
+    <child link="link2"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.3962634015954636" upper="1.6231562043547265" effort="0" velocity="1.6260831540319833"/>
+  </joint>
+  <joint name="joint3" type="revolute">
+    <!-- DH: 前级连杆 a=780.0mm d=-47.5mm alpha=0.0deg; 本关节 theta 偏置=0.0deg; 限位(原始 deg)=[-86.0, 90.0] -->
+    <origin xyz="0.78000000000000003 0 -0.047500000000000001" rpy="0 0 0"/>
+    <parent link="link2"/>
+    <child link="link3"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.5009831567151235" upper="1.5707963267948966" effort="0" velocity="2.5963575649502353"/>
+  </joint>
+  <joint name="joint4" type="revolute">
+    <!-- DH: 前级连杆 a=250.0mm d=0.0mm alpha=90.0deg; 本关节 theta 偏置=0.0deg; 限位(原始 deg)=[-180.0, 180.0] -->
+    <origin xyz="0.25 0 0" rpy="1.5707963267948966 0 0"/>
+    <parent link="link3"/>
+    <child link="link4"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.1415926535897931" upper="3.1415926535897931" effort="0" velocity="3.9199908333562408"/>
+  </joint>
+  <joint name="joint5" type="revolute">
+    <!-- DH: 前级连杆 a=0.0mm d=1048.7mm alpha=90.0deg; 本关节 theta 偏置=0.0deg; 限位(原始 deg)=[-136.0, 125.0] -->
+    <origin xyz="0 0 1.0487" rpy="1.5707963267948966 0 0"/>
+    <parent link="link4"/>
+    <child link="link5"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.3736477827122884" upper="2.1816615649929121" effort="0" velocity="4.524927690355665"/>
+  </joint>
+  <joint name="joint6" type="revolute">
+    <!-- DH: 前级连杆 a=0.0mm d=0.0mm alpha=-90.0deg; 本关节 theta 偏置=0.0deg; 限位(原始 deg)=[-370.0, 360.0] -->
+    <origin xyz="0 0 0" rpy="-1.5707963267948966 0 0"/>
+    <parent link="link5"/>
+    <child link="link6"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.457718232379019" upper="6.2831853071795862" effort="0" velocity="15.103603367487089"/>
+  </joint>
+  <joint name="joint6-tool0" type="fixed">
+    <!-- DH 末端: a6=0.0mm d6=102.6mm alpha6=0.0deg; tool0 = DH 系6(法兰) -->
+    <origin xyz="0 0 0.1026" rpy="0 0 0"/>
+    <parent link="link6"/>
+    <child link="tool0"/>
+  </joint>
+</robot>

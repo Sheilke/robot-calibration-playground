@@ -7,3 +7,7 @@ data/raw/
 .cache/
 .cursor/
 .codex/
+
+# AABB 扫描 CLI 在仓库根目录的默认输出
+scan_result.json
+scan_path.png
