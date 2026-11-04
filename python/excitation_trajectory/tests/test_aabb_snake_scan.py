@@ -21,6 +21,7 @@ import numpy as np
 from robot_model.nexbot_ik import euler_to_rot
 from excitation_trajectory.aabb_snake_scan import (
     DEFAULT_COND_MAX,
+    PERTURB_AMPLITUDE_DEG,
     build_arg_parser,
     design_condition_number,
     evaluate_conditioning,
@@ -124,9 +125,9 @@ class DesignConditionNumberTest(unittest.TestCase):
             msg=f"{amplitudes} -> {info['condition_number']}, 期望 {expected}")
 
     def test_default_amplitudes_equal_max_over_min_ratio(self):
-        """默认 (20, 15, 3) -> a_max/a_min = 6.67（±1%）。"""
-        amplitudes = (20.0, 15.0, 3.0)
-        self.assert_ratio(amplitudes, max(amplitudes) / min(amplitudes))
+        """默认 (5, 20, 15) -> a_max/a_min = 4（±1%）。"""
+        self.assertEqual(PERTURB_AMPLITUDE_DEG, (5.0, 20.0, 15.0))
+        self.assert_ratio(PERTURB_AMPLITUDE_DEG, 4.0)
 
     def test_balanced_amplitudes_give_unit_condition_number(self):
         """均衡 (10, 10, 10) -> 1.0（条件数下限）。"""
@@ -138,8 +139,10 @@ class DesignConditionNumberTest(unittest.TestCase):
 
     def test_axis_aligned_reference_poses_agree(self):
         """轴对齐参考姿态下 cond 与参考姿态取值无关（J 至多差一个反射）。"""
-        first = design_condition_number((20.0, 15.0, 3.0), (0.0, 0.0, 0.0))
-        second = design_condition_number((20.0, 15.0, 3.0), REFERENCE_RPY)
+        first = design_condition_number(PERTURB_AMPLITUDE_DEG,
+                                        (0.0, 0.0, 0.0))
+        second = design_condition_number(PERTURB_AMPLITUDE_DEG,
+                                         REFERENCE_RPY)
         self.assertAlmostEqual(first["condition_number"],
                                second["condition_number"], places=9)
 
@@ -337,8 +340,8 @@ class ConditioningGateTest(unittest.TestCase):
         for seed in (0, 1, 2, 7, 11):
             waypoints = plan_waypoints(0, 200, 0, 200, 0, 200, 2, 2, 2,
                                        REFERENCE_RPY)
-            poses = _perturbed_poses((20.0, 15.0, 3.0), count=len(waypoints),
-                                     seed=seed,
+            poses = _perturbed_poses(PERTURB_AMPLITUDE_DEG,
+                                     count=len(waypoints), seed=seed,
                                      positions=[wp.pos for wp in waypoints])
             with redirect_stdout(io.StringIO()):
                 report = evaluate_conditioning(args, waypoints,
@@ -356,19 +359,19 @@ class ConditioningGateTest(unittest.TestCase):
 
     def test_no_cond_check_reports_only(self):
         args = self._args(["--no-cond-check"])
-        report, _ = self._evaluate(args, (20.0, 15.0, 3.0))
+        report, _ = self._evaluate(args, PERTURB_AMPLITUDE_DEG)
         self.assertEqual(report["status"], "reported_only")
         self.assertIsNotNone(report["realized"])
 
     def test_no_perturb_does_not_run(self):
         args = self._args(["--no-perturb"])
-        report, output = self._evaluate(args, (20.0, 15.0, 3.0))
+        report, output = self._evaluate(args, PERTURB_AMPLITUDE_DEG)
         self.assertEqual(report["status"], "not_run")
         self.assertIsNone(report["realized"])
         self.assertIsNone(report["gate"]["value"])
         # 设计值仍给出，但不打印实测数字
         self.assertAlmostEqual(report["design"]["condition_number"],
-                               20.0 / 3.0, places=6)
+                               20.0 / 5.0, places=6)
         self.assertNotIn("实测", output)
 
     def test_single_point_grid_serializes_infinite_condition_as_null(self):
@@ -411,7 +414,7 @@ class ConditioningGateTest(unittest.TestCase):
             self.assertIsNone(payload["conditioning"]["realized"])
             self.assertAlmostEqual(
                 payload["conditioning"]["design"]["condition_number"],
-                20.0 / 3.0, places=6)
+                20.0 / 5.0, places=6)
             self.assertFalse(payload["meta"]["perturbed"])
             self.assertTrue(payload["meta"]["skip_ik"])
             self.assertIn("no_perturb", payload["meta"])
