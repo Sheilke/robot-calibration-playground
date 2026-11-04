@@ -11,3 +11,7 @@ data/raw/
 # AABB 扫描 CLI 在仓库根目录的默认输出
 scan_result.json
 scan_path.png
+
+# 运行时由 protoc 从公司 arc-common 动态生成的 proto 绑定
+# （公司内部 schema，绝不入库）
+build/
