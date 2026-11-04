@@ -25,6 +25,18 @@ robot-calibration-playground/
 │   │   ├── optimizer.py          # 可辨识性指标优化
 │   │   └── tests/                # 单元测试
 │   ├── identification/           # 参数辨识相关
+│   ├── handeye/                  # 手眼验证（VPE）与 DH 离线重算（纯 Python）
+│   │   ├── se3.py                # SE(3) 运算、手眼矩阵 16 值装载/校验/单位换算
+│   │   ├── dh.py                 # URDF 基准 + DH 覆盖 -> 旧/新 DH 的 FK
+│   │   ├── proto_codec.py        # 公司 calibration proto 的运行时编译与 .pb 读写
+│   │   ├── pose_encoder.py       # T_bh <-> 控制器 robot_pt（mm + XYZ 内旋欧拉）
+│   │   ├── pb_rewrite.py         # 用 FK 重算位姿并改写 .pb（喂给公司 C++ 求解器）
+│   │   ├── session.py            # 会话 JSON 装载与校验（含 FK 一致性自检）
+│   │   ├── vpe.py                # 视觉链推算与 VPE 指标
+│   │   ├── report.py             # markdown 报告
+│   │   ├── verify.py             # VPE 验证 CLI
+│   │   ├── offline_recompute.py  # 旧/新 DH 离线重算 CLI
+│   │   └── tests/                # 单元测试
 │   ├── robot_model/              # 机器人运动学/动力学模型抽象
 │   │   ├── __init__.py           # 运动学公共接口
 │   │   ├── nexbot_ik.py          # 标准 URDF + JSON 输入的 6R FK/解析 IK
@@ -34,7 +46,9 @@ robot-calibration-playground/
 │   └── src/                      # 后续放 ament_python / ament_cmake 包
 └── data/                         # 配置模板与样本（大文件不入库）
     ├── configs/
-    │   └── ch2000_origin.urdf    # CH2000/Nexbot 标准机器人模型
+    │   ├── ch2000_origin.urdf    # CH2000/Nexbot 标准机器人模型
+    │   ├── dh_override_example.json  # DH 覆盖参数模板
+    │   └── session_example.json      # 手眼验证会话模板（可直接跑通）
     └── samples/                  # 小样本数据
 ```
 
@@ -47,6 +61,7 @@ robot-calibration-playground/
   - `json_to_urdf.py` 将控制器 JSON 转换为标准 URDF。
 - `data/configs/ch2000_origin.urdf` 是可直接用于上述 6R 工具的标准 URDF 配置模板。
 - `python/identification/`、`python/common/` 同样保持与 ROS2 解耦。
+- `python/handeye/` 做手眼标定的**独立验证**（VPE，Visual Positioning Error），**不重写手眼求解算法**——求解器复用公司 `calibration/eye_on_hand_calibration` 动作；本包只补 C++ 做不到的部分：用关节角 + DH 参数算位姿、改写 `.pb`、算 VPE 指标与出报告。
 - `ros2_ws/` 仅作为未来 ROS2 对接层的预留位置，当前不放置 ROS2 包。
 
 ## ROS2 对接预期
@@ -84,7 +99,7 @@ PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
   800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 \
   --cond-max 9
 
-# 1c. 自定义三轴扰动半宽（deg）：把最小轴从 3 提高到 10，设计条件数 6.7 -> 2.0
+# 1c. 自定义三轴扰动半宽（deg）：例如 20/15/10，设计条件数为 2.0
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
   800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 \
   --perturb-deg 20 15 10 --cond-max 9
@@ -107,7 +122,7 @@ AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.
 
 这是一次性的**设计方案检查**：路点用于最小二乘参数辨识，姿态集必须充分激励三个转动自由度。工具在 **IK 之前**计算两类条件数（`cond(X)=σmax/σmin`，X 为 N×3 激励设计矩阵，`σ` 为奇异值）：
 
-- **设计条件数**（`design_condition_number`）：解析值，**与随机种子、采样次数无关**。各路点扰动独立均匀，切空间协方差 `Σ = J·diag(a²/3)·Jᵀ`（J 为旋转向量对 rpy 的雅可比），设计矩阵满足 `XᵀX ≈ N·Σ`，故 `cond(X) = sqrt(λmax(Σ)/λmin(Σ))`。轴对齐姿态下 `J` 正交，因此 `cond ≈ a_max/a_min`；默认幅度 ±20°/±15°/±3° → ≈6.7，均衡 10/10/10 → 1.0，`--perturb-deg 20 15 10` → ≈2.0，`--perturb-deg 20 15 0.5` → 40（会被拒绝）。
+- **设计条件数**（`design_condition_number`）：解析值，**与随机种子、采样次数无关**。各路点扰动独立均匀，切空间协方差 `Σ = J·diag(a²/3)·Jᵀ`（J 为旋转向量对 rpy 的雅可比），设计矩阵满足 `XᵀX ≈ N·Σ`，故 `cond(X) = sqrt(λmax(Σ)/λmin(Σ))`。轴对齐姿态下 `J` 正交，因此 `cond ≈ a_max/a_min`；默认幅度 ±5°/±20°/±15° → ≈4.0，均衡 10/10/10 → 1.0，`--perturb-deg 20 15 10` → ≈2.0，`--perturb-deg 20 15 0.5` → 40（会被拒绝）。
 - **实测条件数**（`pose_condition_number`）：对实际采样的姿态集做 SVD，按块报告——姿态块（相对标称参考姿态的 SO(3) log 旋转向量，rad）与位置块（mm），每块给出各自条件数与去中心化后的**绝对 RMS**（用于暴露绝对幅度）。
 
 门禁规则：
@@ -117,7 +132,7 @@ AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.
 - 超过 `--cond-max`（默认 9）时打印**可执行建议**：
   `需要 a_min >= a_max/cond_max = 2.22 deg（当前 0.5）；可用 --perturb-deg 调整或提高 --cond-max`，`--strict` 下以退出码 2 中止，否则继续执行；
 - `--no-cond-check` 只报告不门禁（`status="reported_only"`）；`--no-perturb` / `--skip-ik` 下姿态全同、实测度量退化，状态记 `not_run`（设计值仍报告，不打印误导性数字）；
-- **不再**「超阈值就重采样扰动」：重采样不改变三轴幅度比，只在同一分布内挑样本噪声（默认 20/15/3 下大量 seed 的首采样本本来就都低于阈值）。要降低条件数只能改设计参数——提高最小轴幅度（`--perturb-deg`），或放宽 `--cond-max`。
+- **不再**「超阈值就重采样扰动」：重采样不改变三轴幅度比，只在同一分布内挑样本噪声。要降低条件数只能改设计参数——提高最小轴幅度（`--perturb-deg`），或放宽 `--cond-max`。
 
 语义换算与单位约定：
 
@@ -126,6 +141,88 @@ AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.
 - 参考姿态统一取标称 RPY（`--rpy`），消除「参考 = 第一个路点」的顺序依赖（JSON 中 `reference_source: "explicit"`）。
 
 注意：这里度量的是**姿态集激励覆盖度**的条件数，不是 DH 参数辨识回归矩阵的条件数——后者依赖关节角，需在 IK 之后（对成功子集）另行计算。JSON 的 `conditioning` 节给出 `design` / `realized` / `post_ik`（IK 后成功子集，只报告）三段，非有限值一律写 `null`，`--seed` 相同则输出可复现。
+
+## 手眼验证（VPE）与 DH 离线重算
+
+用途：用激光跟踪仪作为独立参考，验证「机器人 + 手眼标定」的最终空间定位精度，并回答一个具体问题——**DH 参数标定到底能不能改善手眼精度**。
+
+### 设计原则：不重写求解器
+
+手眼求解器只保留公司 C++ 一份（动作 `calibration/eye_on_hand_calibration`）。原因是它只接受**笛卡尔位姿**，不知道关节角、也不知道 DH；离线重算真正缺的能力是「用新 DH 从关节角重算位姿」。所以本包只做三件事：算位姿、改写 `.pb`、算 VPE。
+
+### 核心公式
+
+```
+^B P_ball^vision(i) = FK(q_i, θ) · ^H T_C · [^C P_ball(i); 1]
+e_i                  = ^B P_ball^vision(i) − (^B P_ball^laser + ^B ΔP)
+VPE_i                = ‖e_i‖,  VPE_RMSE = sqrt(mean(VPE_i²))
+```
+
+`^B ΔP` 是建立 laser→base 坐标注册时产生的 Tool0—靶球固定偏置；`^C P_ball(i)` 是相机在该位姿下**直接辨识靶球**得到的球心坐标（无需标定板布局）。
+
+### 用法
+
+```bash
+# 1. VPE 验证（X 已标定好）
+PYTHONPATH=python python3 -m handeye.verify data/configs/session_example.json \
+  -o vpe_report.md --json vpe_report.json
+
+# 2. 用命令行给的 X 覆盖会话内的矩阵（单位默认 mm）
+PYTHONPATH=python python3 -m handeye.verify SESSION.json \
+  --matrix16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 --matrix-units mm
+
+# 3. DH 离线重算：同一批采样，只换运动学模型
+PYTHONPATH=python python3 -m handeye.offline_recompute \
+  --pb-dir /path/to/handeye_pb --session SESSION.json \
+  --dh-old old.json --dh-new new.json --split 0.7 --seed 0 \
+  --solver-cmd 'docker exec arc-eye-on-hand bash -lc "ros2 run calibration_py eye_on_hand_calibration_solver --input-dir {input_dir} --output-bin {output_bin}"' \
+  -o offline.md --json offline.json
+```
+
+### 数据准备：`.pb` → 会话 JSON
+
+原始数据是公司管线落盘的 `ArucoRecordingResult`（.pb，含笛卡尔位姿 + 相机系靶球点）。本仓库**不改动**原始 `.pb`，只在内存/临时目录里改写后交给求解器；会话 JSON 由调用方提供，格式见 `data/configs/session_example.json`。
+
+关键字段与约定：
+
+| 字段 | 说明 |
+| --- | --- |
+| `meta.robot_urdf` | 机器人模型（URDF），相对仓库根或绝对路径 |
+| `meta.dh_override` | DH 覆盖 JSON；`null` 表示用 URDF 基准参数 |
+| `meta.joint_convention` | 固定 `"model"`（模型轴角度，API 不传 Direction 映射）|
+| `meta.units` | 固定 `"mm"` |
+| `reference.p_ball_laser_base` | 跟踪仪实测球心（换算到基座系）|
+| `reference.delta_p_base` | Tool0—靶球固定偏置 `^B ΔP`，可为 `null` |
+| `handeye_matrix` | `{"matrix16_rowmajor": [...], "units": "mm"|"m"}`，可为 `null` |
+| `samples[].q_deg` | **关节角（模型轴，度）**，必填，必须在 URDF 限位内 |
+| `samples[].recorded_pose` | 控制器回传的笛卡尔位姿；用于 FK 一致性自检 |
+| `samples[].frames[].target_points` | `{靶球id: [x,y,z] 相机系 mm}`，可多帧、多 id |
+
+### 两条必须知道的自检与陷阱
+
+1. **运动学一致性自检（`--fk-tolerance-mm`，默认 1.0）**：把 `recorded_pose` 与 `FK(q, θ)` 对比。若这里就超阈值，说明 DH、单位或欧拉约定有错，**后续 VPE 结论全部不可信**。典型错误是欧拉约定——控制器/Nexbot 链路用 **XYZ 内旋**（`R = Rx·Ry·Rz`，C++ `kXyzIntrinsic`），本仓库 `pose_encoder` 已固定此约定；本仓库其他工具默认的 `extrinsic=True` 是 `Rz·Ry·Rx`，两者不同。
+2. **手眼矩阵单位有两套**：`common_config` 存的是**米制**（`toolFromCameraMm()` 乘 1000 可证），而动作 `EyeOnHandCalibrationResult.matrix` 返回的是 **mm**（全程用 robot_pt 的 mm 计算）。`se3.load_matrix16` 强制显式声明 `units`，不会静默换算错。
+
+### 离线重算的两个方法学选择
+
+- `--pose-source-old recorded|fk_old`（默认 `recorded`）：生产上的 `X_old` 是用**控制器回传位姿**算的。若强行换成我们的 `FK(θ_old)`，基线就被改动、`ΔVPE` 不再可比。
+- 四个组合中 `θ_new×X_old`、`θ_old×X_new` **不具备物理一致性**，报告里只作**诊断**（判断误差主要来自运动学还是手眼矩阵），不作最终性能结论。
+
+### 判读规则
+
+`ΔVPE_RMSE = VPE_old − VPE_new`（正值表示改善），相对基线 `Δ/RMSE_old`：
+
+| 比值 | 判读 |
+| --- | --- |
+| `≥ 10%` | 新 DH 使手眼定位精度改善超过 10%，支持采用标定后参数 |
+| `−10% ~ 10%` | 影响在 ±10% 内，不足以支持结论，建议增加样本或复核标定残差 |
+| `< −10%` | 新 DH 使精度变差，需检查 DH 标定结果与零点定义转换 |
+
+### 依赖说明
+
+- 核心（`se3`/`dh`/`session`/`vpe`/`report`/`verify`）：仅 `numpy`
+- `.pb` 读写：需要系统 `protoc` + `protobuf`，且能访问公司 `arc-common` 的 proto 根目录（环境变量 `ARC_COMMON_PROTO_ROOT`，默认 `~/ws/3srobotics/arc-common/src/proto_msgs`）。绑定时运行时生成到 `build/proto_gen/`（已 gitignore），**公司 schema 不入库**
+- 离线重算的求解步骤：需要能调用公司 ROS2 栈（`--solver-cmd` 模板），本仓库不自动执行 docker
 
 ## 实验记录
 
