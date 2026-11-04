@@ -91,13 +91,13 @@ X_new = C++HandEye(rewrite_pb(FK(q,θ_new)), p_cam)
 
 - [x] 1. `se3.py`（含 X 装载/校验/单位换算）+ 单测
 - [x] 2. `dh.py`（URDF+override → 新旧 FK）+ 单测（注入扰动恢复）
-- [ ] 3. `proto_codec.py` + `pose_encoder.py` + `pb_rewrite.py`（用 FK 重算 robot_pt 并改写 .pb）+ 单测
-- [ ] 4. `session.py`（schema 校验、FK 一致性报告）+ 示例 JSON + 单测
-- [ ] 5. `vpe.py`（链式推算 + 多帧聚合 + 指标）+ 手算对照单测
-- [ ] 6. `report.py` markdown 输出
-- [ ] 7. `verify.py` CLI + 端到端单测（合成 session → 报告）
-- [ ] 8. `offline_recompute.py` CLI（子集划分、改写 .pb、调 C++ 动作得 X_old/X_new、交叉组合）+ 单测
-- [ ] 9. README 更新（用法 + pb→session 数据准备说明 + 动作调用方式）
+- [x] 3. `proto_codec.py` + `pose_encoder.py` + `pb_rewrite.py`（用 FK 重算 robot_pt 并改写 .pb）+ 单测
+- [x] 4. `session.py`（schema 校验、FK 一致性报告）+ 示例 JSON + 单测
+- [x] 5. `vpe.py`（链式推算 + 多帧聚合 + 指标）+ 手算对照单测
+- [x] 6. `report.py` markdown 输出
+- [x] 7. `verify.py` CLI + 端到端单测（合成 session → 报告）
+- [x] 8. `offline_recompute.py` CLI（子集划分、改写 .pb、调 C++ 动作得 X_old/X_new、交叉组合）+ 单测
+- [x] 9. README 更新（用法 + pb→session 数据准备说明 + 动作调用方式）
 
 ## Verification
 
