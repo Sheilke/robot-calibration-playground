@@ -22,6 +22,7 @@ robot-calibration-playground/
 │   ├── excitation_trajectory/    # 利于辨识的标定路点生成（不依赖 ROS2）
 │   │   ├── aabb_snake_scan.py    # 连续蛇形网格、姿态扰动、链式 IK、3D 可视化
 │   │   ├── export_9011.py        # 扫描结果 -> 9011/N9011 点位与逐点行走报文
+│   │   ├── send_9011.py          # TCP 服务端：逐点发 M0，done/ready 握手 + 每点暂停
 │   │   ├── generator.py          # 路点生成主逻辑
 │   │   ├── optimizer.py          # 可辨识性指标优化
 │   │   └── tests/                # 单元测试
@@ -120,10 +121,13 @@ PYTHONPATH=python python -m robot_model.nexbot_ik --selftest 100
 PYTHONPATH=python python -m robot_model.json_to_urdf \
   /path/to/Robot_A.json /tmp/ch2000_origin.urdf
 
-# 5. 扫描结果 -> 9011/N9011 点位下载 + 逐点行走报文（DH 标定采点）
+# 5. 扫描结果 -> 9011/N9011 点位报文（DH 标定采点）
 PYTHONPATH=python python -m excitation_trajectory.export_9011 \
-  scan_result.json --out calib_points_9011.json \
-  --messages calib_9011_messages.txt --dwell 6
+  scan_result.json --out calib_points_9011.json --dwell 6
+
+# 6. 控制器侧运行 9011/N9011 后，本机监听并逐点发送（done/ready 握手 + 每点暂停）
+PYTHONPATH=python python -m excitation_trajectory.send_9011 \
+  calib_points_9011.json --port 12345 --dwell 6
 ```
 
 AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.png`；这两个运行产物已被 `.gitignore` 忽略。JSON 转换器的默认输出是 `data/configs/ch2000_origin.urdf`，但公司内部原始 `Robot_A.json` 始终由调用方显式传入，不会进入仓库。
@@ -170,16 +174,46 @@ AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.
 
 外轴站（7/8 轴）：每点记录长度为 `1 + (6+外轴数)×8 + 4`（Nexbot `N9011ReadPos` 6 轴=53、8 轴=69），用 `--ext-axis` 追加，**必须与下位 JOB 的 stride 一致**。
 
-### 关于“每点暂停 6 秒”（关键）
+### 现场怎么发：`send_9011.py`
 
-**下位移动指令都没有停留/等待参数**（`N9011.JBR` 的 `WHILE`、Hyundai `9011.JOB` 的 `FOR`、以及 `M0` 分支，都是 `MOVE` 完就返回）。所以 6 秒暂停**只能由上位发送循环实现**：
+**关键：PC 是 TCP 服务端，控制器是客户端。** `NexbotRobot` 在本机 `12345` 上
+listen，控制器 JOB 里 `ENET1.OPEN 1` 去连 PC（`ENET1.IP` 填的是 PC 地址）。
+所以不能“去连机器人”，只能**先监听、等它连上来**。
 
-1. 发一条**单点**报文（默认 `M0`；`--walk T` 时是 `begin==end` 的单点 `T`。**不要**发 `T0001{0048}` 范围，否则机器人连续走完不留测量时间）；
-2. 等运动完成（驱动侧 `MovePointAndWait` 的做法是轮询到 `Ready`）；
-3. `sleep --dwell` 秒，让跟踪仪完成测量；
-4. 再发下一条。
+```bash
+# 1) 生成点位
+PYTHONPATH=python python3 -m excitation_trajectory.export_9011 \
+  scan_result.json --out calib_points_9011.json --dwell 6
 
-报文文件里在每个点之间插了 `# [n/N] 等运动完成后 sleep 6 s 再发下一条` 注释行作提示；`--dwell` 的值同时写进 JSON 的 `meta.dwell_s`，供发送端读取而不是硬编码。
+# 2) 控制器侧运行 9011/N9011（它会在 ENET1.OPEN 处等连），本机起监听
+PYTHONPATH=python python3 -m excitation_trajectory.send_9011 \
+  calib_points_9011.json --port 12345 --dwell 6
+
+# 只跑第 5..12 点；发完结束 JOB
+PYTHONPATH=python python3 -m excitation_trajectory.send_9011 \
+  calib_points_9011.json --start 5 --end 12 --quit
+```
+
+握手（`N9011.JBR` 231-234 行）：每条指令执行完，JOB 落到 `LABEL [$2$]` 发
+**`done`**，`TIMER T=0.1`，再发 **`ready`**，然后回 `$Recv$`。因此
+“运动是否完成”是**可观测**的，不用按路程估时间：
+
+```
+发 M0 → 收到 done（运动结束）→ 收到 ready（可发下一条）→ sleep dwel → 下一点
+```
+
+发送端与驱动 `RobotDriverBase::StateCheck` 同语义：先等 `done`，孤立早到的
+`ready` 跳过；收到 `error,...` 立即中止。
+
+> `--quit` 会发 `Q0`，JOB 跳 `$END$` 结束，**之后必须重新运行 9011**。
+> 所以默认**不发** `Q0`，采完一遍可以直接再跑一次本工具。
+
+### 为什么 6 秒暂停必须在上位做
+
+**下位移动指令都没有停留/等待参数**（`N9011.JBR` 的 `WHILE`、Hyundai
+`9011.JOB` 的 `FOR`、以及 `M0` 分支，都是 `MOVE` 完就回 `$Recv$`）。
+`MOVE` 本身是阻塞的，所以“等运动完成”由下位保证；**“停够 6 秒再走”只能
+由上位在下一次发送前 sleep**。
 
 ### 两个必须现场确认的点
 
