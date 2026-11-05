@@ -106,6 +106,10 @@ DEFAULT_OUT_PNG = "scan_path.png"
 # （双轴 ≈ 39，单轴/无激励 = inf）。
 DEFAULT_COND_MAX = 9.0
 
+#: |J5| 下限（度）：J5=0 是腕奇异，低于此值的解不接受（逐点重采姿态）。
+#: 20 度对应 sin(J5)≈0.34，离奇异有明确的运动学余量。
+DEFAULT_J5_MIN_DEG = 20.0
+
 # 姿态扰动幅度（deg，对应 rx/ry/rz 的 ± 半宽）。可由 --perturb-deg 覆盖。
 PERTURB_AMPLITUDE_DEG = (5.0, 20.0, 15.0)
 
@@ -340,6 +344,51 @@ def config_tag(rbt, T, q) -> tuple[int, int, int]:
     return (arm, elbow, wrist)
 
 
+def _select_solution(rbt, T, q_prev, cfg_ref):
+    """在单个位姿的全部 IK 解中按链式规则选一组。
+
+    Args:
+        rbt: 机器人模型。
+        T: 4x4 目标位姿。
+        q_prev: 上一选中解（作为 score 与 config 参考）。
+        cfg_ref: tie-break 参考构型（上一选中解或种子构型）。
+
+    Returns:
+        ``(q_sel, n_sols, dq_l2, dq_l1, cfg, ok)``；无解时
+        ``(None, 0, None, None, None, False)``。
+    """
+    sols = rbt.ik(T, q_ref=q_prev)
+    n_sols = len(sols)
+    if n_sols == 0:
+        return None, 0, None, None, None, False
+
+    # 度数域 score 复核排序（不直接信任 ik 的弧度域排序）
+    scores = [sum(wrap_180(a - b) ** 2 for a, b in zip(sol, q_prev))
+              for sol in sols]
+    best = min(scores)
+    tied = [k for k, sc in enumerate(scores) if sc - best < 1e-9]
+
+    if len(tied) == 1:
+        pick = tied[0]
+    else:
+        def _n_match(sol) -> int:
+            """与参考构型相同分量数（越大越好）。"""
+            cfg = config_tag(rbt, T, sol)
+            return sum(1 for x, y in zip(cfg, cfg_ref) if x == y)
+
+        pick = min(tied, key=lambda k: (-_n_match(sols[k]), scores[k]))
+
+    q_sel = [float(v) for v in sols[pick]]
+    dq_l2 = float(scores[pick])
+    dq_l1 = float(sum(abs(wrap_180(a - b)) for a, b in zip(q_sel, q_prev)))
+    cfg = config_tag(rbt, T, q_sel)
+
+    Tq = rbt.fk(q_sel)
+    ok = bool(np.max(np.abs(Tq[:3, :3] - T[:3, :3])) < 1e-6 and
+              np.max(np.abs(Tq[:3, 3] - T[:3, 3])) < 1e-4)
+    return q_sel, n_sols, dq_l2, dq_l1, cfg, ok
+
+
 def solve_chain(rbt, T_list, q_seed, strict: bool = False) -> list[ChainStep]:
     """对位姿序列做链式 IK 选解。
 
@@ -370,10 +419,10 @@ def solve_chain(rbt, T_list, q_seed, strict: bool = False) -> list[ChainStep]:
     steps: list[ChainStep] = []
     for i, T in enumerate(T_list):
         T = np.asarray(T, dtype=float)
-        sols = rbt.ik(T, q_ref=q_prev)
-        n_sols = len(sols)
+        q_sel, n_sols, dq_l2, dq_l1, cfg, ok = _select_solution(
+            rbt, T, q_prev, cfg_seed if last_cfg is None else last_cfg)
 
-        if n_sols == 0:
+        if q_sel is None:
             print(f"  waypoint #{i} 无解(跳过)")
             if strict:
                 print(f"错误: strict 模式下路点 #{i} 无解，中止")
@@ -382,42 +431,131 @@ def solve_chain(rbt, T_list, q_seed, strict: bool = False) -> list[ChainStep]:
                                     dq_l2=None, dq_l1=None, ok=False))
             continue                       # q_prev / last_cfg 保持不变
 
-        # 度数域 score 复核排序（不直接信任 ik 的弧度域排序）
-        scores = [sum(wrap_180(a - b) ** 2 for a, b in zip(sol, q_prev))
-                  for sol in sols]
-        best = min(scores)
-        tied = [k for k, sc in enumerate(scores) if sc - best < 1e-9]
-
-        if len(tied) == 1:
-            pick = tied[0]
-        else:
-            ref_cfg = cfg_seed if last_cfg is None else last_cfg
-
-            def _n_match(sol) -> int:
-                """与参考构型相同分量数（越大越好）。"""
-                cfg = config_tag(rbt, T, sol)
-                return sum(1 for x, y in zip(cfg, ref_cfg) if x == y)
-
-            # 并列者中构型相同分量多者优先，其次 score 小者、先出现者
-            pick = min(tied, key=lambda k: (-_n_match(sols[k]), scores[k]))
-
-        q_sel = [float(v) for v in sols[pick]]
-        dq_l2 = float(scores[pick])
-        dq_l1 = float(sum(abs(wrap_180(a - b))
-                          for a, b in zip(q_sel, q_prev)))
-        cfg = config_tag(rbt, T, q_sel)
-
-        # FK 复验：fk(q_sel) 是否回到目标位姿 T
-        Tq = rbt.fk(q_sel)
-        ok = bool(np.max(np.abs(Tq[:3, :3] - T[:3, :3])) < 1e-6 and
-                  np.max(np.abs(Tq[:3, 3] - T[:3, 3])) < 1e-4)
-
         steps.append(ChainStep(index=i, q=q_sel, n_sols=n_sols, config=cfg,
                                dq_l2=dq_l2, dq_l1=dq_l1, ok=ok))
         q_prev = q_sel
         last_cfg = cfg
 
     return steps
+
+
+def solve_chain_guarded(rbt, waypoints, q_seed, *, j5_min: float = 0.0,
+                        j3_min: float = 0.0, attempts: int = 30,
+                        seed: int = 0, amplitudes_deg=None,
+                        extrinsic: bool = True,
+                        strict: bool = False) -> tuple:
+    """带奇异守卫的链式选解：某点 |J5|（或 |J3|）过小时重采该点姿态。
+
+    奇异（腕奇异在 J5=0、肘奇异在 J3=0）是**硬约束**，不是统计指标，
+    所以这里逐点重采样：某路点的选中解违反阈值时，重新抽该路点的姿态
+    扰动并重解，保持与上一点的构型与关节连续性；最多尝试 ``attempts``
+    次，全部失败时取 |J5| 最大的那次并记录在报告里（``strict`` 则退出码 2）。
+
+    重采样只动**该路点自己的**姿态扰动，不改位置、不影响其它路点；
+    随机流独立于 ``_sample_perturbations``（用 ``seed`` 派生），因此同
+    参数下结果可复现。
+
+    Args:
+        rbt: 机器人模型。
+        waypoints: 路点列表（会被原地修改 ``delta_rpy`` / ``rpy_pert``）。
+        q_seed: 链种子关节角（deg）。
+        j5_min: |J5| 下限（deg）；0 表示不检查。
+        j3_min: |J3| 下限（deg）；0 表示不检查。
+        attempts: 单点最多尝试次数（含首次）。
+        seed: 随机种子。
+        amplitudes_deg: 三轴扰动半宽，None 用模块常量。
+        extrinsic: 欧拉约定（True=定轴 RPY）。
+        strict: 守卫最终失败则退出码 2。
+
+    Returns:
+        ``(steps, report)``：``steps`` 与 ``waypoints`` 等长；``report`` 含
+        ``resampled``（被改动的路点记录）、``j5_min_seen``、``j3_min_seen``、
+        ``violations``（重采后仍不达标的点）。
+    """
+    amps = tuple(float(v) for v in
+                 (PERTURB_AMPLITUDE_DEG if amplitudes_deg is None
+                  else amplitudes_deg))
+    rng = np.random.default_rng(int(seed) + 0x5A17)
+
+    def _resample(wp) -> None:
+        delta = tuple(rng.uniform(-a, a) for a in amps)
+        wp.delta_rpy = delta
+        wp.rpy_pert = tuple(r + d for r, d in zip(wp.rpy_ref, delta))
+
+    guard_on = (j5_min > 0.0) or (j3_min > 0.0)
+
+    def _violates(q) -> bool:
+        if j5_min > 0.0 and abs(q[4]) < j5_min:
+            return True
+        if j3_min > 0.0 and abs(q[2]) < j3_min:
+            return True
+        return False
+
+    q_prev = [float(v) for v in q_seed]
+    cfg_seed = config_tag(rbt, rbt.fk(q_seed), q_seed)
+    last_cfg = None
+    steps: list[ChainStep] = []
+    resampled: list[dict] = []
+    violations: list[dict] = []
+
+    for wp in waypoints:
+        cfg_ref = cfg_seed if last_cfg is None else last_cfg
+        best = None                       # (|J5| * 1e6 - |J3|, step, tries)
+        tries = 0
+        while tries < max(1, int(attempts)):
+            tries += 1
+            T = rbt.pose_to_T(wp.pos, wp.rpy_pert, extrinsic=extrinsic)
+            q_sel, n_sols, dq_l2, dq_l1, cfg, ok = _select_solution(
+                rbt, T, q_prev, cfg_ref)
+            if q_sel is not None and ok:
+                if not guard_on or not _violates(q_sel):
+                    best = (None, q_sel, n_sols, dq_l2, dq_l1, cfg, ok, tries)
+                    break
+                margin = abs(q_sel[4]) * 1e6 + abs(q_sel[2])
+                if best is None or margin > best[0]:
+                    best = (margin, q_sel, n_sols, dq_l2, dq_l1, cfg, ok, tries)
+            if not guard_on:
+                break                     # 不守卫时只试一次
+            _resample(wp)
+
+        if best is None or best[1] is None:
+            print(f"  waypoint #{wp.index} 无解(跳过)")
+            if strict:
+                print(f"错误: strict 模式下路点 #{wp.index} 无解，中止")
+                sys.exit(2)
+            steps.append(ChainStep(index=wp.index, q=None, n_sols=0,
+                                   config=None, dq_l2=None, dq_l1=None, ok=False))
+            continue
+
+        _, q_sel, n_sols, dq_l2, dq_l1, cfg, ok, used = best
+        if used > 1:
+            resampled.append({"index": wp.index, "tries": used,
+                              "delta_rpy": [float(v) for v in wp.delta_rpy],
+                              "q5_deg": float(q_sel[4])})
+        if guard_on and _violates(q_sel):
+            violations.append({"index": wp.index, "q3_deg": float(q_sel[2]),
+                               "q5_deg": float(q_sel[4]), "tries": used})
+        steps.append(ChainStep(index=wp.index, q=q_sel, n_sols=n_sols,
+                               config=cfg, dq_l2=dq_l2, dq_l1=dq_l1, ok=ok))
+        q_prev = q_sel
+        last_cfg = cfg
+
+    ok_steps = [s for s in steps if s.ok]
+    report = {
+        "j5_min": float(j5_min), "j3_min": float(j3_min),
+        "attempts": int(attempts),
+        "resampled": resampled,
+        "violations": violations,
+        "j5_abs_min_deg": (min(abs(s.q[4]) for s in ok_steps)
+                           if ok_steps else None),
+        "j3_abs_min_deg": (min(abs(s.q[2]) for s in ok_steps)
+                           if ok_steps else None),
+    }
+    if violations and strict:
+        print(f"错误: strict 模式下 {len(violations)} 个路点重采后仍违反"
+              f" 奇异阈值 (|J5|>={j5_min}, |J3|>={j3_min})，中止")
+        sys.exit(2)
+    return steps, report
 
 
 # --------------------------------------------------------------------------
@@ -854,6 +992,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Y 方向份数，默认 3")
     parser.add_argument("--zs", type=int, default=3,
                         help="Z 方向份数，默认 3")
+    parser.add_argument("--j5-min", type=float, default=DEFAULT_J5_MIN_DEG,
+                        metavar="DEG",
+                        help="|J5| 下限（度），低于则不接受该点的解并重采该点姿态，"
+                             f"默认 {DEFAULT_J5_MIN_DEG:g}；0 关闭")
+    parser.add_argument("--j3-min", type=float, default=0.0, metavar="DEG",
+                        help="|J3| 下限（度，肘奇异守卫），默认 0 关闭")
+    parser.add_argument("--j5-attempts", type=int, default=30, metavar="N",
+                        help="单点重采样的最大尝试次数（含首次），默认 30")
     parser.add_argument("--z-insert", type=int, default=0, metavar="N",
                         help="每次换层时在两层之间插入 N 个中间高度路点"
                              "（只变 Z，把大跳拆成短升降），默认 0 不插")
@@ -916,6 +1062,11 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     for name, n in (("xs", args.xs), ("ys", args.ys), ("zs", args.zs)):
         if n < 0:
             parser.error(f"--{name} 份数需 >= 0，当前为 {n}")
+    for name, value in (("j5-min", args.j5_min), ("j3-min", args.j3_min)):
+        if not math.isfinite(value) or value < 0:
+            parser.error(f"--{name} 需为有限非负数（deg），当前为 {value}")
+    if args.j5_attempts < 1:
+        parser.error(f"--j5-attempts 需 >= 1，当前为 {args.j5_attempts}")
     if getattr(args, "z_insert", 0) < 0:
         parser.error(f"--z-insert 需 >= 0，当前为 {args.z_insert}")
     if not math.isfinite(args.cond_max):
@@ -1127,8 +1278,19 @@ def _run_ik_chain(args: argparse.Namespace,
     # 不做任何循环重试——三轴幅度比是设计参数，同分布内再采样改变不了它。
     conditioning = evaluate_conditioning(args, waypoints, rpy_ref, poses)
 
-    # ---- 4. 链式 IK 选解 ----
-    chain = solve_chain(rbt, poses, q_seed, strict=args.strict)
+    # ---- 4. 链式 IK 选解（带奇异守卫） ----
+    guard_on = (args.j5_min > 0.0) or (args.j3_min > 0.0)
+    if guard_on:
+        chain, guard_report = solve_chain_guarded(
+            rbt, waypoints, q_seed, j5_min=args.j5_min, j3_min=args.j3_min,
+            attempts=args.j5_attempts, seed=args.seed,
+            amplitudes_deg=args.perturb_deg, extrinsic=_extrinsic_of(args),
+            strict=args.strict)
+        poses = [rbt.pose_to_T(wp.pos, wp.rpy_pert,
+                               extrinsic=_extrinsic_of(args)) for wp in waypoints]
+    else:
+        chain = solve_chain(rbt, poses, q_seed, strict=args.strict)
+        guard_report = None
 
     # ---- 5. 链结果表 ----
     for s in chain:
@@ -1148,6 +1310,16 @@ def _run_ik_chain(args: argparse.Namespace,
     print(f"成功 {len(ok_steps)}/{len(chain)}")
     print(f"构型切换次数 {n_switch}")
     print(f"Σ dqL2 = {sum_dq_l2:.2f}")
+    if guard_report is not None:
+        j5 = guard_report["j5_abs_min_deg"]
+        j3 = guard_report["j3_abs_min_deg"]
+        print(f"奇异守卫: |J5|min={_fmt_cond(j5)} (阈值 {args.j5_min:g}), "
+              f"|J3|min={_fmt_cond(j3)}"
+              + (f", 重采 {len(guard_report['resampled'])} 点"
+                 if guard_report["resampled"] else ", 无需重采"))
+        if guard_report["violations"]:
+            bad = ", ".join(f"#{v['index']}" for v in guard_report["violations"])
+            print(f"  警告: 重采后仍低于阈值: {bad}")
 
     # ---- 6b. IK 之后对**成功子集**重算实测条件数（只报告，不做门禁） ----
     ok_poses = [poses[s.index] for s in chain if s.ok]
@@ -1213,6 +1385,7 @@ def _run_ik_chain(args: argparse.Namespace,
             }
             for wp in waypoints
         ],
+        "singularity_guard": guard_report,
         "conditioning": conditioning_json,
         "perturbed_ik": [
             {

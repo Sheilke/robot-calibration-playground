@@ -194,5 +194,33 @@
     "tradeoff": {
       "note": "边长换奇异余量：670->|J3|8.3°、640->11.9°、620->14.5°、600->16.5°、560->21.2°、520->25.8°"
     }
+  },
+  "singularity_guard": {
+    "j5_min_deg": 20.0,
+    "why": "J5=0 是腕奇异；sin(20°)=0.34，有明确运动学余量。该约束是硬性的，所以按点重采姿态而不是放宽阈值",
+    "effect_on_full_aabb": {
+      "before": {
+        "j5_abs_min_deg": 12.79,
+        "points_below_25": 5
+      },
+      "after": {
+        "j5_abs_min_deg": 21.01,
+        "resampled_points": [
+          39,
+          45
+        ],
+        "configuration_switches": 12
+      }
+    },
+    "j3_cannot_be_fixed_by_resampling": {
+      "observed_j3_abs_min_deg": 1.48,
+      "attempts_at_j3_min_10": {
+        "resampled": 10,
+        "still_violating": 10,
+        "j3_abs_min_deg": 4.697
+      },
+      "reason": "远端低角 (1420, ±820, 270) 处 |p|≈1650 mm，位置本身迫使手臂接近完全伸直；重采姿态改变不了位置驱动的肘奇异",
+      "fix": "收小 AABB（见 cube 段）"
+    }
   }
 }
