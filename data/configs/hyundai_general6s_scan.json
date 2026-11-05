@@ -1,0 +1,62 @@
+{
+  "meta": {
+    "name": "hyundai_general6s_scan",
+    "robot_urdf": "data/configs/hyundai_general6s.urdf",
+    "dh_override": "data/configs/hyundai_general6s_dh.json",
+    "note": "现场路点扫描参数记录。AABB 上界待补；本文件只记录已确认的边界与姿态，便于复现同一条命令。",
+    "status": "aabb_max_pending"
+  },
+  "reference_pose": {
+    "euler_convention": "xyz-intrinsic",
+    "rpy_deg": [3, 73, -167],
+    "source": "示教器位姿 903.669 751.245 272.323 0.056 1.273 -2.906 rad 取整而来",
+    "rounding_cost_deg": 0.7033,
+    "rounding_cost_mm_at_300mm": 3.68,
+    "note": "pitch=73° 距万向锁 17°，rx/rz 列间余弦 0.956；默认幅度 5/20/15 会使门禁条件数升到 14.4"
+  },
+  "aabb": {
+    "min": [751, -823, 272],
+    "min_raw": [751.073, -822.751, 272.233],
+    "max": null,
+    "max_raw": null,
+    "note": "最小角按向下取整（与四舍五入同值），保证仍覆盖原始边界"
+  },
+  "waypoints": {
+    "xs": 3,
+    "ys": 3,
+    "zs": 2,
+    "seed": 0
+  },
+  "perturbation": {
+    "deg": [15, 20, 15],
+    "design_condition": 6.691,
+    "reason": "该参考姿态下 rx 与 rz 退化（余弦 0.956），等幅 5/20/15 会得到 cond=14.365 并被门禁拒绝；15/20/15 为数值搜索出的最均衡组合"
+  },
+  "ik_seed": {
+    "q_deg": [43, -30, -36, 42, -89, -1],
+    "note": "取该参考姿态最接近零位的一组解，保证链式 IK 从一个合法构型起步"
+  },
+  "verified": {
+    "sample_aabb": [700, 1100, 550, 950, 100, 500],
+    "ik_success": "48/48",
+    "configuration_switches": 0,
+    "sum_dq_l2": 39566.06,
+    "design_condition": 6.691,
+    "post_ik_condition": 8.104,
+    "joint_ranges_deg": {
+      "J1": [29.03, 58.18],
+      "J2": [-51.04, 8.19],
+      "J3": [-59.02, -10.46],
+      "J4": [29.61, 62.92],
+      "J5": [-113.61, -58.21],
+      "J6": [-39.54, 25.47]
+    },
+    "note": "J5 全程离 0（腕奇异）至少 58 度"
+  },
+  "corner_check": {
+    "min_corner": [751, -823, 272],
+    "solutions_within_limits": 6,
+    "closest_to_zero_q_deg": [-51.84, -27.57, -39.56, -47.98, -91.99, 33.7],
+    "abs_j5_deg": 92.0
+  }
+}
