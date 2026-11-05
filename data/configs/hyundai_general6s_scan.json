@@ -21,43 +21,36 @@
   "aabb": {
     "min": [
       750,
-      -820,
+      -600,
       270
     ],
     "max": [
-      1420,
-      800,
-      1320
+      1300,
+      600,
+      940
     ],
     "size_mm": [
-      670,
-      1620,
-      1050
+      550,
+      1200,
+      670
     ],
-    "note": "下界取整到十位（覆盖原始 751.073/-822.751/272.233）；上界由现场给定"
+    "note": "现场最终范围。由「全 AABB 无法避免肘奇异」推出：Z 跨度必须收到 670，X 收到 1300、Y 可放宽到 ±600；体积 0.44 L（比 670³ 立方体大 47%），且段内 J3 余量更好（9.61° vs 8.08°）"
   },
   "waypoints": {
     "xs": 3,
     "ys": 3,
     "zs": 2,
+    "z_insert": 1,
     "seed": 0,
-    "z_insert": 2,
-    "count": 52,
-    "spacing_mm": [
-      223,
-      540,
-      525
-    ],
+    "count": 50,
     "z_levels_mm": [
-      270.0,
-      445.0,
-      620.0,
-      795.0,
-      970.0,
-      1145.0,
-      1320.0
+      270,
+      497.5,
+      725,
+      837.5,
+      940
     ],
-    "note": "格点 48 个；每次换层插入 2 个中间高度点（只变 Z），共 +4 -> 52 点，Z 层间大跳被拆成 3 段（每段 175 mm）"
+    "note": "48 网格点 + 2 次换层各插 1 点 = 50"
   },
   "perturbation": {
     "deg": [
@@ -105,18 +98,59 @@
   "verified": {
     "aabb": [
       750,
-      1420,
-      -820,
-      800,
+      1300,
+      -600,
+      600,
       270,
-      1320
+      940
     ],
-    "ik_success": "52/52",
-    "configuration_switches": 13,
-    "sum_dq_l2": 121058.87,
-    "design_condition": 6.691,
-    "post_ik_condition": 8.558,
-    "continuity_check": "相邻两点仅一个轴变化：通过"
+    "ik_success": "50/50",
+    "configuration_switches": 0,
+    "sum_dq_l2": 132854.34,
+    "design_condition": 7.812,
+    "post_ik_condition": 9.191,
+    "joint_ranges_deg": {
+      "J1": [
+        -43.17,
+        43.38
+      ],
+      "J2": [
+        -39.52,
+        40.97
+      ],
+      "J3": [
+        -67.99,
+        -9.61
+      ],
+      "J4": [
+        -69.84,
+        61.38
+      ],
+      "J5": [
+        -105.21,
+        -28.87
+      ],
+      "J6": [
+        -73.81,
+        95.42
+      ]
+    },
+    "segment_check": {
+      "j3_abs_min": 9.61,
+      "j5_abs_min": 28.87,
+      "j3_crossings": 0,
+      "j5_crossings": 0
+    },
+    "start_point": [
+      750,
+      -600,
+      270
+    ],
+    "end_point": [
+      750,
+      600,
+      940
+    ]
   },
   "corner_check": {
     "min_corner": [
@@ -220,31 +254,8 @@
   },
   "singularity_guard": {
     "j5_min_deg": 20.0,
-    "why": "J5=0 是腕奇异；sin(20°)=0.34，有明确运动学余量。该约束是硬性的，所以按点重采姿态而不是放宽阈值",
-    "effect_on_full_aabb": {
-      "before": {
-        "j5_abs_min_deg": 12.79,
-        "points_below_25": 5
-      },
-      "after": {
-        "j5_abs_min_deg": 21.01,
-        "resampled_points": [
-          39,
-          45
-        ],
-        "configuration_switches": 12
-      }
-    },
-    "j3_cannot_be_fixed_by_resampling": {
-      "observed_j3_abs_min_deg": 1.48,
-      "attempts_at_j3_min_10": {
-        "resampled": 10,
-        "still_violating": 10,
-        "j3_abs_min_deg": 4.697
-      },
-      "reason": "远端低角 (1420, ±820, 270) 处 |p|≈1650 mm，位置本身迫使手臂接近完全伸直；重采姿态改变不了位置驱动的肘奇异",
-      "fix": "收小 AABB（见 cube 段）"
-    }
+    "resampled": "无需重采",
+    "note": "本范围下端点与段内均无奇异，守卫未触发"
   },
   "iso9283_test_cube": {
     "purpose": "ISO 9283 定位精度测试（AP/RP）用的测试立方体与 P1~P5；与上面 50 点扫描路点无关",
@@ -338,5 +349,11 @@
     },
     "tooling": "aabb_snake_scan 现在默认输出 segment_check 段（逐段 j3/j5 段内最小与是否穿 0），并打印最危险段；--strict 下穿越即退出码 2",
     "conclusion": "全 AABB 无法在不穿过 J3=0 的前提下覆盖，必须改用立方体（或进一步收小）；立方体版本 0 穿越"
+  },
+  "deliverables": {
+    "gp_file": "Documents/backup/position_R1_scan50.json（GP0001..GP0050，关节坐标）",
+    "template": "Documents/backup/position_R1_template.json（控制器原始模板，未改动）",
+    "iso5": "Documents/backup/position_R1_iso5.json（ISO 9283 5 点，笛卡尔+关节）",
+    "superseded": "全 AABB / 立方体等历史 50 点文件已清理"
   }
 }
