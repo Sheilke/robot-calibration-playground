@@ -439,6 +439,51 @@ def solve_chain(rbt, T_list, q_seed, strict: bool = False) -> list[ChainStep]:
     return steps
 
 
+def check_segments(steps, *, samples: int = 101) -> dict:
+    """检查相邻路点的**关节直线插补段内**是否穿过奇异。
+
+    端点满足 ``|J3|``/``|J5|`` 下限并不代表路径安全：两点 J3 反号时，PTP
+    插补必然经过 J3=0（手臂完全伸直），即使两端各离 0 有 8° 余量。
+    这里按关节线性插值采样 ``samples`` 点，统计段内最小 ``|J3|``、``|J5|``
+    以及是否穿越 0。
+
+    Args:
+        steps: :class:`ChainStep` 序列（只用 ``ok`` 且有解的项）。
+        samples: 每段采样点数。
+
+    Returns:
+        ``{"segments": [{"from","to","j3_abs_min","j5_abs_min",
+        "j3_crosses_zero","j5_crosses_zero"}...],
+        "j3_abs_min": float|None, "j5_abs_min": float|None,
+        "j3_crossings": int, "j5_crossings": int}``
+    """
+    usable = [s for s in steps if s.ok and s.q is not None]
+    segments = []
+    for first, second in zip(usable, usable[1:]):
+        a = np.asarray(first.q, dtype=float)
+        b = np.asarray(second.q, dtype=float)
+        t = np.linspace(0.0, 1.0, max(2, int(samples)))[:, None]
+        line = a + (b - a) * t
+        j3 = line[:, 2]
+        j5 = line[:, 4]
+        segments.append({
+            "from": int(first.index), "to": int(second.index),
+            "j3_abs_min": float(np.min(np.abs(j3))),
+            "j5_abs_min": float(np.min(np.abs(j5))),
+            "j3_crosses_zero": bool(np.min(j3) < 0.0 < np.max(j3)),
+            "j5_crosses_zero": bool(np.min(j5) < 0.0 < np.max(j5)),
+        })
+    return {
+        "segments": segments,
+        "j3_abs_min": (min(s["j3_abs_min"] for s in segments)
+                       if segments else None),
+        "j5_abs_min": (min(s["j5_abs_min"] for s in segments)
+                       if segments else None),
+        "j3_crossings": sum(1 for s in segments if s["j3_crosses_zero"]),
+        "j5_crossings": sum(1 for s in segments if s["j5_crosses_zero"]),
+    }
+
+
 def solve_chain_guarded(rbt, waypoints, q_seed, *, j5_min: float = 0.0,
                         j3_min: float = 0.0, attempts: int = 30,
                         seed: int = 0, amplitudes_deg=None,
@@ -998,6 +1043,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              f"默认 {DEFAULT_J5_MIN_DEG:g}；0 关闭")
     parser.add_argument("--j3-min", type=float, default=0.0, metavar="DEG",
                         help="|J3| 下限（度，肘奇异守卫），默认 0 关闭")
+    parser.add_argument("--seg-min", type=float, default=5.0, metavar="DEG",
+                        help="相邻两点关节插补段内 |J3|/|J5| 的最小允许值（度），"
+                             "低于则告警；穿 0 直接判失败，默认 5")
     parser.add_argument("--j5-attempts", type=int, default=30, metavar="N",
                         help="单点重采样的最大尝试次数（含首次），默认 30")
     parser.add_argument("--z-insert", type=int, default=0, metavar="N",
@@ -1302,6 +1350,31 @@ def _run_ik_chain(args: argparse.Namespace,
             print(f"#{s.index:03d} q=[{q_str}] cfg={s.config} "
                   f"dqL2={s.dq_l2:.2f} nSols={s.n_sols}")
 
+    # ---- 5b. 段内奇异检查（端点安全 ≠ 路径安全） ----
+    segment_report = check_segments(chain)
+    if segment_report["j3_crossings"] or segment_report["j5_crossings"]:
+        print(f"段内奇异: J3 穿 0 的段 {segment_report['j3_crossings']} 处"
+              f"（段内 |J3| 最小 {_fmt_cond(segment_report['j3_abs_min'])}），"
+              f"J5 穿 0 的段 {segment_report['j5_crossings']} 处"
+              f"（段内 |J5| 最小 {_fmt_cond(segment_report['j5_abs_min'])}）")
+        worst = min(segment_report["segments"],
+                    key=lambda s: s["j3_abs_min"])
+        print(f"  最危险段 #{worst['from']}->#{worst['to']}: "
+              f"|J3|min={_fmt_cond(worst['j3_abs_min'])}, "
+              f"|J5|min={_fmt_cond(worst['j5_abs_min'])}")
+        print("  端点余量足够但段内穿 0：说明相邻两点 J3（肘）反号，"
+              "PTP 插补必然经过完全伸直；需收小 AABB 或改点位")
+        if args.strict:
+            print("错误: strict 模式下段内出现奇异穿越，中止")
+            sys.exit(2)
+    elif segment_report["j3_abs_min"] is not None:
+        print(f"段内奇异检查: 无穿越，段内 |J3|min="
+              f"{_fmt_cond(segment_report['j3_abs_min'])}, |J5|min="
+              f"{_fmt_cond(segment_report['j5_abs_min'])}")
+        if min(segment_report["j3_abs_min"],
+               segment_report["j5_abs_min"]) < args.seg_min:
+            print(f"  警告: 段内最小值低于 --seg-min {args.seg_min:g}")
+
     # ---- 6. 汇总（成功率 / 构型切换 / 累计关节变化） ----
     ok_steps = [s for s in chain if s.ok]
     n_switch = sum(1 for a, b in zip(ok_steps, ok_steps[1:])
@@ -1386,6 +1459,7 @@ def _run_ik_chain(args: argparse.Namespace,
             for wp in waypoints
         ],
         "singularity_guard": guard_report,
+        "segment_check": segment_report,
         "conditioning": conditioning_json,
         "perturbed_ik": [
             {

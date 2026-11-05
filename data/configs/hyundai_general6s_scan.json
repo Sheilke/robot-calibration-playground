@@ -319,5 +319,24 @@
       "abs_j5_min_deg": 34.0,
       "side_sweep": "670/660/640/620/600/580/560/520 均为单构型且余量充足，故无需按奇异限制缩小立方体"
     }
+  },
+  "segment_singularity": {
+    "why": "端点 |J3| 有余量不代表路径安全：相邻两点 J3 反号时，PTP 关节插补必然经过 J3=0（手臂完全伸直）。现场停机就是这个原因，不是腕奇异。",
+    "full_aabb_measured": {
+      "j3_crossing_segments": 12,
+      "j3_abs_min_deg": 0.005,
+      "worst_segment": "#44->#45",
+      "j5_crossing_segments": 0,
+      "j5_abs_min_deg": 20.546
+    },
+    "cube_measured": {
+      "j3_crossing_segments": 0,
+      "j5_crossing_segments": 0,
+      "j3_abs_min_deg": 8.076,
+      "j5_abs_min_deg": 27.582,
+      "configuration_switches": 0
+    },
+    "tooling": "aabb_snake_scan 现在默认输出 segment_check 段（逐段 j3/j5 段内最小与是否穿 0），并打印最危险段；--strict 下穿越即退出码 2",
+    "conclusion": "全 AABB 无法在不穿过 J3=0 的前提下覆盖，必须改用立方体（或进一步收小）；立方体版本 0 穿越"
   }
 }
