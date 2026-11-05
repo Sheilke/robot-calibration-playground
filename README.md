@@ -48,9 +48,11 @@ robot-calibration-playground/
 │   └── src/                      # 后续放 ament_python / ament_cmake 包
 └── data/                         # 配置模板与样本（大文件不入库）
     ├── configs/
-    │   ├── ch2000_origin.urdf    # CH2000/Nexbot 标准机器人模型
-    │   ├── dh_override_example.json  # DH 覆盖参数模板
-    │   └── session_example.json      # 手眼验证会话模板（可直接跑通）
+    │   ├── ch2000_origin.urdf         # CH2000（昌宏）标准机器人模型
+    │   ├── hyundai_general6s.urdf      # Hyundai R_GENERAL_6S 机器人模型
+    │   ├── hyundai_general6s_dh.json   # 上者的 DH 显式副本（可作 --dh-old 基线）
+    │   ├── dh_override_example.json    # DH 覆盖参数模板
+    │   └── session_example.json        # 手眼验证会话模板（可直接跑通）
     └── samples/                  # 小样本数据
 ```
 
@@ -252,6 +254,25 @@ PYTHONPATH=python python3 -m excitation_trajectory.send_9011 \
 
 - **关节方向映射**：导出的角度是**模型轴角**。若实际控制器 `Direction` 不全为 1（CH2000 本体为全 1，但加外轴/不同站点需核实），需先换算再下发；JSON 的 `meta.note` 已标此项。
 - **平滑等级 `--acc`**：默认 `0`（`A=0`，点到点精确停位），采点场景**不要**设大值，否则机器人会在目标点附近平滑掠过而不真正停住。
+
+## 已入库的机器人模型
+
+| 模型 | URDF | DH 副本 | 关键参数 |
+| --- | --- | --- | --- |
+| CH2000（昌宏） | `ch2000_origin.urdf` | — | a=`150/780/250`、d=`510.5/-47.5/1048.7/102.6`、限位 J2`[-80,93]` |
+| Hyundai R_GENERAL_6S | `hyundai_general6s.urdf` | `hyundai_general6s_dh.json` | a=`159.47/770.7/141.05`、d=`446.6/1025.36/110.4`、限位 J2`[-70,180]` J3`[-80,180]` |
+
+两者 alpha 均为 `[90,0,90,90,-90,0]` 且 `a4=a5=d5=0`，满足本仓解析 IK 的结构前提
+（球型腕）。`test_robot_configs.py` 钉住三件事：URDF 可解析且结构合格、DH 副本与
+URDF 基准逐分量相等（FK 差 0）、限位内 FK→IK→FK 往返闭合。
+
+新模型上跑路点/报文（换 `--urdf` 与合适的 `--q-seed`）：
+
+```bash
+PYTHONPATH=python python3 -m excitation_trajectory.aabb_snake_scan \
+  800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 --seed 0 \
+  --urdf data/configs/hyundai_general6s.urdf --q-seed 0,45,0,0,45,0
+```
 
 ## 手眼验证（VPE）与 DH 离线重算
 
