@@ -285,8 +285,10 @@ def plot_path(points_xyz, ok_flags, out_png, title) -> None:
 def config_tag(rbt, T, q) -> tuple[int, int, int]:
     """计算解 ``q``（deg）在位姿 ``T`` 下的构型标签 ``(arm, elbow, wrist)``。
 
-    * wrist: q5 > 0 记 +1，否则 -1（恰为 0 归 -1）;
-    * elbow: q3 > 0 记 +1，否则 -1（恰为 0 归 -1）;
+    * wrist: **J5**（``q[4]``）> 0 记 +1，否则 -1（恰为 0 归 -1）。IK 的腕正/腕反
+      两支正是 ``th5 = ±acos(c5)``，所以分支标签必须看 J5；旧实现误用了 ``q[5]``
+      （J6），J6 跨 0 时会把同一构型误报成两个分支；
+    * elbow: J3（``q[2]``）> 0 记 +1，否则 -1（恰为 0 归 -1）;
     * arm (0/1): 由腕点方位反解 J1 双解 ``phi+beta`` / ``phi+pi-beta``
       （W = p - d6*z_T，phi = atan2(Wy, Wx)，beta = asin(d2/rho)），
       与 q1（wrap 后角度差）更近的候选记 0/1。
@@ -302,8 +304,8 @@ def config_tag(rbt, T, q) -> tuple[int, int, int]:
     T = np.asarray(T, dtype=float)
     q = [float(v) for v in q]
 
-    wrist = 1 if q[5] > 0 else -1
-    elbow = 1 if q[2] > 0 else -1
+    wrist = 1 if q[4] > 0 else -1          # J5 的正负决定腕部分支（ik 的 sg5）
+    elbow = 1 if q[2] > 0 else -1          # J3
 
     W = T[:3, 3] - rbt.d6 * T[:3, :3][:, 2]      # 腕点（4/5/6 轴交点）
     phi = math.atan2(W[1], W[0])

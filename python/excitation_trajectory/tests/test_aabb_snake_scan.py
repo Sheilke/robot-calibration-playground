@@ -18,9 +18,10 @@ from pathlib import Path
 
 import numpy as np
 
-from robot_model.nexbot_ik import euler_to_rot
+from robot_model.nexbot_ik import Nexbot6R, euler_to_rot
 from excitation_trajectory.aabb_snake_scan import (
     DEFAULT_COND_MAX,
+    config_tag,
     PERTURB_AMPLITUDE_DEG,
     build_arg_parser,
     design_condition_number,
@@ -463,3 +464,34 @@ class EulerConventionOptionTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(["0", "200", "0", "200", "0", "200",
                                "--euler", "zyx-intrinsic"])
+
+
+class ConfigTagTest(unittest.TestCase):
+    """构型标签必须按 IK 的真实分支变量取值（曾是 q[5]=J6 的 off-by-one）。"""
+
+    def _robot(self):
+        return Nexbot6R(str(Path(__file__).resolve().parents[3]
+                            / "data" / "configs" / "ch2000_origin.urdf"))
+
+    def test_wrist_tag_uses_j5_not_j6(self):
+        """J5 定分支、J6 随便变：标签必须只随 J5 翻。"""
+        rbt = self._robot()
+        pose = rbt.fk([0.0, 20.0, -20.0, 0.0, 60.0, 0.0])
+        positive = config_tag(rbt, pose, [0.0, 20.0, -20.0, 0.0, 60.0, 30.0])
+        negative = config_tag(rbt, pose, [0.0, 20.0, -20.0, 0.0, -60.0, 30.0])
+        # J6 同为正，但 J5 反号 -> wrist 必须不同
+        self.assertEqual(positive[2], 1)
+        self.assertEqual(negative[2], -1)
+
+    def test_j6_crossing_zero_does_not_change_wrist_tag(self):
+        rbt = self._robot()
+        pose = rbt.fk([0.0, 20.0, -20.0, 0.0, 60.0, 0.0])
+        a = config_tag(rbt, pose, [0.0, 20.0, -20.0, 0.0, 60.0, -5.0])
+        b = config_tag(rbt, pose, [0.0, 20.0, -20.0, 0.0, 60.0, 5.0])
+        self.assertEqual(a[2], b[2])
+
+    def test_elbow_tag_uses_j3(self):
+        rbt = self._robot()
+        pose = rbt.fk([0.0, 20.0, -20.0, 0.0, 60.0, 0.0])
+        self.assertEqual(config_tag(rbt, pose, [0.0, 20.0, 20.0, 0.0, 60.0, 0.0])[1], 1)
+        self.assertEqual(config_tag(rbt, pose, [0.0, 20.0, -20.0, 0.0, 60.0, 0.0])[1], -1)
