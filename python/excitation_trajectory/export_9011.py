@@ -228,10 +228,10 @@ def main(argv=None) -> int:
     parser.add_argument("--slot-start", type=int, default=SLOT_START,
                         help="T 模式下首个 P 变量编号（默认 1，与驱动一致）")
     parser.add_argument("--invert-joints", default="", metavar="J1,J2,...",
-                        help="需要取反的轴号（1 基，逗号分隔），默认不取反。用于把"
-                             "模型轴角换算成控制器下发值：CH2000 的 Direction 全为 1 "
-                             "故留空；Hyundai 该机 Direction=[-1,-1,1,-1,1,-1]，若下"
-                             "发的是电机轴角则传 1,2,4,6")
+                        help="需要取反的轴号（1 基，逗号分隔），默认不取反。模型轴角"
+                             "与示教器/关节角下发是同一约定（Direction 是控制器内部的"
+                             "编码器换算，驱动层不使用），故通常留空；仅在确认某站点"
+                             "把编码器符号泄漏进关节读数时才用")
     parser.add_argument("--ext-axis", nargs="*", type=float, default=None,
                         metavar="EXT",
                         help="7/8/9 轴站的外轴坐标（每点相同，逐个追加；"
