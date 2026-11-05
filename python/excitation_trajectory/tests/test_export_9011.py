@@ -19,6 +19,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from excitation_trajectory.export_9011 import (
+    DEFAULT_SCRATCH_SLOT,
     MAX_MESSAGE_LENGTH,
     _fixed_float,
     _fixed_int,
@@ -26,6 +27,7 @@ from excitation_trajectory.export_9011 import (
     main,
     move_data_to_str,
     position_to_str,
+    single_move_message,
     walk_messages,
 )
 
@@ -118,7 +120,7 @@ class GroupMessageTest(unittest.TestCase):
 
 class WalkMessageTest(unittest.TestCase):
     def test_one_t_per_point_with_pause_comments(self):
-        lines = walk_messages([1, 2, 3], move_data_to_str(), 6.0)
+        lines = walk_messages([1, 2, 3], move_data_to_str(), 6.0, mode="T")
         moves = [line for line in lines if line.startswith("T")]
         pauses = [line for line in lines if line.startswith("#")]
         self.assertEqual(moves, ["T00010001P-001.00000010\n",
@@ -131,9 +133,49 @@ class WalkMessageTest(unittest.TestCase):
             self.assertEqual(len(move.rstrip("\n")), 23)
 
     def test_single_point_has_no_pause(self):
-        lines = walk_messages([7], move_data_to_str(), 6.0)
+        lines = walk_messages([7], move_data_to_str(), 6.0, mode="T")
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].startswith("T"))
+
+
+class SingleMoveMessageTest(unittest.TestCase):
+    """M0：每次报文自带目标点，单次 MOVE（对比 M1 的两次移动）。"""
+
+    def test_message_layout_and_length(self):
+        data = [1.0, -2.0, 3.0, -4.0, 5.0, -6.0]
+        text = single_move_message(DEFAULT_SCRATCH_SLOT, 1, data, move_data_to_str())
+        self.assertTrue(text.startswith("M0"))
+        self.assertTrue(text.endswith("\n"))
+        body = text.rstrip("\n")
+        self.assertEqual(len(body), 2 + 53 + 14)     # M0 + 点 + movedata
+        self.assertEqual(body[2], "1")               # coord
+        self.assertEqual(int(body[2 + 49:2 + 53]), DEFAULT_SCRATCH_SLOT)
+
+    def test_only_one_move_statement(self):
+        """M0 报文里只应有一个目标位置（M1 会走两次，故被排除）。"""
+        text = single_move_message(100, 1, [0.0] * 6, move_data_to_str())
+        self.assertEqual(text.count(":") , 0)        # 无范围/多次引用
+        self.assertEqual(len(text.rstrip("\n")), 69)
+
+    def test_m0_walk_is_self_contained(self):
+        coords = [(1, [float(i)] * 6) for i in range(3)]
+        lines = walk_messages([100] * 3, move_data_to_str(), 6.0, mode="M0",
+                              coords_data=coords)
+        moves = [l for l in lines if l.startswith("M0")]
+        self.assertEqual(len(moves), 3)
+        for i, move in enumerate(moves):
+            self.assertIn(f"{float(i):08.2f}", move)   # 坐标随报文
+            self.assertEqual(int(move[51:55]), 100)    # 槽号
+
+    def test_m1_m2_m3_not_supported(self):
+        for mode in ("M1", "M2", "M3"):
+            with self.assertRaises(ValueError):
+                walk_messages([1], move_data_to_str(), 6.0, mode=mode,
+                              coords_data=[(1, [0.0] * 6)])
+
+    def test_m0_requires_coords(self):
+        with self.assertRaises(ValueError):
+            walk_messages([1], move_data_to_str(), 6.0, mode="M0")
 
 
 class CliTest(unittest.TestCase):
@@ -164,20 +206,26 @@ class CliTest(unittest.TestCase):
             code, stdout, _ = self._run(argv)
             self.assertEqual(code, 0, msg=stdout)
             self.assertIn("点位 5 个", stdout)
+            self.assertIn("M0", stdout)
 
             payload = json.loads(out_json.read_text(encoding="utf-8"))
             self.assertEqual(payload["meta"]["n_points"], 5)
             self.assertEqual(payload["meta"]["dwell_s"], 6.0)
             self.assertEqual(payload["meta"]["coord"], "axis")
-            self.assertEqual([p["slot"] for p in payload["points"]], [1, 2, 3, 4, 5])
+            self.assertEqual(payload["meta"]["walk_mode"], "M0")
+            self.assertEqual(payload["meta"]["scratch_slot"], DEFAULT_SCRATCH_SLOT)
+            self.assertEqual([p["slot"] for p in payload["points"]],
+                             [DEFAULT_SCRATCH_SLOT] * 5)
             # 失败的 lot 被跳过
             self.assertEqual([p["index"] for p in payload["points"]], [0, 1, 2, 3, 4])
 
             text = out_msg.read_text(encoding="utf-8")
-            self.assertIn("点位下载", text)
+            self.assertNotIn("G4", text)                   # M0 不做点位下载
             self.assertIn("逐点行走", text)
             self.assertTrue(text.rstrip().endswith("Q0"))
             self.assertEqual(text.count("sleep 6 s"), 4)   # 5 点 → 4 处暂停
+            self.assertEqual(len([l for l in text.splitlines()
+                                  if l.startswith("M0")]), 5)
 
     def test_axis_coordinates_round_trip_to_scan(self):
         """报文里的轴角必须与 scan_result 的 q 一致（量化到 0.01 度）。"""
@@ -190,17 +238,36 @@ class CliTest(unittest.TestCase):
             code, _, _ = self._run([str(scan), "--out", str(root / "p.json"),
                                     "--messages", str(out_msg)])
             self.assertEqual(code, 0)
-            first_line = next(line for line in out_msg.read_text(
-                encoding="utf-8").splitlines() if line.startswith("G"))
-            body = first_line.strip()[2:]
-            decoded = [_decode_point(body[i * 53:(i + 1) * 53])
-                       for i in range(len(body) // 53)]
-            self.assertEqual(len(decoded), 3)
-            for (coord, values, slot), step in zip(decoded,
-                                                   payload["perturbed_ik"][:3]):
+            # M0 每条报文自带目标点：取所有 M0 行，按 "M0"+53字+14字 切
+            moves = [line.rstrip("\n") for line in out_msg.read_text(
+                encoding="utf-8").splitlines() if line.startswith("M0")]
+            self.assertEqual(len(moves), 3)
+            for move, step in zip(moves, payload["perturbed_ik"][:3]):
+                self.assertEqual(len(move), 2 + 53 + 14)
+                record = move[2:2 + 53]
+                coord, values, slot = _decode_point(record)
                 self.assertEqual(coord, 1)
-                self.assertEqual(slot, step["index"] + 1)
+                self.assertEqual(slot, DEFAULT_SCRATCH_SLOT)
                 self.assertEqual(values, [round(v, 2) for v in step["q"]])
+
+    def test_t_mode_still_available(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            scan = root / "scan.json"
+            scan.write_text(json.dumps(self._scan_payload(5)), encoding="utf-8")
+            out_msg = root / "m.txt"
+            code, stdout, _ = self._run([str(scan), "--out", str(root / "p.json"),
+                                         "--messages", str(out_msg), "--walk", "T"])
+            self.assertEqual(code, 0, msg=stdout)
+            text = out_msg.read_text(encoding="utf-8")
+            self.assertIn("点位下载", text)
+            self.assertEqual(len([l for l in text.splitlines()
+                                  if l.startswith("G")]), 2)   # 5 点 → 4+1
+            self.assertEqual(len([l for l in text.splitlines()
+                                  if l.startswith("T")]), 5)
+            payload = json.loads((root / "p.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["meta"]["walk_mode"], "T")
+            self.assertIsNone(payload["meta"]["scratch_slot"])
 
     def test_invalid_dwell(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:

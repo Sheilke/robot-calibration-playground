@@ -9,14 +9,20 @@
   避免控制器自己解笛卡尔 IK 时跳构型。
 * 下位 JOB（nexbot_controller_driver/robot_down/*/N9011.JBR，Hyundai 9011 同
   构）是 ENET 定长字符串协议：
-  - ``G{N}`` + N 个点（每点 ``coord(1) + 6×8 字(2 位小数) + P 编号(4)``），
-    报文上限 240 字符 → 6 轴点每包最多 4 个，本工具自动分包；
-  - ``T{begin:04d}{end:04d}{movedata}`` 逐点走 P[begin..end]，
-    movedata = ``{P|L}`` + ``speed(7,2 位小数)`` + ``acc(1)`` + ``tool(1)``
-    + ``ratio(4, 百分数)``。
-* **9011 的 T 循环没有停留参数**（N9011.JBR 的 WHILE 循环 MOVE 后直接下一
-  点；Hyundai 9011.JOB 同）。逐点 6 秒暂停必须由**上位发送循环**实现：每发
-  一条单点 T、等运动完成后 sleep ``--dwell`` 秒再发下一条。报文脚本里用
+  - ``M0`` + 单点（``coord(1) + 每轴 8 字(2 位小数) + slot(4)``）+ movedata：
+    **每次报文自带目标点**，单次 MOVE，movedata = ``{P|L}`` + ``speed(7)``
+    + ``acc(1)`` + ``tool(1)`` + ``ratio(4)``。默认用这个（无下载状态可失效）；
+  - ``G{N}`` + N 个点下载到 P[slot]（每点 53 字，报文上限 240 字符 →
+    6 轴每包最多 4 点，且 ``G`` 头计数只有 1 位），再 ``T{begin:04d}{end:04d}``
+    引用已下载的 P 号逐点走（``--walk T``）。
+* **不用 ``M1``**：subtype 1 是 J6 解缠专用，会（a）每点走**两次**
+  （Hyundai S9 + S11；Nexbot MOVJ + MOVJ）、（b）把 J6 强缠进 ±180°
+  （改掉 IK 给定的关节值）、（c）Hyundai 侧第二次移动写死 ``S=V12!mm/s``，
+  百分比模式（speed<0）会变成负的 mm/s。``M2``/``M3`` 同理（把 J6 推到
+  正/负极限）。
+* **9011 的移动指令都没有停留参数**（N9011 的 WHILE / Hyundai 的 FOR 循环
+  都是 MOVE 完直接下一点）。逐点 6 秒暂停必须由**上位发送循环**实现：每发
+  一条单点报文、等运动完成后 sleep ``--dwell`` 秒再发下一条。报文脚本里用
   注释行标注暂停点。
 
 用法（仓库根）::
@@ -43,6 +49,13 @@ MAX_MESSAGE_LENGTH = 240
 # 与 robot.h kNexbotPathRegisterStart 一致（P 变量从 1 号开始）
 SLOT_START = 1
 DEFAULT_DWELL_S = 6.0
+#: 单点行走默认用 M0：报文自带目标点，不依赖之前的 G 下载；
+#: M1/M2/M3 是 J6 解缠分支（每点走两次），采点不能用。
+DEFAULT_WALK = "M0"
+WALK_MODES = ("M0", "T")
+#: M0 用的暂存 P 号。取 100 与公司驱动 ``kCalibrationPointStatus`` 一致，
+#: 避开路径占用槽位 P1..PN。
+DEFAULT_SCRATCH_SLOT = 100
 DEFAULT_SPEED = -1.0          # <0 → 百分比模式（N9011 的 MOVJ 固定 VJ=5%）
 DEFAULT_ACC = 0
 DEFAULT_TOOL = 0
@@ -119,11 +132,38 @@ def group_messages(points, slot_start: int = SLOT_START) -> list:
     return chunks
 
 
-def walk_messages(slots, move_data: str, dwell_s: float) -> list:
-    """逐点单步 T 报文 + 上位暂停标注（T 循环本身无停留参数）。"""
+def single_move_message(slot: int, coord: int, data, move_data: str) -> str:
+    """``M0`` 单点报文：``M`` + subtype(1) + 点(53) + movedata(14) + 换行。
+
+    与 ``HyundaiRobot::MovementToMsg`` / ``NexbotProtocol`` 的 M 分支一致：
+    目标点随报文下发，**不依赖任何已下载的 P 数组**。
+    """
+    return f"M0{position_to_str(coord, data, slot)}{move_data}\n"
+
+
+def walk_messages(slots, move_data: str, dwell_s: float, *,
+                  mode: str = DEFAULT_WALK, coords_data=None) -> list:
+    """生成逐点移动报文 + 上位暂停标注（下位移动指令无停留参数）。
+
+    Args:
+        slots: 每点的 P 编号（``T`` 模式下是下载槽号；``M0`` 模式下是暂存槽）。
+        move_data: :func:`move_data_to_str` 的结果。
+        dwell_s: 点到点之间的暂停秒数（写进注释，由上位执行）。
+        mode: ``"M0"``（默认，自带坐标）或 ``"T"``（引用已下载 P）。
+        coords_data: ``M0`` 模式必需，``[(coord, data), ...]`` 与 ``slots``
+            一一对应。
+    """
+    if mode not in WALK_MODES:
+        raise ValueError(f"mode 需为 {WALK_MODES} 之一，当前 {mode!r}")
     lines = []
     for i, slot in enumerate(slots, start=1):
-        lines.append(f"T{_fixed_int(slot, 4)}{_fixed_int(slot, 4)}{move_data}\n")
+        if mode == "M0":
+            if coords_data is None:
+                raise ValueError("M0 模式需要 coords_data（每点坐标）")
+            coord, data = coords_data[i - 1]
+            lines.append(single_move_message(slot, coord, data, move_data))
+        else:
+            lines.append(f"T{_fixed_int(slot, 4)}{_fixed_int(slot, 4)}{move_data}\n")
         if i < len(slots):
             lines.append(f"# [{i}/{len(slots)}] 等运动完成后 sleep {dwell_s:g} s 再发下一条\n")
     return lines
@@ -172,8 +212,16 @@ def main(argv=None) -> int:
                         help="工具号（0=Tool0 法兰），默认 0")
     parser.add_argument("--ratio", type=int, default=DEFAULT_RATIO_PCT,
                         help="速度百分比（movedata 末 4 位），默认 10")
+    parser.add_argument("--walk", choices=WALK_MODES, default=DEFAULT_WALK,
+                        help="逐点移动的报文形式：M0=每次自带目标点（默认，"
+                             "不依赖预下载，G 丢包也不会走到旧 P）；T=引用 G 下载"
+                             "的 P 号。M1/M2/M3 是 J6 解缠分支，故不提供")
+    parser.add_argument("--scratch-slot", type=int,
+                        default=DEFAULT_SCRATCH_SLOT,
+                        help=f"M0 模式用的暂存 P 号（默认 "
+                             f"{DEFAULT_SCRATCH_SLOT}，避开路径槽位 P1..PN）")
     parser.add_argument("--slot-start", type=int, default=SLOT_START,
-                        help="首个 P 变量编号（默认 1，与驱动一致）")
+                        help="T 模式下首个 P 变量编号（默认 1，与驱动一致）")
     parser.add_argument("--ext-axis", nargs="*", type=float, default=None,
                         metavar="EXT",
                         help="7/8/9 轴站的外轴坐标（每点相同，逐个追加；"
@@ -186,6 +234,10 @@ def main(argv=None) -> int:
         parser.error(f"--acc 需在 0..9，当前 {args.acc}")
     if not (0 <= args.ratio <= 9999):
         parser.error(f"--ratio 需在 0..9999，当前 {args.ratio}")
+    if not (1 <= args.scratch_slot <= 9999):
+        parser.error(f"--scratch-slot 需在 1..9999，当前 {args.scratch_slot}")
+    if args.walk == "T" and args.scratch_slot != DEFAULT_SCRATCH_SLOT:
+        parser.error("--scratch-slot 仅用于 M0 模式，T 模式请用 --slot-start")
 
     scan_path = Path(args.scan)
     points = load_scan_points(scan_path)
@@ -196,32 +248,45 @@ def main(argv=None) -> int:
         data = list(item["q"]) + list(ext)
         wire_points.append((1, data))          # coord=1 轴坐标
     try:
-        chunks = group_messages(wire_points, args.slot_start)
         move_data = move_data_to_str(args.move_type, args.speed, args.acc,
                                      args.tool, args.ratio)
+        if args.walk == "T":
+            chunks = group_messages(wire_points, args.slot_start)
+            slots = [s for chunk_slots, _ in chunks for s in chunk_slots]
+        else:
+            chunks = []
+            slots = [args.scratch_slot] * len(wire_points)
+        walk = walk_messages(slots, move_data, args.dwell, mode=args.walk,
+                             coords_data=wire_points)
     except ValueError as error:
         print(f"错误: {error}", file=sys.stderr)
         return 2
 
-    slots = [s for chunk_slots, _ in chunks for s in chunk_slots]
-    walk = walk_messages(slots, move_data, args.dwell)
-
-    lines = ["# ---- 1) 点位下载（G 分包，逐行发送，等回包后再发下一条） ----\n"]
-    lines += [msg for _, msg in chunks]
-    lines.append(f"# ---- 2) 逐点行走（共 {len(slots)} 点；每条 T 只走 1 点） ----\n")
+    lines = []
+    if chunks:
+        lines.append("# ---- 1) 点位下载（G 分包，逐行发送，等回包后再发下一条） ----\n")
+        lines += [msg for _, msg in chunks]
+        lines.append(f"# ---- 2) 逐点行走（共 {len(slots)} 点；每条 T 只走 1 点） ----\n")
+    else:
+        lines.append(
+            f"# ---- 逐点行走（共 {len(slots)} 点；每条 M0 自带目标点，"
+            f"不依赖预下载的 P，movedata={move_data}） ----\n")
     lines += walk
-    lines.append("# ---- 3) 结束退出 ----\nQ0\n")
+    lines.append("# ---- 结束退出 ----\nQ0\n")
     Path(args.messages).write_text("".join(lines), encoding="utf-8")
 
     payload = {
         "meta": {
             "source_scan": str(scan_path),
             "n_points": len(slots),
-            "slot_start": args.slot_start,
+            "walk_mode": args.walk,
+            "slot_start": args.slot_start if args.walk == "T" else None,
+            "scratch_slot": args.scratch_slot if args.walk == "M0" else None,
             "coord": "axis",
             "dwell_s": args.dwell,
             "note": ("轴坐标=模型关节角(度)，方向映射 identity（如现场 Direction "
-                     "非全 1 需先换算）；逐点暂停由上位在每条 T 后执行"),
+                     "非全 1 需先换算）；逐点暂停由上位在每条移动报文后执行；"
+                     "不用 M1/M2/M3（J6 解缠分支，每点走两次）"),
             "move_data": {"type": args.move_type, "speed": args.speed,
                           "acc": args.acc, "tool": args.tool,
                           "ratio_pct": args.ratio},
@@ -236,11 +301,13 @@ def main(argv=None) -> int:
         json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
         encoding="utf-8")
 
-    print(f"点位 {len(slots)} 个（P{slots[0]}..P{slots[-1]}），"
-          f"G 报文 {len(chunks)} 包")
+    if args.walk == "T":
+        print(f"点位 {len(slots)} 个（P{slots[0]}..P{slots[-1]}），G 报文 {len(chunks)} 包")
+    else:
+        print(f"点位 {len(slots)} 个（每条 M0 自带坐标，暂存 P{args.scratch_slot}）")
     print(f"JSON:   {args.out}")
     print(f"报文:   {args.messages}")
-    print(f"行走:   每点一条单步 T，运动完成后 sleep {args.dwell:g} s")
+    print(f"行走:   每点一条单步 {args.walk}，运动完成后 sleep {args.dwell:g} s")
     return 0
 
 

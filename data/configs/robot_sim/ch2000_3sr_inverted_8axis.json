@@ -1,0 +1,219 @@
+{
+ "format": "robot-sim-robot",
+ "id": "ch2000_3sr_inverted_8axis",
+ "name": "CH2000 3SR 倒装八轴",
+ "description": "由 robot_descriptions 装配体 ch2000_3sr_inverted_8axis_description 生成",
+ "asset_revision": "b68d0e7e80df427560196e9886a3864871fddd2e4888fd75a898fa769efd2c04",
+ "units": [
+  {
+   "prefix": "",
+   "arm": {
+    "kinematic_chain": {
+     "base_link": "base_link",
+     "tip_link": "arm_link_flange"
+    },
+    "mdh": [
+     [
+      0,
+      0,
+      510.5,
+      0
+     ],
+     [
+      -90,
+      150,
+      0,
+      -90
+     ],
+     [
+      0,
+      780,
+      47.5,
+      0
+     ],
+     [
+      -90,
+      250,
+      1048.7,
+      0
+     ],
+     [
+      90,
+      0,
+      0,
+      0
+     ],
+     [
+      -90,
+      0,
+      102.6,
+      180
+     ]
+    ],
+    "joint_direction": [
+     1,
+     -1,
+     -1,
+     1,
+     1,
+     1
+    ],
+    "joint_limits_deg": [
+     [
+      -170,
+      170
+     ],
+     [
+      -100,
+      150
+     ],
+     [
+      -135,
+      85
+     ],
+     [
+      -180,
+      180
+     ],
+     [
+      -105,
+      105
+     ],
+     [
+      -210,
+      210
+     ]
+    ],
+    "velocity_deg_s": [
+     330,
+     330,
+     375,
+     450,
+     450,
+     600
+    ],
+    "acceleration_deg_s2": [
+     1500,
+     1500,
+     1500,
+     3000,
+     3000,
+     3000
+    ],
+    "jerk_deg_s3": [
+     10000,
+     10000,
+     10000,
+     20000,
+     20000,
+     20000
+    ],
+    "tcp_speed_mm_s": 500,
+    "tcp_acceleration_mm_s2": 2000,
+    "tcp_rotation_deg_s": 180,
+    "ik_config": null,
+    "sing_guard": {
+     "shoulder_on": true,
+     "min_shoulder": 300,
+     "reach_on": true,
+     "max_reach": 1808.0870512161807
+    },
+    "safe_pose": {
+     "joints": [
+      0,
+      0,
+      0,
+      0,
+      -90,
+      0
+     ]
+    },
+    "tool": {
+     "name": "3SR 焊枪",
+     "tcp": {
+      "xyz": [
+       -107.65,
+       4.0551,
+       544.42
+      ],
+      "rpy": [
+       44.965155,
+       -1.998763,
+       -90.00021
+      ]
+     }
+    }
+   },
+   "external": {
+    "compensation": [
+     {
+      "enabled": false,
+      "lower": 300,
+      "upper": 1300
+     },
+     {
+      "enabled": false,
+      "lower": -1000,
+      "upper": 1000
+     },
+     {
+      "enabled": false,
+      "lower": 500,
+      "upper": 1000
+     }
+    ],
+    "axes": {
+     "ext_axis_joint_1": {
+      "shared": false,
+      "default": 0,
+      "limits": [
+       0,
+       4600
+      ],
+      "velocity": 500,
+      "acceleration": 2500,
+      "jerk": 15000
+     },
+     "ext_axis_joint_2": {
+      "shared": false,
+      "default": 0,
+      "limits": [
+       0,
+       2400
+      ],
+      "velocity": 500,
+      "acceleration": 2500,
+      "jerk": 15000
+     }
+    }
+   },
+   "sensors": [
+    {
+     "id": "s1",
+     "name": "相机 1",
+     "parent": "arm_link_flange",
+     "offset": {
+      "xyz": [
+       130,
+       0,
+       100
+      ],
+      "wxyz": [
+       0.9238795325112867,
+       0,
+       0.38268343236508984,
+       0
+      ]
+     },
+     "width": 640,
+     "height": 480,
+     "hfov_deg": 60,
+     "near_mm": 50,
+     "far_mm": 5000,
+     "noise_mm": 0
+    }
+   ]
+  }
+ ],
+ "sensors": []
+}
