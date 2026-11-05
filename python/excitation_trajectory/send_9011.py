@@ -48,6 +48,28 @@ DEFAULT_TIMEOUT_S = 120.0
 #: 下位 ``done`` 与 ``ready`` 之间的 ``TIMER T = 0.1``
 HANDSHAKE_GAP_S = 0.1
 
+#: 帧结束符。Nexbot 的 ``OPENMSG`` 分隔/帧尾是**控制器侧设置**（N9018.JBR
+#: 注释写「分隔/帧尾用 ``;``（按现场控制器设置）」），而 C++ 驱动只发 ``\n``；
+#: 两者不一致时表现为“报文发出去了但机器人不动”。
+TERMINATORS = {
+    "lf": "\n",
+    "crlf": "\r\n",
+    "semicolon": ";",
+    "lf-semicolon": "\n;",
+}
+DEFAULT_TERMINATOR = "lf"
+#: 读应答时把这些字符都当分隔（兼容控制器任意帧方式）
+_RECV_SEPARATORS = "\r\n;"
+
+
+def _terminator_of(name: str) -> str:
+    """结束符名 -> 实际字节串。"""
+    try:
+        return TERMINATORS[name]
+    except KeyError as error:
+        raise ProtocolError(
+            f"--terminator 需为 {sorted(TERMINATORS)} 之一，当前 {name!r}") from error
+
 
 def local_ipv4_addresses(include_loopback: bool = False) -> list:
     """列出本机 IPv4 地址（不依赖第三方库，不发送任何报文）。"""
@@ -112,8 +134,9 @@ def move_data_str(spec: dict) -> str:
             f"{acc:01d}{tool:01d}{ratio:04d}")
 
 
-def point_to_message(point: dict, move_data: str) -> str:
-    """单个点 -> ``M0`` 报文行（与 ``export_9011.single_move_message`` 同格式）。"""
+def point_to_message(point: dict, move_data: str,
+                     terminator: str = DEFAULT_TERMINATOR) -> str:
+    """单个点 -> ``M0`` 报文（含结束符；默认 ``\n``）。"""
     coord = int(point.get("coord", 1))
     data = [float(v) for v in point["data"]]
     slot = int(point["slot"])
@@ -124,10 +147,11 @@ def point_to_message(point: dict, move_data: str) -> str:
             raise ProtocolError(f"坐标 {value} 超出 8 字宽")
         fields.append(text)
     fields.append(f"{slot:04d}")
-    return f"M0{''.join(fields)}{move_data}\n"
+    return f"M0{''.join(fields)}{move_data}{_terminator_of(terminator)}"
 
 
-def build_plan(points_path, *, start=None, end=None, dwell=None) -> dict:
+def build_plan(points_path, *, start=None, end=None, dwell=None,
+               terminator: str = DEFAULT_TERMINATOR) -> dict:
     """读 ``calib_points_9011.json`` 并生成待发报文序列。"""
     payload = json.loads(Path(points_path).read_text(encoding="utf-8"))
     meta = payload.get("meta", {})
@@ -147,7 +171,8 @@ def build_plan(points_path, *, start=None, end=None, dwell=None) -> dict:
 
     move_data = move_data_str(meta.get("move_data", {}))
     selected = points[lo - 1:hi]
-    lines = [point_to_message(point, move_data) for point in selected]
+    lines = [point_to_message(point, move_data, terminator)
+             for point in selected]
     return {
         "lines": lines,
         "points": selected,
@@ -156,6 +181,7 @@ def build_plan(points_path, *, start=None, end=None, dwell=None) -> dict:
         "move_data": move_data,
         "total": len(points),
         "range": (lo, hi),
+        "terminator": terminator,
     }
 
 
@@ -229,25 +255,34 @@ class RobotLink:
         self._conn.sendall(line.encode("ascii"))
 
     def read_line(self, timeout_s: float | None = None) -> str:
-        """读一行（去 ``\\r\\n``）；超时抛 ``ProtocolError``。"""
+        """读一条应答；``\\n`` / ``\\r`` / ``;`` 都当分隔符（兼容控制器帧设置）。"""
         if self._conn is None:
             raise ProtocolError("未连接控制器")
         self._conn.settimeout(self.timeout_s if timeout_s is None else timeout_s)
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
-        while b"\n" not in self._buffer:
+        while True:
+            cuts = [self._buffer.find(ch.encode())
+                    for ch in _RECV_SEPARATORS]
+            cuts = [pos for pos in cuts if pos >= 0]
+            if cuts:
+                cut = min(cuts)
+                line, self._buffer = self._buffer[:cut], self._buffer[cut + 1:]
+                text = line.decode("ascii", errors="replace").strip()
+                if text:
+                    return text
+                continue                     # 连续分隔符产生的空 token 跳过
             if deadline is not None and time.monotonic() > deadline:
                 raise ProtocolError(f"{timeout_s:g} s 内未收到应答")
             try:
                 chunk = self._conn.recv(4096)
             except socket.timeout as error:
                 raise ProtocolError(
-                    f"{self.timeout_s:g} s 内未收到应答（下一条指令前必须收到 done/ready）"
-                ) from error
+                    f"{self.timeout_s:g} s 内未收到应答（下一条指令前必须收到 "
+                    "done/ready；若报文已发但无任何回包，检查控制器 OPENMSG 的帧"
+                    "分隔/结束符是否与本工具 --terminator 一致）") from error
             if not chunk:
                 raise ProtocolError("控制器断开连接")
             self._buffer += chunk
-        line, _, self._buffer = self._buffer.partition(b"\n")
-        return line.decode("ascii", errors="replace").strip()
 
     def wait_handshake(self) -> tuple:
         """等到 ``done`` 之后再等到 ``ready``；返回 (done 行, ready 行)。
@@ -319,13 +354,18 @@ def main(argv=None) -> int:
                         help="不等 done/ready（不推荐：无法确认运动是否完成）")
     parser.add_argument("--quit", action="store_true",
                         help="结束时发 Q0（注意：Q0 会让 JOB 结束，之后必须重新运行 9011）")
+    parser.add_argument("--terminator", choices=sorted(TERMINATORS),
+                        default=DEFAULT_TERMINATOR,
+                        help="帧结束符（默认 lf）。Nexbot 的 OPENMSG 用控制器侧"
+                             "分隔/帧尾设置；若注释写「分隔/帧尾用 ;」而本工具发 \\n，"
+                             "报文会不被分发：此时用 semicolon 或 lf-semicolon")
     parser.add_argument("--dry-run", action="store_true",
                         help="只打印将要发送的报文，不监听端口")
     args = parser.parse_args(argv)
 
     try:
         plan = build_plan(args.points, start=args.start, end=args.end,
-                          dwell=args.dwell)
+                          dwell=args.dwell, terminator=args.terminator)
     except (OSError, KeyError, ValueError, ProtocolError) as error:
         print(f"错误: {error}", file=sys.stderr)
         return 2
@@ -336,7 +376,7 @@ def main(argv=None) -> int:
     lo, hi = plan["range"]
     print(f"[计划] 共 {plan['total']} 点，本次发第 {lo}..{hi} 点"
           f"（{len(plan['lines'])} 条），movedata={plan['move_data']}，"
-          f"每点暂停 {plan['dwell_s']:g}s")
+          f"每点暂停 {plan['dwell_s']:g}s，结束符={plan['terminator']!r}")
     print(f"[网络] 本机监听 {args.host}:{args.port}"
           + (f"，只接受 {args.expect_peer} 的连接" if args.expect_peer else "")
           + f"；本机 IPv4: {', '.join(local_ipv4_addresses()) or '未检测到'}")

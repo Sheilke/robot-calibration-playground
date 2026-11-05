@@ -289,3 +289,45 @@ class NetworkPreflightTest(unittest.TestCase):
             self.assertEqual(link.peer, "127.0.0.1")
             run_plan(link, plan, log=lambda *_: None, sleep=lambda _s: None)
         holder["c"].join(5)
+
+
+class TerminatorTest(unittest.TestCase):
+    """OPENMSG 的帧分隔/帧尾是控制器侧设置，与报文结束符必须一致。"""
+
+    def test_terminator_variants(self):
+        point = {"slot": 100, "coord": 1, "data": [0.0] * 6}
+        for name, expected in (("lf", "\n"), ("crlf", "\r\n"),
+                               ("semicolon", ";"), ("lf-semicolon", "\n;")):
+            with self.subTest(terminator=name):
+                text = point_to_message(point, "P-001.00000010", name)
+                self.assertTrue(text.endswith(expected))
+                self.assertEqual(len(text), 69 + len(expected))
+
+    def test_unknown_terminator(self):
+        with self.assertRaises(ProtocolError):
+            point_to_message({"slot": 1, "coord": 1, "data": [0.0] * 6},
+                             "P-001.00000010", "nul")
+
+    def test_semicolon_framing_round_trip(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            plan = build_plan(_make_points(tmp), terminator="semicolon")
+            self.assertTrue(all(line.endswith(";") for line in plan["lines"]))
+            self.assertEqual(plan["terminator"], "semicolon")
+
+    def test_reader_accepts_semicolon_framed_replies(self):
+        """下位若回 ``done;ready;``，读取端也必须能拆开。"""
+        holder = {}
+
+        def start_fake(link):
+            def client():
+                time.sleep(0.1)
+                with socket.create_connection(("127.0.0.1", link.port),
+                                              timeout=5) as sock:
+                    sock.sendall(b"done;ready;")     # 分号分帧，一次到齐
+                    time.sleep(0.5)
+            threading.Thread(target=client, daemon=True).start()
+
+        with RobotLink("127.0.0.1", 0, timeout_s=3, accept_timeout_s=5,
+                       on_listening=start_fake) as link:
+            done, ready = link.wait_handshake()
+        self.assertEqual((done, ready), ("done", "ready"))
