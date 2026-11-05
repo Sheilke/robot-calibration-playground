@@ -268,6 +268,7 @@ def _session_section(session, vpe_result) -> list:
          else (_display_path(dh_override) if isinstance(dh_override, str)
                else _meta_text(dh_override))),
         ("关节约定", _meta_text(meta.get("joint_convention"))),
+        ("欧拉约定", getattr(session, "euler_convention", "xyz-intrinsic")),
         ("坐标单位", _meta_text(meta.get("units"))),
         ("样本数", str(int(vpe_result["n_samples"]))),
         ("总帧数", str(int(vpe_result["n_frames"]))),

@@ -104,6 +104,10 @@ PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
   800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 \
   --perturb-deg 20 15 10 --cond-max 9
 
+# 1b. 指定欧拉约定：xyz-intrinsic = Rx·Ry·Rz（Nexbot 控制器链路）
+PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
+  800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 --euler xyz-intrinsic
+
 # 2. 仅预览连续蛇形网格，不求解 IK
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
   0 200 0 200 0 200 --xs 2 --ys 2 --zs 2 --skip-ik
@@ -190,6 +194,7 @@ PYTHONPATH=python python3 -m handeye.offline_recompute \
 | `meta.robot_urdf` | 机器人模型（URDF），相对仓库根或绝对路径 |
 | `meta.dh_override` | DH 覆盖 JSON；`null` 表示用 URDF 基准参数 |
 | `meta.joint_convention` | 固定 `"model"`（模型轴角度，API 不传 Direction 映射）|
+| `meta.euler_convention` | 可选，`"xyz-intrinsic"`（默认，Nexbot 链路）/ `"xyz-extrinsic"`（定轴 RPY），作用于 `recorded_pose` 的 orientation |
 | `meta.units` | 固定 `"mm"` |
 | `reference.p_ball_laser_base` | 跟踪仪实测球心（换算到基座系）|
 | `reference.delta_p_base` | Tool0—靶球固定偏置 `^B ΔP`，可为 `null` |
@@ -200,7 +205,7 @@ PYTHONPATH=python python3 -m handeye.offline_recompute \
 
 ### 两条必须知道的自检与陷阱
 
-1. **运动学一致性自检（`--fk-tolerance-mm`，默认 1.0）**：把 `recorded_pose` 与 `FK(q, θ)` 对比。若这里就超阈值，说明 DH、单位或欧拉约定有错，**后续 VPE 结论全部不可信**。典型错误是欧拉约定——控制器/Nexbot 链路用 **XYZ 内旋**（`R = Rx·Ry·Rz`，C++ `kXyzIntrinsic`），本仓库 `pose_encoder` 已固定此约定；本仓库其他工具默认的 `extrinsic=True` 是 `Rz·Ry·Rx`，两者不同。
+1. **运动学一致性自检（`--fk-tolerance-mm`，默认 1.0）**：把 `recorded_pose` 与 `FK(q, θ)` 对比。若这里就超阈值，说明 DH、单位或欧拉约定有错，**后续 VPE 结论全部不可信**。典型错误是欧拉约定——控制器/Nexbot 链路用 **XYZ 内旋**（`R = Rx·Ry·Rz`，C++ `kXyzIntrinsic`），本仓库 `pose_encoder` 默认即此约定；若会话里的 `recorded_pose` 来自默认定轴 RPY（`Rz·Ry·Rx`）的工具，在 `meta.euler_convention` 里写 `"xyz-extrinsic"` 即可，两约定同名可选项为 `xyz-intrinsic | xyz-extrinsic`。
 2. **手眼矩阵单位有两套**：`common_config` 存的是**米制**（`toolFromCameraMm()` 乘 1000 可证），而动作 `EyeOnHandCalibrationResult.matrix` 返回的是 **mm**（全程用 robot_pt 的 mm 计算）。`se3.load_matrix16` 强制显式声明 `units`，不会静默换算错。
 
 ### 离线重算的两个方法学选择

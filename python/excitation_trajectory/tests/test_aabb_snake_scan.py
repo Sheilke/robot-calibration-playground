@@ -422,3 +422,44 @@ class ConditioningGateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EulerConventionOptionTest(unittest.TestCase):
+    """--euler 选项：与 --intrinsic 等价、与默认（xyz-extrinsic）可区分。"""
+
+    @staticmethod
+    def _run(extra, out, plot):
+        argv = ["800", "1200", "-200", "200", "800", "1000",
+                "--xs", "1", "--ys", "1", "--zs", "0",
+                "--seed", "3", "--out", str(out), "--plot", str(plot)] + extra
+        with redirect_stdout(io.StringIO()):
+            code = main(argv)
+        assert code == 0
+        return json.loads(Path(out).read_text(encoding="utf-8"))
+
+    def test_euler_option_and_intrinsic_alias(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            default = self._run([], root / "a.json", root / "a.png")
+            extrinsic = self._run(["--euler", "xyz-extrinsic"],
+                                  root / "b.json", root / "b.png")
+            intrinsic_flag = self._run(["--intrinsic"], root / "c.json",
+                                       root / "c.png")
+            intrinsic_opt = self._run(["--euler", "xyz-intrinsic"],
+                                      root / "d.json", root / "d.png")
+            self.assertEqual(default["meta"]["euler_convention"],
+                             "xyz-extrinsic")
+            self.assertEqual(default, extrinsic)
+            self.assertEqual(intrinsic_flag, intrinsic_opt)
+            self.assertEqual(intrinsic_opt["meta"]["euler_convention"],
+                             "xyz-intrinsic")
+            # 两约定对同一扰动序列给出不同的 IK 解（rpy 数值本身与约定无关，
+            # 约定只在 rpy -> 旋转矩阵时生效，因此差异体现在 perturbed_ik 的 q 上）
+            self.assertNotEqual(default["perturbed_ik"],
+                                intrinsic_opt["perturbed_ik"])
+
+    def test_invalid_euler_choice_rejected(self):
+        parser = build_arg_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["0", "200", "0", "200", "0", "200",
+                               "--euler", "zyx-intrinsic"])

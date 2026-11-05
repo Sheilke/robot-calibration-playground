@@ -35,6 +35,14 @@ EULER_ORDER = "XYZ"
 #: 是否定轴（外旋）。``False`` = 动轴（内旋），即 ``R = Rx·Ry·Rz``。
 EXTRINSIC = False
 
+#: 支持的欧拉约定（对外统一命名，供 CLI / 会话 JSON 使用）。
+#: ``xyz-intrinsic`` = ``R = Rx·Ry·Rz``（C++ ``kXyzIntrinsic``，Nexbot 链路）；
+#: ``xyz-extrinsic`` = ``R = Rz·Ry·Rx``（RPY 定轴，本仓其他工具默认）。
+EULER_CONVENTIONS = ("xyz-intrinsic", "xyz-extrinsic")
+
+#: 默认约定：与控制器链路一致（XYZ 内旋）。
+DEFAULT_EULER_CONVENTION = "xyz-intrinsic"
+
 #: 奇异判定阈值：``cos(pitch)`` 小于该值（即 |pitch| 距 90° 小于约 6e-8 度）
 #: 时改用专门的奇异分支。
 _GIMBAL_EPS = 1e-9
@@ -143,14 +151,73 @@ def euler_intrinsic_to_rotation(rpy_deg) -> np.ndarray:
     return euler_to_rot(angles, order=EULER_ORDER, extrinsic=EXTRINSIC)
 
 
-def matrix_to_pose_fields(matrix) -> tuple:
+def normalize_convention(value, where: str = "euler_convention") -> str:
+    """校验并归一化欧拉约定名（大小写不敏感），返回 ``EULER_CONVENTIONS`` 之一。
+
+    Args:
+        value: 约定名（如 ``"xyz-intrinsic"`` / ``"XYZ-Intrinsic"``）。
+        where: 报错时使用的字段名。
+
+    Returns:
+        归一化后的约定名（小写全称）。
+
+    Raises:
+        ValueError: 不是 ``EULER_CONVENTIONS`` 之一。
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{where} 必须为 {EULER_CONVENTIONS} 之一，当前 {value!r}")
+    normalized = value.strip().lower()
+    if normalized not in EULER_CONVENTIONS:
+        raise ValueError(f"{where} 必须为 {EULER_CONVENTIONS} 之一，当前 {value!r}")
+    return normalized
+
+
+def convention_extrinsic(convention) -> bool:
+    """约定名 -> ``extrinsic`` 旗标（``xyz-intrinsic`` -> False，其余 -> True）。"""
+    normalized = normalize_convention(convention)
+    return normalized == "xyz-extrinsic"
+
+
+def rotation_to_euler(rot, convention: str = DEFAULT_EULER_CONVENTION) -> np.ndarray:
+    """3×3 旋转矩阵 -> 指定约定的 XYZ 欧拉角（deg）。
+
+    Args:
+        rot: 3×3 旋转矩阵（正交、det=+1）。
+        convention: ``"xyz-intrinsic"``（R=Rx·Ry·Rz，默认）或
+            ``"xyz-extrinsic"``（R=Rz·Ry·Rx）。内旋分支带万向锁专门处理；
+            外旋分支直接复用 :func:`robot_model.nexbot_ik.rot_to_euler`
+            （其自身含奇异分支）。
+
+    Returns:
+        ``np.ndarray``（shape ``(3,)``），单位 deg，顺序 ``[rx, ry, rz]``。
+    """
+    normalized = normalize_convention(convention)
+    if normalized == "xyz-intrinsic":
+        return rotation_to_euler_intrinsic(rot)
+    matrix = _as_rotation(rot)
+    return np.asarray(
+        rot_to_euler(matrix, order=EULER_ORDER, extrinsic=True), dtype=float)
+
+
+def euler_to_rotation(rpy_deg, convention: str = DEFAULT_EULER_CONVENTION) -> np.ndarray:
+    """指定约定的 XYZ 欧拉角（deg）-> 3×3 旋转矩阵。"""
+    normalized = normalize_convention(convention)
+    angles = _as_vector3(rpy_deg, "rpy_deg")
+    return euler_to_rot(angles, order=EULER_ORDER,
+                        extrinsic=(normalized == "xyz-extrinsic"))
+
+
+def matrix_to_pose_fields(matrix,
+                          convention: str = DEFAULT_EULER_CONVENTION) -> tuple:
     """4×4 齐次矩阵 -> ``([x, y, z] mm, [rx, ry, rz] deg)``。
 
     先调用 :func:`handeye.se3.validate_rigid` 校验（形状、有限性、末行、
-    正交性、det=+1），再分解平移与 XYZ 内旋欧拉角。
+    正交性、det=+1），再分解平移与按 ``convention`` 约定的 XYZ 欧拉角
+    （默认 ``xyz-intrinsic``，与控制器链路一致）。
 
     Args:
         matrix: 4×4 齐次矩阵（平移 mm）。
+        convention: ``"xyz-intrinsic"`` / ``"xyz-extrinsic"``。
 
     Returns:
         ``(position, orientation)``：两个 ``list[float]``。
@@ -165,16 +232,18 @@ def matrix_to_pose_fields(matrix) -> tuple:
     validate_rigid(transform)
     position = [float(value) for value in transform[:3, 3]]
     orientation = [float(value) for value in
-                   rotation_to_euler_intrinsic(transform[:3, :3])]
+                   rotation_to_euler(transform[:3, :3], convention)]
     return position, orientation
 
 
-def pose_fields_to_matrix(position, orientation) -> np.ndarray:
+def pose_fields_to_matrix(position, orientation,
+                          convention: str = DEFAULT_EULER_CONVENTION) -> np.ndarray:
     """``([x, y, z] mm, [rx, ry, rz] deg)`` -> 4×4 齐次矩阵。
 
     Args:
         position: 3 个位置分量（mm）。
-        orientation: 3 个欧拉角分量（deg，XYZ 内旋）。
+        orientation: 3 个欧拉角分量（deg，按 ``convention`` 约定解释，
+            默认 XYZ 内旋）。
 
     Returns:
         ``np.ndarray``（4×4，``float``，平移 mm）。
@@ -184,7 +253,7 @@ def pose_fields_to_matrix(position, orientation) -> np.ndarray:
     """
     xyz = _as_vector3(position, "position")
     rpy = _as_vector3(orientation, "orientation")
-    return make_pose(xyz, euler_intrinsic_to_rotation(rpy))
+    return make_pose(xyz, euler_to_rotation(rpy, convention))
 
 
 def self_check(samples: int = 200, seed: int = 0, tolerance: float = 1e-10) -> float:

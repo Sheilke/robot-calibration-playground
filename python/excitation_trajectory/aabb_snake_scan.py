@@ -626,12 +626,17 @@ def design_condition_number(amplitudes_deg, reference_rpy,
             "convention": "cond(X)=sigma_max/sigma_min"}
 
 
+def _extrinsic_of(args: argparse.Namespace) -> bool:
+    """解析后的欧拉约定 -> ``extrinsic`` 旗标（``--validate-args`` 已归一化）。"""
+    return getattr(args, "euler_convention", "xyz-extrinsic") == "xyz-extrinsic"
+
+
 def _reference_rotation(args: argparse.Namespace,
                         reference_rpy) -> np.ndarray:
-    """标称参考姿态（``--rpy``）的旋转矩阵，与 ``--intrinsic`` 约定一致。"""
+    """标称参考姿态（``--rpy``）的旋转矩阵，与 ``--euler`` 约定一致。"""
     return euler_to_rot(tuple(float(v) for v in reference_rpy),
                         order="XYZ",
-                        extrinsic=not bool(getattr(args, "intrinsic", False)))
+                        extrinsic=_extrinsic_of(args))
 
 
 def _fmt_cond(value) -> str:
@@ -706,8 +711,7 @@ def evaluate_conditioning(args: argparse.Namespace, waypoints, reference_rpy,
     include_position = bool(args.cond_position)
     design = design_condition_number(amplitudes, reference_rpy,
                                      order="XYZ",
-                                     extrinsic=not bool(getattr(args, "intrinsic",
-                                                               False)))
+                                     extrinsic=_extrinsic_of(args))
     report = {"status": "not_run",
               "convention": "cond(X)=sigma_max/sigma_min",
               "gate": {"value": None, "source": "design(orientation)"},
@@ -843,8 +847,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-ik", action="store_true",
                         help="仅路点预览模式：不求解 IK，打印路点表并输出"
                              "预览图与 JSON")
+    parser.add_argument("--euler", choices=("xyz-extrinsic", "xyz-intrinsic"),
+                        default=None, metavar="CONVENTION",
+                        help="欧拉角约定：xyz-extrinsic=定轴 RPY（Rz·Ry·Rx，"
+                             "默认）或 xyz-intrinsic=动轴（Rx·Ry·Rz，Nexbot "
+                             "控制器链路）；显式给出时覆盖 --intrinsic")
     parser.add_argument("--intrinsic", action="store_true",
-                        help="动轴欧拉角模式（extrinsic=False）")
+                        help="[已废弃] 等价于 --euler xyz-intrinsic；为保持"
+                             "兼容保留，显式 --euler 优先")
     parser.add_argument("--cond-max", type=float, default=DEFAULT_COND_MAX,
                         help="姿态激励条件数阈值 cond(X)=σmax/σmin（门禁取"
                              " max(分块 cond)），超过则拒绝并给出可执行建议，"
@@ -866,7 +876,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    """参数校验（各模式共用）：边界/份数/门禁阈值/扰动幅度。失败则 parser.error 退出。"""
+    """参数校验（各模式共用）：边界/份数/欧拉约定/门禁阈值/扰动幅度。失败则 parser.error 退出。"""
+    # 欧拉约定归一化：显式 --euler 优先，否则看 --intrinsic，默认定轴 RPY。
+    if args.euler is not None:
+        args.euler_convention = args.euler
+    else:
+        args.euler_convention = ("xyz-intrinsic" if args.intrinsic
+                                 else "xyz-extrinsic")
     for axis, lo, hi in (("X", args.x_min, args.x_max),
                          ("Y", args.y_min, args.y_max),
                          ("Z", args.z_min, args.z_max)):
@@ -1009,6 +1025,7 @@ def _run_skip_ik(args: argparse.Namespace) -> int:
             "ys": int(args.ys),
             "zs": int(args.zs),
             "seed": int(args.seed),
+            "euler_convention": getattr(args, "euler_convention", "xyz-extrinsic"),
             "skip_ik": bool(args.skip_ik),
             "no_perturb": bool(args.no_perturb),
             "perturbed": False,          # 预览模式不采样扰动
@@ -1058,9 +1075,9 @@ def _run_ik_chain(args: argparse.Namespace,
 
     # ---- 3. 姿态扰动采样 + 姿态激励条件数（一次性检查，非循环） ----
     def _poses_of(rpy_getter):
-        """由路点姿态构造位姿序列（extrinsic 由 --intrinsic 控制）。"""
+        """由路点姿态构造位姿序列（欧拉约定由 --euler 控制）。"""
         return [rbt.pose_to_T(wp.pos, rpy_getter(wp),
-                              extrinsic=not args.intrinsic)
+                              extrinsic=_extrinsic_of(args))
                 for wp in waypoints]
 
     def _ref_rpy(wp):
@@ -1150,6 +1167,7 @@ def _run_ik_chain(args: argparse.Namespace,
             "ys": int(args.ys),
             "zs": int(args.zs),
             "seed": int(args.seed),
+            "euler_convention": getattr(args, "euler_convention", "xyz-extrinsic"),
             "skip_ik": bool(args.skip_ik),
             "no_perturb": bool(args.no_perturb),
             "perturbed": not bool(args.no_perturb),

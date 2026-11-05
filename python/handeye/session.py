@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 
 from handeye.dh import DhOverride, RobotKinematics
-from handeye.pose_encoder import pose_fields_to_matrix
+from handeye.pose_encoder import normalize_convention, pose_fields_to_matrix
 from handeye.se3 import load_matrix16, rotation_angle_between, validate_rigid
 
 #: 仓库根：``python/handeye/session.py`` 向上两级。
@@ -54,6 +54,9 @@ SUPPORTED_UNITS = ("mm",)
 
 #: 本期支持的关节角约定。
 SUPPORTED_JOINT_CONVENTIONS = ("model",)
+
+#: 支持的 ``recorded_pose`` 欧拉约定（见 ``handeye.pose_encoder``）。
+SUPPORTED_EULER_CONVENTIONS = ("xyz-intrinsic", "xyz-extrinsic")
 
 #: 手眼矩阵允许的输入单位（装载后统一换算成 mm）。
 _MATRIX_UNITS = ("mm", "m")
@@ -127,8 +130,12 @@ def _frame_from(raw, where: str) -> "Frame":
     return Frame(raw, where=f"{where}.target_points")
 
 
-def _posed_matrix(raw, where: str):
-    """把 ``{"position": [3], "orientation": [3]}`` 转成 4x4；``None`` 原样返回。"""
+def _posed_matrix(raw, where: str, convention: str = "xyz-intrinsic"):
+    """把 ``{"position": [3], "orientation": [3]}`` 转成 4x4；``None`` 原样返回。
+
+    ``orientation`` 按 ``convention`` 约定解释（默认 XYZ 内旋，与控制器
+    链路一致；若会话来自默认定轴 RPY 的工具，用 ``xyz-extrinsic``）。
+    """
     if raw is None:
         return None
     if isinstance(raw, np.ndarray) or (
@@ -154,7 +161,7 @@ def _posed_matrix(raw, where: str):
     orientation = _as_finite_floats(
         _require_key(mapping, "orientation", where), f"{where}.orientation", 3)
     try:
-        return pose_fields_to_matrix(position, orientation)
+        return pose_fields_to_matrix(position, orientation, convention)
     except ValueError as error:
         raise SessionError(f"{where} 不合法：{error}") from error
 
@@ -217,7 +224,8 @@ class Sample:
     """
 
     def __init__(self, pose_id, q_deg, frames, recorded_pose=None,
-                 where: str = "sample"):
+                 where: str = "sample",
+                 euler_convention: str = "xyz-intrinsic"):
         """校验并保存一个位姿的采样。
 
         Args:
@@ -226,6 +234,8 @@ class Sample:
             frames: 非空序列，元素为 :class:`Frame` 或 ``{id: [x, y, z]}`` 字典。
             recorded_pose: ``None`` / 4x4 矩阵 / ``{"position","orientation"}``。
             where: 报错时使用的字段路径前缀（内部使用）。
+            euler_convention: ``recorded_pose`` 的欧拉约定（作用于 dict 形式
+                的 ``orientation``；4x4 矩阵形式不受影响）。
 
         Raises:
             SessionError: 任一分量不合法。关节限位需要运动学模型，由
@@ -243,7 +253,8 @@ class Sample:
             _frame_from(frame, f"{where}.frames[{index}]")
             for index, frame in enumerate(frames)
         ]
-        self.recorded_pose = _posed_matrix(recorded_pose, f"{where}.recorded_pose")
+        self.recorded_pose = _posed_matrix(recorded_pose, f"{where}.recorded_pose",
+                                           euler_convention)
 
     def target_ids(self) -> set:
         """该位姿所有帧里出现过的目标 id 并集。"""
@@ -268,10 +279,13 @@ class Session:
         samples: ``list[Sample]``。
         kinematics: :class:`handeye.dh.RobotKinematics`（提供 ``fk`` / ``limits``）。
         source_path: 会话 JSON 路径（构造性会话为 ``None``）。
+        euler_convention: 本会话 ``recorded_pose`` 的欧拉约定
+            （``"xyz-intrinsic"`` / ``"xyz-extrinsic"``）。
     """
 
     def __init__(self, meta, reference_point, delta_p_base, handeye_matrix,
-                 samples, kinematics, source_path=None):
+                 samples, kinematics, source_path=None,
+                 euler_convention: str = "xyz-intrinsic"):
         """保存已校验的数据；这里再做一次形状/有限性校验。
 
         Args:
@@ -282,10 +296,18 @@ class Session:
             samples: ``list[Sample]``；允许为空（由 :mod:`handeye.vpe` 决定行为）。
             kinematics: 运动学对象，需实现 ``fk(q_deg) -> 4x4``。
             source_path: 会话 JSON 路径。
+            euler_convention: 会话欧拉约定（记录在属性上，供报告/FK 自检
+                展示；默认 ``xyz-intrinsic``，与控制器链路一致）。
 
         Raises:
-            SessionError: 形状/数值/重复 ``pose_id``/关节超限不合法。
+            SessionError: 形状/数值/重复 ``pose_id``/关节超限/约定名不合法。
         """
+        try:
+            euler_convention = normalize_convention(
+                euler_convention, "euler_convention")
+        except ValueError as error:
+            raise SessionError(str(error)) from error
+        self.euler_convention = euler_convention
         if meta is None:
             meta = {}
         self.meta = dict(_require_mapping(meta, "meta"))
@@ -396,7 +418,8 @@ def _check_joint_limits(q_deg, kinematics, where: str) -> None:
                 f"[{low:g}, {high:g}] 度")
 
 
-def _parse_sample(raw, index: int, kinematics) -> Sample:
+def _parse_sample(raw, index: int, kinematics,
+                 euler_convention: str = "xyz-intrinsic") -> Sample:
     """解析 ``samples[index]`` 并检查关节限位。"""
     where = f"samples[{index}]"
     mapping = _require_mapping(raw, where)
@@ -404,7 +427,8 @@ def _parse_sample(raw, index: int, kinematics) -> Sample:
     q_deg = _require_key(mapping, "q_deg", where)
     frames = _require_key(mapping, "frames", where)
     sample = Sample(pose_id, q_deg, frames,
-                    recorded_pose=mapping.get("recorded_pose"), where=where)
+                    recorded_pose=mapping.get("recorded_pose"), where=where,
+                    euler_convention=euler_convention)
     _check_joint_limits(sample.q_deg, kinematics, where)
     return sample
 
@@ -463,6 +487,13 @@ def session_from_dict(payload, *, base_dir=None, source_path=None) -> Session:
             f"target_points / p_ball_laser_base / delta_p_base / recorded_pose），"
             f"当前 {units!r}")
 
+    euler_convention = meta_raw.get("euler_convention", "xyz-intrinsic")
+    try:
+        euler_convention = normalize_convention(
+            euler_convention, "meta.euler_convention")
+    except ValueError as error:
+        raise SessionError(str(error)) from error
+
     try:
         override = None if override_path is None else DhOverride.from_json(override_path)
         kinematics = RobotKinematics(urdf_path, override)
@@ -515,7 +546,7 @@ def session_from_dict(payload, *, base_dir=None, source_path=None) -> Session:
     samples = []
     seen: dict = {}
     for index, raw in enumerate(samples_raw):
-        sample = _parse_sample(raw, index, kinematics)
+        sample = _parse_sample(raw, index, kinematics, euler_convention)
         if sample.pose_id in seen:
             raise SessionError(
                 f"samples[{index}].pose_id 重复：{sample.pose_id}"
@@ -531,6 +562,7 @@ def session_from_dict(payload, *, base_dir=None, source_path=None) -> Session:
         samples=samples,
         kinematics=kinematics,
         source_path=source_path,
+        euler_convention=euler_convention,
     )
 
 
