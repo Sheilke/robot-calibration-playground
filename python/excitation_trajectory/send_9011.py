@@ -4,10 +4,11 @@
 
 协议事实（均已从公司仓库下位 JOB 与驱动核实）
 --------------------------------------------
-* **PC 是 TCP 服务端**：``NexbotRobot`` 在 ``listen_ip:12345`` 上 listen，
-  控制器侧 ``ENET1.OPEN 1`` 作为客户端连过来（下位 JOB 里
-  ``ENET1.IP = "192.168.10.200"`` 指的是 PC）。因此本工具只能**先监听、
-  等控制器连上**，不能主动去连机器人。
+* **PC 是 TCP 服务端**：``NexbotRobot`` 在 ``listen_ip:port`` 上 listen，控制器侧
+  ``ENET1.OPEN 1`` 作为客户端连过来。所以本工具只能**先监听、等控制器连上**，
+  不能主动去连机器人；下位 JOB 里的 ``ENET1.IP`` 必须填 **本机**地址，
+  ``ENET1.RPORT`` 必须等于本工具的 ``--port``。
+  本现场：控制器 ``192.168.3.13``（客户端），本机/TCP 服务端 ``192.168.3.11``。
 * 报文是 ``\\n`` 结尾的定长 ASCII 行；单点移动用 ``M0``（自带坐标）。
 * **每条指令有握手应答**：JOB 走完 ``MOVE`` 后落到 ``LABEL [$2$]``，发
   ``done``，``TIMER T = 0.1``，再发 ``ready``，然后回到 ``$Recv$``。
@@ -25,7 +26,7 @@
 
     # 2) 控制器侧运行 9011/N9011，本机起监听并逐点发送
     PYTHONPATH=python python3 -m excitation_trajectory.send_9011 \\
-        calib_points_9011.json --port 12345 --dwell 6
+        calib_points_9011.json --host 192.168.3.11 --port 12345 --dwell 6
 
     # 只发第 5..12 点；发完退出 JOB
     PYTHONPATH=python python3 -m excitation_trajectory.send_9011 \\
@@ -46,6 +47,47 @@ DEFAULT_DWELL_S = 6.0
 DEFAULT_TIMEOUT_S = 120.0
 #: 下位 ``done`` 与 ``ready`` 之间的 ``TIMER T = 0.1``
 HANDSHAKE_GAP_S = 0.1
+
+
+def local_ipv4_addresses(include_loopback: bool = False) -> list:
+    """列出本机 IPv4 地址（不依赖第三方库，不发送任何报文）。"""
+    found = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None,
+                                       family=socket.AF_INET):
+            found.add(info[4][0])
+    except OSError:
+        pass
+    try:                                  # UDP connect 不会发包，只求路由选中的本机地址
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            found.add(probe.getsockname()[0])
+        finally:
+            probe.close()
+    except OSError:
+        pass
+    if include_loopback:
+        return sorted(found)
+    return sorted(addr for addr in found if not addr.startswith("127."))
+
+
+def _is_loopback(host: str) -> bool:
+    return host == "localhost" or host.startswith("127.")
+
+
+def check_bind_address(host: str) -> None:
+    """预检：``--host`` 必须是本机已配置的 IPv4，否则机器人永远连不上。"""
+    if host in ("", "0.0.0.0") or _is_loopback(host):
+        return
+    if host in local_ipv4_addresses(include_loopback=True):
+        return
+    available = local_ipv4_addresses()
+    raise ProtocolError(
+        f"--host {host} 不是本机已配置的 IPv4（本机有: "
+        f"{', '.join(available) if available else '未检测到'}）。"
+        "控制器会连 ENET1.IP 指定的地址；绑错地址会“监听成功但永远连不上”。"
+        "若本站应使用 192.168.3.11，先用 ip addr 确认该地址配在本机网卡上。")
 
 
 class ProtocolError(RuntimeError):
@@ -121,7 +163,8 @@ class RobotLink:
     """TCP 服务端：监听端口，等控制器（客户端）连上来。"""
 
     def __init__(self, host: str, port: int, *, timeout_s: float = DEFAULT_TIMEOUT_S,
-                 accept_timeout_s: float = 300.0, on_listening=None):
+                 accept_timeout_s: float = 300.0, on_listening=None,
+                 expect_peer: str | None = None):
         self.host = host
         self.port = port
         self.timeout_s = timeout_s
@@ -129,11 +172,15 @@ class RobotLink:
         #: ``listen()`` 完成、``accept()`` 之前回调（测试用它启动假控制器；
         #: 传 ``port=0`` 时可用 ``link.port`` 拿到内核分配的实际端口）。
         self.on_listening = on_listening
+        #: 仅接受来自该 IP 的连接（机器人地址），拒绍其它来源。
+        self.expect_peer = expect_peer
+        self.peer = None
         self._server = None
         self._conn = None
         self._buffer = b""
 
     def __enter__(self) -> "RobotLink":
+        check_bind_address(self.host)
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((self.host, self.port))
@@ -154,7 +201,13 @@ class RobotLink:
                 f"已运行、JOB 里 ENET1.IP 指向本机、RPORT={self.port}") from error
         conn.settimeout(self.timeout_s)
         self._conn = conn
+        self.peer = peer[0]
         print(f"[连接] 控制器已接入 {peer[0]}:{peer[1]}")
+        if self.expect_peer is not None and peer[0] != self.expect_peer:
+            self._close_all()
+            raise ProtocolError(
+                f"接入方 {peer[0]} 不是预期的机器人地址 {self.expect_peer}，"
+                "已拒绝（核对 ENET1.IP / 网络是否串了）")
         return self
 
     def __exit__(self, *_exc) -> None:
@@ -248,9 +301,14 @@ def main(argv=None) -> int:
         description="读 calib_points_9011.json，逐点发 M0 给 Nexbot 控制器，"
                     "每点之间按 done/ready 握手确认运动完成后暂停指定秒数。")
     parser.add_argument("points", help="export_9011.py 产出的 calib_points_9011.json")
-    parser.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="监听地址（默认 0.0.0.0）。指定为具体 IPv4 时会预检"
+                             "它是否属于本机；本现场 PC 为 192.168.3.11")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"监听端口（默认 {DEFAULT_PORT}，须与 JOB 的 ENET1.RPORT 一致）")
+    parser.add_argument("--expect-peer", default=None, metavar="ROBOT_IP",
+                        help="只接受来自该 IP 的连接（机器人地址，本现场 "
+                             "192.168.3.13）；不填则不校验")
     parser.add_argument("--dwell", type=float, default=None,
                         help="每点到位后暂停秒数（默认取 JSON 的 meta.dwell_s）")
     parser.add_argument("--start", type=int, default=None, help="起始点序号（1 基）")
@@ -275,11 +333,14 @@ def main(argv=None) -> int:
     if not (plan["dwell_s"] >= 0):
         print(f"错误: --dwell 需 >= 0，当前 {plan['dwell_s']}", file=sys.stderr)
         return 2
-
     lo, hi = plan["range"]
     print(f"[计划] 共 {plan['total']} 点，本次发第 {lo}..{hi} 点"
           f"（{len(plan['lines'])} 条），movedata={plan['move_data']}，"
           f"每点暂停 {plan['dwell_s']:g}s")
+    print(f"[网络] 本机监听 {args.host}:{args.port}"
+          + (f"，只接受 {args.expect_peer} 的连接" if args.expect_peer else "")
+          + f"；本机 IPv4: {', '.join(local_ipv4_addresses()) or '未检测到'}")
+    print(f"[下位] JOB 需满足 ENET1.IP=\"<本机地址>\"、ENET1.RPORT={args.port}")
 
     if args.dry_run:
         for line in plan["lines"]:
@@ -287,7 +348,14 @@ def main(argv=None) -> int:
         return 0
 
     try:
-        with RobotLink(args.host, args.port, timeout_s=args.timeout) as link:
+        check_bind_address(args.host)
+    except ProtocolError as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 2
+
+    try:
+        with RobotLink(args.host, args.port, timeout_s=args.timeout,
+                       expect_peer=args.expect_peer) as link:
             run_plan(link, plan, handshake=not args.no_handshake)
             if args.quit:
                 link.send("Q0\n")

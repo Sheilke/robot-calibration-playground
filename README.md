@@ -180,6 +180,16 @@ AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.
 listen，控制器 JOB 里 `ENET1.OPEN 1` 去连 PC（`ENET1.IP` 填的是 PC 地址）。
 所以不能“去连机器人”，只能**先监听、等它连上来**。
 
+**本现场的地址方向（极易搞反）**：
+
+| 角色 | 地址 | 说明 |
+| --- | --- | --- |
+| 机器人控制器 | `192.168.3.13` | **TCP 客户端**，主动连出来 |
+| 本机 PC | `192.168.3.11` | **TCP 服务端**，`send_9011` 在此地址上 listen |
+
+所以下位 JOB 里必须是 `ENET1.IP = "192.168.3.11"`（指向 PC，不是机器人自己），
+`ENET1.RPORT` 等于 `--port`。
+
 ```bash
 # 1) 生成点位
 PYTHONPATH=python python3 -m excitation_trajectory.export_9011 \
@@ -187,12 +197,23 @@ PYTHONPATH=python python3 -m excitation_trajectory.export_9011 \
 
 # 2) 控制器侧运行 9011/N9011（它会在 ENET1.OPEN 处等连），本机起监听
 PYTHONPATH=python python3 -m excitation_trajectory.send_9011 \
-  calib_points_9011.json --port 12345 --dwell 6
+  calib_points_9011.json --host 192.168.3.11 --port 12345 \
+  --expect-peer 192.168.3.13 --dwell 6
 
 # 只跑第 5..12 点；发完结束 JOB
 PYTHONPATH=python python3 -m excitation_trajectory.send_9011 \
-  calib_points_9011.json --start 5 --end 12 --quit
+  calib_points_9011.json --host 192.168.3.11 --start 5 --end 12 --quit
+
+# 只打印报文，不联网（可在任意机器上检查内容）
+PYTHONPATH=python python3 -m excitation_trajectory.send_9011 \
+  calib_points_9011.json --dry-run
 ```
+
+启动前有两道**快速失败**校验，避免“监听成功但机器人永远连不上”：
+
+- `--host` 必须是本机已配置的 IPv4（`127.0.0.1`/`0.0.0.0` 放行），否则直接报错
+  并列出本机实际地址——`192.168.3.11` 没配到网卡上时会立刻暴露；
+- `--expect-peer` 指定后，接入方 IP 不匹配会立即断开并报错（防止网络串线）。
 
 握手（`N9011.JBR` 231-234 行）：每条指令执行完，JOB 落到 `LABEL [$2$]` 发
 **`done`**，`TIMER T=0.1`，再发 **`ready`**，然后回 `$Recv$`。因此

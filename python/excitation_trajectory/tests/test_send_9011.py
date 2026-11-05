@@ -19,6 +19,7 @@ from pathlib import Path
 from excitation_trajectory.export_9011 import main as export_main
 from excitation_trajectory.send_9011 import (
     HANDSHAKE_GAP_S,
+    check_bind_address,
     ProtocolError,
     RobotLink,
     build_plan,
@@ -232,3 +233,59 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NetworkPreflightTest(unittest.TestCase):
+    """IP 方向易搞反：控制器是客户端，PC 是服务端；绑错地址会“监听成功但连不上”。"""
+
+    def test_loopback_is_allowed(self):
+        for host in ("127.0.0.1", "localhost", "0.0.0.0", ""):
+            check_bind_address(host)          # 不应抛异常
+
+    def test_foreign_ip_rejected_with_local_list(self):
+        with self.assertRaises(ProtocolError) as ctx:
+            check_bind_address("192.0.2.77")   # TEST-NET-1，几乎不可能在本机
+        message = str(ctx.exception)
+        self.assertIn("192.0.2.77", message)
+        self.assertIn("IPv4", message)
+
+    def test_dry_run_does_not_require_local_ip(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            points = _make_points(tmp)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = main([str(points), "--dry-run", "--host", "192.0.2.77"])
+            self.assertEqual(code, 0)
+            self.assertEqual(len([l for l in out.getvalue().splitlines()
+                                  if l.startswith("M0")]), 4)
+
+    def test_expect_peer_rejects_unexpected_client(self):
+        def start_fake(link):
+            threading.Thread(
+                target=lambda: (time.sleep(0.1),
+                                socket.create_connection(("127.0.0.1", link.port),
+                                                         timeout=5)),
+                daemon=True).start()
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            plan = build_plan(_make_points(tmp))
+        link = RobotLink("127.0.0.1", 0, timeout_s=3, accept_timeout_s=5,
+                         on_listening=start_fake, expect_peer="192.168.3.13")
+        with self.assertRaises(ProtocolError) as ctx:
+            link.__enter__()
+        self.assertIn("192.168.3.13", str(ctx.exception))
+
+    def test_expect_peer_accepts_matching_client(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            plan = build_plan(_make_points(tmp))
+        holder = {}
+
+        def start_fake(link):
+            holder["c"] = FakeController(link.port)
+            holder["c"].start()
+
+        with RobotLink("127.0.0.1", 0, timeout_s=3, accept_timeout_s=5,
+                       on_listening=start_fake, expect_peer="127.0.0.1") as link:
+            self.assertEqual(link.peer, "127.0.0.1")
+            run_plan(link, plan, log=lambda *_: None, sleep=lambda _s: None)
+        holder["c"].join(5)
