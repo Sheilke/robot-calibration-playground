@@ -21,6 +21,7 @@ robot-calibration-playground/
 ├── python/                       # 当前阶段：纯 Python 开发
 │   ├── excitation_trajectory/    # 利于辨识的标定路点生成（不依赖 ROS2）
 │   │   ├── aabb_snake_scan.py    # 连续蛇形网格、姿态扰动、链式 IK、3D 可视化
+│   │   ├── export_9011.py        # 扫描结果 -> 9011/N9011 点位与逐点行走报文
 │   │   ├── generator.py          # 路点生成主逻辑
 │   │   ├── optimizer.py          # 可辨识性指标优化
 │   │   └── tests/                # 单元测试
@@ -118,6 +119,11 @@ PYTHONPATH=python python -m robot_model.nexbot_ik --selftest 100
 # 4. JSON -> 标准 URDF：显式提供内部原始 JSON 和目标文件
 PYTHONPATH=python python -m robot_model.json_to_urdf \
   /path/to/Robot_A.json /tmp/ch2000_origin.urdf
+
+# 5. 扫描结果 -> 9011/N9011 点位下载 + 逐点行走报文（DH 标定采点）
+PYTHONPATH=python python -m excitation_trajectory.export_9011 \
+  scan_result.json --out calib_points_9011.json \
+  --messages calib_9011_messages.txt --dwell 6
 ```
 
 AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.png`；这两个运行产物已被 `.gitignore` 忽略。JSON 转换器的默认输出是 `data/configs/ch2000_origin.urdf`，但公司内部原始 `Robot_A.json` 始终由调用方显式传入，不会进入仓库。
@@ -145,6 +151,40 @@ AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.
 - 参考姿态统一取标称 RPY（`--rpy`），消除「参考 = 第一个路点」的顺序依赖（JSON 中 `reference_source: "explicit"`）。
 
 注意：这里度量的是**姿态集激励覆盖度**的条件数，不是 DH 参数辨识回归矩阵的条件数——后者依赖关节角，需在 IK 之后（对成功子集）另行计算。JSON 的 `conditioning` 节给出 `design` / `realized` / `post_ik`（IK 后成功子集，只报告）三段，非有限值一律写 `null`，`--seed` 相同则输出可复现。
+
+## 9011 点位下载与逐点采点
+
+`export_9011.py` 把 `aabb_snake_scan.py` 的扫描结果转成下位 `9011`/`N9011` 的定宽字符串报文，现场“标定软件采点 → 跟踪仪测量”循环用它驱动机器人。
+
+### 为什么用轴坐标
+
+路点里的姿态是逐点随机扰动的，链式 IK 已为本仓选定了具体构型。若下发笛卡尔位姿，控制器会自己解 IK，可能跳到另一个构型（腕翻转/肘上肘下），导致相邻点关节大幅跳变。用**轴坐标**（`coord=1`，模型关节角度）可精确复现选定构型。
+
+### 报文格式（逐字符对齐 C++ 驱动）
+
+| 报文 | 格式 | 说明 |
+| --- | --- | --- |
+| 下载点位 | `G{count}` + 每点 `coord(1) + 每轴 8 字(2 位小数) + P 编号(4)` | 6 轴即每点 53 字；报文上限 **240 字符**、`G` 头计数仅 1 位 → 自动分包，6 轴每包最多 4 点 |
+| 逐点行走 | `T{begin:04d}{end:04d}` + `type(1)+speed(7)+acc(1)+tool(1)+ratio(4)` | 每条 23 字；`begin==end` 即只走 1 点 |
+| 退出 | `Q0` | |
+
+外轴站（7/8 轴）：每点记录长度为 `1 + (6+外轴数)×8 + 4`（Nexbot `N9011ReadPos` 6 轴=53、8 轴=69），用 `--ext-axis` 追加，**必须与下位 JOB 的 stride 一致**。
+
+### 关于“每点暂停 6 秒”（关键）
+
+**9011 的 `T` 循环里没有停留/等待指令**（`N9011.JBR` 的 `WHILE` 与 Hyundai `9011.JOB` 的 `FOR` 都是 `MOVE` 完直接下一点）。所以 6 秒暂停**只能由上位发送循环实现**：
+
+1. 发一条**单点** `T`（不要发 `T0001{0048}` 范围，否则机器人连续走完）；
+2. 等运动完成（驱动侧 `MovePointAndWait` 的做法是轮询到 `Ready`）；
+3. `sleep --dwell` 秒，让跟踪仪完成测量；
+4. 再发下一条。
+
+报文文件里在每个点之间插了 `# [n/N] 等运动完成后 sleep 6 s 再发下一条` 注释行作提示；`--dwell` 的值同时写进 JSON 的 `meta.dwell_s`，供发送端读取而不是硬编码。
+
+### 两个必须现场确认的点
+
+- **关节方向映射**：导出的角度是**模型轴角**。若实际控制器 `Direction` 不全为 1（CH2000 本体为全 1，但加外轴/不同站点需核实），需先换算再下发；JSON 的 `meta.note` 已标此项。
+- **平滑等级 `--acc`**：默认 `0`（`A=0`，点到点精确停位），采点场景**不要**设大值，否则机器人会在目标点附近平滑掠过而不真正停住。
 
 ## 手眼验证（VPE）与 DH 离线重算
 
