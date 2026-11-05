@@ -55,7 +55,12 @@ DEFAULT_WALK = "M0"
 WALK_MODES = ("M0", "T")
 #: M0 用的暂存 P 号。取 100 与公司驱动 ``kCalibrationPointStatus`` 一致，
 #: 避开路径占用槽位 P1..PN。
+#: M0 用的暂存 P 号。取 100 与公司驱动 ``kCalibrationPointStatus`` 一致，
+#: 避开路径占用槽位 P1..PN。
 DEFAULT_SCRATCH_SLOT = 100
+
+#: 关节角符号映射的默认值（模型轴角 == 控制器下发值）。
+DEFAULT_JOINT_SIGN = (1, 1, 1, 1, 1, 1)
 DEFAULT_SPEED = -1.0          # <0 → 百分比模式（N9011 的 MOVJ 固定 VJ=5%）
 DEFAULT_ACC = 0
 DEFAULT_TOOL = 0
@@ -222,6 +227,11 @@ def main(argv=None) -> int:
                              f"{DEFAULT_SCRATCH_SLOT}，避开路径槽位 P1..PN）")
     parser.add_argument("--slot-start", type=int, default=SLOT_START,
                         help="T 模式下首个 P 变量编号（默认 1，与驱动一致）")
+    parser.add_argument("--invert-joints", default="", metavar="J1,J2,...",
+                        help="需要取反的轴号（1 基，逗号分隔），默认不取反。用于把"
+                             "模型轴角换算成控制器下发值：CH2000 的 Direction 全为 1 "
+                             "故留空；Hyundai 该机 Direction=[-1,-1,1,-1,1,-1]，若下"
+                             "发的是电机轴角则传 1,2,4,6")
     parser.add_argument("--ext-axis", nargs="*", type=float, default=None,
                         metavar="EXT",
                         help="7/8/9 轴站的外轴坐标（每点相同，逐个追加；"
@@ -239,13 +249,26 @@ def main(argv=None) -> int:
     if args.walk == "T" and args.scratch_slot != DEFAULT_SCRATCH_SLOT:
         parser.error("--scratch-slot 仅用于 M0 模式，T 模式请用 --slot-start")
 
+    invert = set()
+    for token in str(args.invert_joints).replace(" ", "").split(","):
+        if not token:
+            continue
+        try:
+            axis = int(token)
+        except ValueError:
+            parser.error(f"--invert-joints 需逗号分隔的轴号，当前 {args.invert_joints!r}")
+        if not (1 <= axis <= 6):
+            parser.error(f"--invert-joints 轴号需在 1..6，当前 {axis}")
+        invert.add(axis)
+    signs = [-1 if (index + 1) in invert else 1 for index in range(6)]
+
     scan_path = Path(args.scan)
     points = load_scan_points(scan_path)
     ext = [] if args.ext_axis is None else [float(v) for v in args.ext_axis]
 
     wire_points = []
     for item in points:
-        data = list(item["q"]) + list(ext)
+        data = [sign * value for sign, value in zip(signs, item["q"])] + list(ext)
         wire_points.append((1, data))          # coord=1 轴坐标
     try:
         move_data = move_data_to_str(args.move_type, args.speed, args.acc,
@@ -283,9 +306,10 @@ def main(argv=None) -> int:
             "slot_start": args.slot_start if args.walk == "T" else None,
             "scratch_slot": args.scratch_slot if args.walk == "M0" else None,
             "coord": "axis",
+            "joint_sign": list(signs),
             "dwell_s": args.dwell,
-            "note": ("轴坐标=模型关节角(度)，方向映射 identity（如现场 Direction "
-                     "非全 1 需先换算）；逐点暂停由上位在每条移动报文后执行；"
+            "note": ("轴坐标=模型关节角(度)；joint_sign 已作用到 data（全 1 表示"
+                     "模型轴角==下发值）；逐点暂停由上位在每条移动报文后执行；"
                      "不用 M1/M2/M3（J6 解缠分支，每点走两次）"),
             "move_data": {"type": args.move_type, "speed": args.speed,
                           "acc": args.acc, "tool": args.tool,
@@ -307,6 +331,8 @@ def main(argv=None) -> int:
         print(f"点位 {len(slots)} 个（每条 M0 自带坐标，暂存 P{args.scratch_slot}）")
     print(f"JSON:   {args.out}")
     print(f"报文:   {args.messages}")
+    if tuple(signs) != DEFAULT_JOINT_SIGN:
+        print(f"关节符号: {signs}（已乘到下发角度上；meta.joint_sign 已记录）")
     print(f"行走:   每点一条单步 {args.walk}，运动完成后 sleep {args.dwell:g} s")
     return 0
 

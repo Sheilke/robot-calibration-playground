@@ -176,6 +176,31 @@ AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.
 
 外轴站（7/8 轴）：每点记录长度为 `1 + (6+外轴数)×8 + 4`（Nexbot `N9011ReadPos` 6 轴=53、8 轴=69），用 `--ext-axis` 追加，**必须与下位 JOB 的 stride 一致**。
 
+### 关节角方向（Direction）必须确认
+
+导出的角度是**模型轴角**。若控制器下发值不是模型轴角（Hyundai 该机
+`Direction = [-1,-1,1,-1,1,-1]`），必须换算，否则飞车：
+
+```bash
+# 取反第 1、2、4、6 轴后再下发（结果记录在 JSON 的 meta.joint_sign）
+PYTHONPATH=python python3 -m excitation_trajectory.export_9011 \
+  scan_result.json --out calib_points_9011.json --invert-joints 1,2,4,6
+```
+
+CH2000 的 `Direction` 全为 1，留空即可。
+
+**已核实（几何层面）**：Hyundai R_GENERAL_6S 在 q=0 时，本仓模型的关节轴方向
+与实机一致——J1 `+Z`、J2/J3 `-Y`、J4 `+X`、J5 `+Y`、J6 `+X`，前臂指向 `+X`；
+即从机器人右侧（-Y）看，正好是「J1 上、J2/J3 外、J4 右、J5 内、J6 右」。所以
+DH 结构与坐标系**不需要改**，需要确认的只是**正方向的转向**（即 Direction）。
+
+现场 2 分钟判定法（任一即可）：
+
+1. 示教器把 J1 单独 +5°，从上往下看：逆时针（右手定则绕 +Z）则 `Direction`
+   在 J1 上等效为 +1；顺时针则该轴取反；
+2. 记下某个姿态的示教器关节值，用它跑一次 FK，看算出的法兰位置是否与实机
+   朝向一致——若整体镜像，说明有轴取反。
+
 ### 现场怎么发：`send_9011.py`
 
 **关键：PC 是 TCP 服务端，控制器是客户端。** `NexbotRobot` 在本机 `12345` 上

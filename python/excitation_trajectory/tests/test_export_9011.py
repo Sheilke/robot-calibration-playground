@@ -194,6 +194,14 @@ class CliTest(unittest.TestCase):
             code = main(argv)
         return code, out.getvalue(), err.getvalue()
 
+    @staticmethod
+    def _invoke(argv, _root=None):
+        """与 :meth:`_run` 同义，供其它测试类复用。"""
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(argv)
+        return code, out.getvalue(), err.getvalue()
+
     def test_end_to_end(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
             root = Path(tmp)
@@ -300,3 +308,51 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JointSignTest(unittest.TestCase):
+    """模型轴角 -> 控制器下发值的方向映射（Hyundai Direction 非全 1）。"""
+
+    @staticmethod
+    def _run(extra):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            scan = root / "scan.json"
+            scan.write_text(json.dumps(CliTest._scan_payload(3)), encoding="utf-8")
+            out = root / "p.json"
+            msg = root / "m.txt"
+            code, _, err = CliTest._invoke([str(scan), "--out", str(out),
+                                            "--messages", str(msg)] + extra,
+                                           root)
+            return code, (json.loads(out.read_text(encoding="utf-8"))
+                          if code == 0 else None), err
+
+    def test_default_is_identity(self):
+        code, payload, _ = self._run([])
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["meta"]["joint_sign"], [1] * 6)
+        self.assertEqual(payload["points"][0]["data"],
+                         [round(v, 2) for v in CliTest._scan_payload(3)
+                          ["perturbed_ik"][0]["q"]])
+
+    def test_invert_selected_axes(self):
+        code, payload, _ = self._run(["--invert-joints", "1,2,4,6"])
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["meta"]["joint_sign"], [-1, -1, 1, -1, 1, -1])
+        source = CliTest._scan_payload(3)["perturbed_ik"][0]["q"]
+        expected = [round(-v if i in (0, 1, 3, 5) else v, 2)
+                    for i, v in enumerate(source)]
+        self.assertEqual(payload["points"][0]["data"], expected)
+
+    def test_invalid_axis_number(self):
+        with self.assertRaises(SystemExit):
+            self._run(["--invert-joints", "0"])
+
+    def test_invalid_token(self):
+        with self.assertRaises(SystemExit):
+            self._run(["--invert-joints", "a"])
+
+    def test_all_axes_can_be_inverted(self):
+        code, payload, _ = self._run(["--invert-joints", "1,2,3,4,5,6"])
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["meta"]["joint_sign"], [-1] * 6)
