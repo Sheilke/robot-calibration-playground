@@ -495,3 +495,42 @@ class ConfigTagTest(unittest.TestCase):
         pose = rbt.fk([0.0, 20.0, -20.0, 0.0, 60.0, 0.0])
         self.assertEqual(config_tag(rbt, pose, [0.0, 20.0, 20.0, 0.0, 60.0, 0.0])[1], 1)
         self.assertEqual(config_tag(rbt, pose, [0.0, 20.0, -20.0, 0.0, 60.0, 0.0])[1], -1)
+
+
+class ZInsertTest(unittest.TestCase):
+    """换层插入中间高度点：只变 Z、点数可预期、连续性不破。"""
+
+    BASE = (0, 60, 0, 40, 0, 80, 3, 2, 2)      # xs=3 ys=2 zs=2 -> 36 点
+
+    def _plan(self, z_insert):
+        return plan_waypoints(*self.BASE, (0, 0, 0), z_insert=z_insert)
+
+    def test_insert_count(self):
+        for k in (0, 1, 2, 3):
+            with self.subTest(z_insert=k):
+                self.assertEqual(len(self._plan(k)), 36 + 2 * k)
+
+    def test_inserted_points_change_only_z(self):
+        waypoints = self._plan(2)
+        for before, after in zip(waypoints, waypoints[1:]):
+            changed = [axis for axis in range(3)
+                       if abs(after.pos[axis] - before.pos[axis]) > 1e-9]
+            self.assertLessEqual(len(changed), 1,
+                                 msg=f"{before.pos} -> {after.pos}")
+
+    def test_inserted_heights_are_evenly_spaced(self):
+        waypoints = self._plan(2)
+        z_values = sorted({round(w.pos[2], 9) for w in waypoints})
+        # 3 层（0/40/80）+ 2 次换层各插 2 点 = 7 个高度
+        self.assertEqual(len(z_values), 7)
+        # 层间距 40 被 2 个插入点分成 3 段 -> 每段 40/3
+        for low, high in zip(z_values, z_values[1:]):
+            # 高度由 (z_from + (z_to-z_from)*frac) 累加得到，含 ~1e-9 浮点噪声
+            self.assertAlmostEqual(high - low, 40.0 / 3.0, places=6)
+
+    def test_grid_vertices_still_visited_once(self):
+        plain = {w.pos for w in self._plan(0)}
+        inserted = self._plan(2)
+        self.assertTrue(plain.issubset({w.pos for w in inserted}))
+        indices = [w.index for w in inserted]
+        self.assertEqual(indices, list(range(len(inserted))))

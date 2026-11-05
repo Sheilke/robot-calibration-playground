@@ -144,7 +144,7 @@ def plan_waypoints(x_min: float, x_max: float,
                    y_min: float, y_max: float,
                    z_min: float, z_max: float,
                    xs: int, ys: int, zs: int,
-                   rpy_ref: tuple) -> list[Waypoint]:
+                   rpy_ref: tuple, z_insert: int = 0) -> list[Waypoint]:
     """生成 AABB 网格蛇形寻位路点（连续蛇形，一格一格走）。
 
     顶点：各轴 ``np.linspace(min, max, 份数 + 1)``（含边界）。
@@ -160,14 +160,20 @@ def plan_waypoints(x_min: float, x_max: float,
 
     ``y_dir`` 每层翻转（偶数层 y_min -> y_max，奇数层反向）。
 
+    ``z_insert > 0`` 时，**每次换层**在两层之间额外插入 ``z_insert`` 个
+    中间高度路点（保持 X、Y 不变，只变 Z），把一次大跳拆成几段短升降。
+    插入点只动 Z，仍满足「相邻两点恰在一个轴上相差一格」的连续性要求。
+
     Args:
         x_min/x_max/y_min/y_max/z_min/z_max: AABB 边界（mm）。
         xs/ys/zs: 各轴份数（顶点数 = 份数 + 1）。
         rpy_ref: 参考姿态 (roll, pitch, yaw) deg，赋给全部路点。
+        z_insert: 每次换层插入的中间高度点数（0 = 不插）。
 
     Returns:
-        按生成顺序的 Waypoint 列表，index 从 0 递增；总数
-        ``(xs+1)*(ys+1)*(zs+1)``，每个网格顶点恰好出现一次。
+        按生成顺序的 Waypoint 列表，index 从 0 递增；不插中间点时总数
+        ``(xs+1)*(ys+1)*(zs+1)``，每个网格顶点恰好出现一次；插值时
+        额外增加 ``zs * z_insert`` 个点。
     """
     xs_v = np.linspace(float(x_min), float(x_max), int(xs) + 1)
     ys_v = np.linspace(float(y_min), float(y_max), int(ys) + 1)
@@ -181,6 +187,12 @@ def plan_waypoints(x_min: float, x_max: float,
         waypoints.append(Waypoint(index=len(waypoints),
                                   pos=(float(xs_v[i]), float(ys_v[j]),
                                        float(zs_v[k])),
+                                  rpy_ref=rpy_ref))
+
+    def _emit_z(x: float, y: float, z: float) -> None:
+        """追加一个非网格顶点（换层中间高度），保持给定 XYZ。"""
+        waypoints.append(Waypoint(index=len(waypoints),
+                                  pos=(float(x), float(y), float(z)),
                                   rpy_ref=rpy_ref))
 
     # 光标式一格一格走：i/j/k 为当前顶点网格下标，x_dir/y_dir 为行/层方向
@@ -202,6 +214,14 @@ def plan_waypoints(x_min: float, x_max: float,
         # 3) 层间转换: 保持 X, Y 不变, 垂直上升一个 Z（关键：无 XY 跳变）;
         #    Y 方向翻转, 行方向同步取反（落点行沿远离落点方向扫描）
         if k + 1 <= int(zs):
+            # 换层：先插入 z_insert 个中间高度（只变 Z），再落到下一层
+            if z_insert > 0:
+                z_from = float(zs_v[k])
+                z_to = float(zs_v[k + 1])
+                for step in range(1, int(z_insert) + 1):
+                    frac = step / (int(z_insert) + 1)
+                    _emit_z(float(xs_v[i]), float(ys_v[j]),
+                            z_from + (z_to - z_from) * frac)
             k += 1
             _emit(i, j, k)
             y_dir = -y_dir
@@ -834,6 +854,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Y 方向份数，默认 3")
     parser.add_argument("--zs", type=int, default=3,
                         help="Z 方向份数，默认 3")
+    parser.add_argument("--z-insert", type=int, default=0, metavar="N",
+                        help="每次换层时在两层之间插入 N 个中间高度路点"
+                             "（只变 Z，把大跳拆成短升降），默认 0 不插")
     parser.add_argument("--urdf", default=str(DEFAULT_URDF),
                         help="机器人模型路径（.urdf / .json，IK 链使用）")
     parser.add_argument("--q-seed", default=DEFAULT_Q_SEED,
@@ -893,6 +916,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     for name, n in (("xs", args.xs), ("ys", args.ys), ("zs", args.zs)):
         if n < 0:
             parser.error(f"--{name} 份数需 >= 0，当前为 {n}")
+    if getattr(args, "z_insert", 0) < 0:
+        parser.error(f"--z-insert 需 >= 0，当前为 {args.z_insert}")
     if not math.isfinite(args.cond_max):
         parser.error(f"--cond-max 必须为有限值（拒绝 inf/nan），当前为 {args.cond_max}")
     if args.cond_max < 1.0:
@@ -997,7 +1022,8 @@ def _run_skip_ik(args: argparse.Namespace) -> int:
     # ---- 路点生成 ----
     waypoints = plan_waypoints(args.x_min, args.x_max, args.y_min, args.y_max,
                                args.z_min, args.z_max,
-                               args.xs, args.ys, args.zs, rpy_ref)
+                               args.xs, args.ys, args.zs, rpy_ref,
+                               z_insert=getattr(args, "z_insert", 0))
 
     # ---- 路点表打印（坐标 1 位小数；末尾打印总数） ----
     rpy_str = ", ".join(_fmt_g(v) for v in rpy_ref)
@@ -1026,6 +1052,7 @@ def _run_skip_ik(args: argparse.Namespace) -> int:
             "xs": int(args.xs),
             "ys": int(args.ys),
             "zs": int(args.zs),
+            "z_insert": int(getattr(args, "z_insert", 0)),
             "seed": int(args.seed),
             "euler_convention": getattr(args, "euler_convention", "xyz-extrinsic"),
             "skip_ik": bool(args.skip_ik),
@@ -1073,7 +1100,8 @@ def _run_ik_chain(args: argparse.Namespace,
     rpy_ref = tuple(float(v) for v in args.rpy)
     waypoints = plan_waypoints(args.x_min, args.x_max, args.y_min, args.y_max,
                                args.z_min, args.z_max,
-                               args.xs, args.ys, args.zs, rpy_ref)
+                               args.xs, args.ys, args.zs, rpy_ref,
+                               z_insert=getattr(args, "z_insert", 0))
 
     # ---- 3. 姿态扰动采样 + 姿态激励条件数（一次性检查，非循环） ----
     def _poses_of(rpy_getter):
@@ -1168,6 +1196,7 @@ def _run_ik_chain(args: argparse.Namespace,
             "xs": int(args.xs),
             "ys": int(args.ys),
             "zs": int(args.zs),
+            "z_insert": int(getattr(args, "z_insert", 0)),
             "seed": int(args.seed),
             "euler_convention": getattr(args, "euler_convention", "xyz-extrinsic"),
             "skip_ik": bool(args.skip_ik),
