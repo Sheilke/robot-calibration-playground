@@ -109,6 +109,31 @@ class PlanWaypointsTest(unittest.TestCase):
         self.assertEqual(indices[9], (2, 2, 1))
         self.assert_adjacent_grid_steps(indices)
 
+    def test_motion_order_is_y_then_x_then_z(self):
+        """轴优先级 Y -> X -> Z：先扫 Y 到头，再动 X，整层走完才动 Z。"""
+        waypoints = plan_waypoints(
+            0, 1, 0, 2, 0, 1, xs=1, ys=2, zs=1, rpy_ref=(0, 0, 0)
+        )
+        indices = self._grid_indices(waypoints)
+        self.assertEqual(indices, [
+            # 层 0：X=0 扫 Y 0->2，X->1，扫 Y 2->0
+            (0, 0, 0), (0, 1, 0), (0, 2, 0),
+            (1, 2, 0), (1, 1, 0), (1, 0, 0),
+            # 整层走完后才升 Z，随后反向蛇形
+            (1, 0, 1), (1, 1, 1), (1, 2, 1),
+            (0, 2, 1), (0, 1, 1), (0, 0, 1),
+        ])
+
+    def test_first_sweep_moves_along_y(self):
+        """首段必须只动 Y（X、Z 不变）。坐标取 0..3 使单位与网格下标重合。"""
+        waypoints = plan_waypoints(
+            0, 3, 0, 3, 0, 3, xs=3, ys=3, zs=3, rpy_ref=(0, 0, 0)
+        )
+        head = self._grid_indices(waypoints)[:4]
+        self.assertEqual(len({pos[0] for pos in head}), 1, "首段 X 不应变化")
+        self.assertEqual(len({pos[2] for pos in head}), 1, "首段 Z 不应变化")
+        self.assertEqual([pos[1] for pos in head], [0, 1, 2, 3], "首段应沿 Y 递增")
+
     def test_one_by_one_by_one_grid_is_unique_and_continuous(self):
         waypoints = plan_waypoints(
             0, 1, 0, 1, 0, 1, xs=1, ys=1, zs=1, rpy_ref=(0, 0, 0)

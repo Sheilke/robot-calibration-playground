@@ -152,6 +152,9 @@ EULER_ORDERS = ("xyz", "zyx")
 EULER_CONVENTIONS = tuple(f"{order}-{sense}" for order in EULER_ORDERS
                           for sense in ("extrinsic", "intrinsic"))
 
+#: 路点遍历的轴优先级：行内 Y 快轴 -> 行间 X -> 整层走完后才动 Z。
+MOTION_ORDER = "Y->X->Z"
+
 #: 默认欧拉约定（与历史行为一致）。
 DEFAULT_EULER_CONVENTION = "xyz-extrinsic"
 
@@ -333,16 +336,18 @@ def plan_waypoints(x_min: float, x_max: float,
 
     顶点：各轴 ``np.linspace(min, max, 份数 + 1)``（含边界）。
     行走顺序：自 ``(x_min, y_min, z_min)`` 起，任意相邻两路点恰在一个轴
-    上相差一格（无斜跳/飞移）：
+    上相差一格（无斜跳/飞移）。轴的优先级为 **Y -> X -> Z**：
 
-    * 行内: 保持 Y, Z 不变, X 逐格扫描; 行方向逐行交替
-      （全局连续，首行 X_min -> X_max，满足首行方向不变量）;
-    * 行间: 保持 X, Z 不变, Y 沿 ``y_dir`` 前进一格;
-    * 层末: 保持 X, Y 不变, 垂直上升一个 Z（无 XY 跳变），并翻转
-      ``y_dir``，下一层自 Y 边界逐格返回；落点即新层首行端点，
-      沿远离落点方向继续扫描（行方向同步取反，保持全局交替）。
+    * 行内（快轴 Y）: 保持 X, Z 不变, Y 沿 ``y_dir`` 逐格扫到边界
+      （首行 Y_min -> Y_max）;
+    * 行间（中层 X）: 保持 Y, Z 不变, X 沿 ``x_dir`` 前进一格,
+      并翻转 ``y_dir`` 使下一行反向扫回（蛇形，全局连续）;
+    * 层末（慢轴 Z）: 一整层走完后, 保持 X, Y 不变, 垂直上升一个 Z
+      （无 XY 跳变），并翻转 ``x_dir`` / ``y_dir``，下一层自落点
+      沿远离边界的方向继续。
 
-    ``y_dir`` 每层翻转（偶数层 y_min -> y_max，奇数层反向）。
+    ``y_dir`` 每行翻转，``x_dir`` / ``y_dir`` 每层各翻转一次
+    （偶数层 y_min -> y_max，奇数层反向）。
 
     ``z_insert > 0`` 时，**每次换层**在两层之间额外插入 ``z_insert`` 个
     中间高度路点（保持 X、Y 不变，只变 Z），把一次大跳拆成几段短升降。
@@ -379,24 +384,26 @@ def plan_waypoints(x_min: float, x_max: float,
                                   pos=(float(x), float(y), float(z)),
                                   rpy_ref=rpy_ref))
 
-    # 光标式一格一格走：i/j/k 为当前顶点网格下标，x_dir/y_dir 为行/层方向
+    # 光标式一格一格走：i/j/k 为当前顶点网格下标，x_dir/y_dir 为行/层方向。
+    # 轴优先级 Y -> X -> Z：Y 是行内快轴，X 是行间中层，Z 只在整层走完后动。
     i, j, k = 0, 0, 0                     # 起点 (x_min, y_min, z_min)
     _emit(i, j, k)
-    x_dir = 1                             # 行内 X 方向（首行 X_min -> X_max）
-    y_dir = 1                             # 层内 Y 方向（每层翻转）
+    y_dir = 1                             # 行内 Y 方向（首行 Y_min -> Y_max）
+    x_dir = 1                             # 层内 X 方向（每层翻转）
     while True:
-        # 1) 行内扫描: 保持 Y, Z 不变, X 沿 x_dir 逐格走到行边界
-        while 0 <= i + x_dir <= int(xs):
-            i += x_dir
-            _emit(i, j, k)
-        # 2) 行间前进: 保持 X, Z 不变, Y 沿 y_dir 前进一格; 行方向取反
-        if 0 <= j + y_dir <= int(ys):
+        # 1) 行内扫描: 保持 X, Z 不变, Y 沿 y_dir 逐格走到行边界
+        while 0 <= j + y_dir <= int(ys):
             j += y_dir
             _emit(i, j, k)
-            x_dir = -x_dir
+        # 2) 行间前进: 保持 Y, Z 不变, X 沿 x_dir 前进一格; 行方向取反
+        if 0 <= i + x_dir <= int(xs):
+            i += x_dir
+            _emit(i, j, k)
+            y_dir = -y_dir
             continue
-        # 3) 层间转换: 保持 X, Y 不变, 垂直上升一个 Z（关键：无 XY 跳变）;
-        #    Y 方向翻转, 行方向同步取反（落点行沿远离落点方向扫描）
+        # 3) 层间转换（仅在一整层走完后发生）: 保持 X, Y 不变, 垂直上升
+        #    一个 Z（关键：无 XY 跳变）; X/Y 方向各翻一次，下一层自落点
+        #    沿远离边界的方向继续
         if k + 1 <= int(zs):
             # 换层：先插入 z_insert 个中间高度（只变 Z），再落到下一层
             if z_insert > 0:
@@ -1464,6 +1471,7 @@ def _run_skip_ik(args: argparse.Namespace) -> int:
             "ys": int(args.ys),
             "zs": int(args.zs),
             "z_insert": int(getattr(args, "z_insert", 0)),
+            "motion_order": MOTION_ORDER,
             "grid_source": getattr(args, "grid_source", "explicit"),
             "target_count": getattr(args, "target_count", None),
             "aabb_source": getattr(args, "aabb_source", "axes"),
@@ -1660,6 +1668,7 @@ def _run_ik_chain(args: argparse.Namespace,
             "ys": int(args.ys),
             "zs": int(args.zs),
             "z_insert": int(getattr(args, "z_insert", 0)),
+            "motion_order": MOTION_ORDER,
             "grid_source": getattr(args, "grid_source", "explicit"),
             "target_count": getattr(args, "target_count", None),
             "aabb_source": getattr(args, "aabb_source", "axes"),
