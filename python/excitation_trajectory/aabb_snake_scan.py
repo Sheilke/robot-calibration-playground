@@ -144,6 +144,17 @@ class ChainStep:
 # ---------------------------------------------------------------------------
 # 路点生成
 # ---------------------------------------------------------------------------
+#: 默认网格份数：``--xs 1 --ys 4 --zs 4`` -> 2x5x5 = 50 个路点（无插点）。
+DEFAULT_GRID = (1, 4, 4)
+
+#: 支持的欧拉约定：轴序（xyz / zyx） × 定轴/动轴，共 4 种。
+EULER_ORDERS = ("xyz", "zyx")
+EULER_CONVENTIONS = tuple(f"{order}-{sense}" for order in EULER_ORDERS
+                          for sense in ("extrinsic", "intrinsic"))
+
+#: 默认欧拉约定（与历史行为一致）。
+DEFAULT_EULER_CONVENTION = "xyz-extrinsic"
+
 #: ``--target-count`` 自动凑数时各轴份数的上限。
 COUNT_GRID_MAX_PER_AXIS = 12
 #: ``--target-count`` 自动凑数时允许的最大 ``z_insert``。
@@ -308,9 +319,9 @@ def _resolve_grid(parser: argparse.ArgumentParser,
 
     args.grid_source = "explicit"
     args.target_count = None
-    for name in ("xs", "ys", "zs"):
+    for name, fallback in zip(("xs", "ys", "zs"), DEFAULT_GRID):
         if getattr(args, name) is None:
-            setattr(args, name, 3)
+            setattr(args, name, fallback)
 
 
 def plan_waypoints(x_min: float, x_max: float,
@@ -656,6 +667,7 @@ def check_segments(steps, *, samples: int = 101) -> dict:
 def solve_chain_guarded(rbt, waypoints, q_seed, *, j5_min: float = 0.0,
                         j3_min: float = 0.0, attempts: int = 30,
                         seed: int = 0, amplitudes_deg=None,
+                        order: str = "XYZ",
                         extrinsic: bool = True,
                         strict: bool = False) -> tuple:
     """带奇异守卫的链式选解：某点 |J5|（或 |J3|）过小时重采该点姿态。
@@ -718,7 +730,8 @@ def solve_chain_guarded(rbt, waypoints, q_seed, *, j5_min: float = 0.0,
         tries = 0
         while tries < max(1, int(attempts)):
             tries += 1
-            T = rbt.pose_to_T(wp.pos, wp.rpy_pert, extrinsic=extrinsic)
+            T = rbt.pose_to_T(wp.pos, wp.rpy_pert, order=order,
+                              extrinsic=extrinsic)
             q_sel, n_sols, dq_l2, dq_l1, cfg, ok = _select_solution(
                 rbt, T, q_prev, cfg_ref)
             if q_sel is not None and ok:
@@ -1002,14 +1015,30 @@ def design_condition_number(amplitudes_deg, reference_rpy,
 
 def _extrinsic_of(args: argparse.Namespace) -> bool:
     """解析后的欧拉约定 -> ``extrinsic`` 旗标（``--validate-args`` 已归一化）。"""
-    return getattr(args, "euler_convention", "xyz-extrinsic") == "xyz-extrinsic"
+    return _split_convention(args)[1]
+
+
+def _split_convention(args: argparse.Namespace):
+    """欧拉约定名 -> ``(order, extrinsic)``，如 ``"zyx-intrinsic"`` -> ``("ZYX", False)``。
+
+    ``--euler`` 的取值形如 ``<轴序>-<定/动轴>``；未设置时按旧的
+    ``--intrinsic`` 旗标回退到 ``xyz-intrinsic`` / ``xyz-extrinsic``。
+    """
+    convention = getattr(args, "euler_convention", None) or "xyz-extrinsic"
+    order, _, sense = convention.partition("-")
+    return order.upper(), sense != "intrinsic"
+
+
+def _order_of(args: argparse.Namespace) -> str:
+    """解析后的欧拉约定 -> ``euler_to_rot`` 的轴序字符串（``"XYZ"`` / ``"ZYX"``）。"""
+    return _split_convention(args)[0]
 
 
 def _reference_rotation(args: argparse.Namespace,
                         reference_rpy) -> np.ndarray:
     """标称参考姿态（``--rpy``）的旋转矩阵，与 ``--euler`` 约定一致。"""
     return euler_to_rot(tuple(float(v) for v in reference_rpy),
-                        order="XYZ",
+                        order=_order_of(args),
                         extrinsic=_extrinsic_of(args))
 
 
@@ -1084,7 +1113,7 @@ def evaluate_conditioning(args: argparse.Namespace, waypoints, reference_rpy,
     threshold = float(args.cond_max)
     include_position = bool(args.cond_position)
     design = design_condition_number(amplitudes, reference_rpy,
-                                     order="XYZ",
+                                     order=_order_of(args),
                                      extrinsic=_extrinsic_of(args))
     report = {"status": "not_run",
               "convention": "cond(X)=sigma_max/sigma_min",
@@ -1200,11 +1229,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         default=list(DEFAULT_RPY),
                         help="参考姿态 roll pitch yaw (deg)，默认 180 0 -90")
     parser.add_argument("--xs", type=int, default=None,
-                        help="X 方向份数（顶点数=份数+1），默认 3")
+                        help="X 方向份数（顶点数=份数+1），默认 %d" % DEFAULT_GRID[0])
     parser.add_argument("--ys", type=int, default=None,
-                        help="Y 方向份数，默认 3")
+                        help="Y 方向份数，默认 %d" % DEFAULT_GRID[1])
     parser.add_argument("--zs", type=int, default=None,
-                        help="Z 方向份数，默认 3")
+                        help="Z 方向份数，默认 %d" % DEFAULT_GRID[2])
     parser.add_argument("--target-count", type=int, default=None, metavar="N",
                         help="目标路点总数：自动选一组 (xs, ys, zs, z_insert) "
                              "恰好凑出 N 个点（各轴格距尽量均匀）；"
@@ -1240,11 +1269,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-ik", action="store_true",
                         help="仅路点预览模式：不求解 IK，打印路点表并输出"
                              "预览图与 JSON")
-    parser.add_argument("--euler", choices=("xyz-extrinsic", "xyz-intrinsic"),
+    parser.add_argument("--euler", choices=EULER_CONVENTIONS, type=str.lower,
                         default=None, metavar="CONVENTION",
-                        help="欧拉角约定：xyz-extrinsic=定轴 RPY（Rz·Ry·Rx，"
-                             "默认）或 xyz-intrinsic=动轴（Rx·Ry·Rz，Nexbot "
-                             "控制器链路）；显式给出时覆盖 --intrinsic")
+                        help="欧拉角约定 <轴序>-<定轴|动轴>：轴序可选 "
+                             "xyz / zyx；定轴（extrinsic）=固定坐标系、逆序相乘，"
+                             "动轴（intrinsic）=随体坐标系、顺序相乘。"
+                             f"默认 {DEFAULT_EULER_CONVENTION}。"
+                             "例：xyz-extrinsic（=Rz·Ry·Rx，定轴 RPY，默认）、"
+                             "xyz-intrinsic（=Rx·Ry·Rz，Nexbot 控制器链路）、"
+                             "zyx-intrinsic（=Rz·Ry·Rx 动轴）、zyx-extrinsic")
     parser.add_argument("--intrinsic", action="store_true",
                         help="[已废弃] 等价于 --euler xyz-intrinsic；为保持"
                              "兼容保留，显式 --euler 优先")
@@ -1488,6 +1521,7 @@ def _run_ik_chain(args: argparse.Namespace,
     def _poses_of(rpy_getter):
         """由路点姿态构造位姿序列（欧拉约定由 --euler 控制）。"""
         return [rbt.pose_to_T(wp.pos, rpy_getter(wp),
+                              order=_order_of(args),
                               extrinsic=_extrinsic_of(args))
                 for wp in waypoints]
 
@@ -1514,9 +1548,11 @@ def _run_ik_chain(args: argparse.Namespace,
         chain, guard_report = solve_chain_guarded(
             rbt, waypoints, q_seed, j5_min=args.j5_min, j3_min=args.j3_min,
             attempts=args.j5_attempts, seed=args.seed,
-            amplitudes_deg=args.perturb_deg, extrinsic=_extrinsic_of(args),
+            amplitudes_deg=args.perturb_deg, order=_order_of(args),
+            extrinsic=_extrinsic_of(args),
             strict=args.strict)
         poses = [rbt.pose_to_T(wp.pos, wp.rpy_pert,
+                               order=_order_of(args),
                                extrinsic=_extrinsic_of(args)) for wp in waypoints]
     else:
         chain = solve_chain(rbt, poses, q_seed, strict=args.strict)

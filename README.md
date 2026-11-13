@@ -94,7 +94,7 @@ PYTHONPATH=python python3 -m excitation_trajectory.aabb_snake_scan \
 | --- | --- |
 | AABB 边界 | 6 个交错数值：`x_min x_max y_min y_max z_min z_max` |
 | 两个对角点 | `--point-min X Y Z --point-max X Y Z`（与上式互斥；某轴顺序反了会自动按分量归一化并提示） |
-| 网格份数 | `--xs/--ys/--zs`（顶点数 = 份数+1）+ `--z-insert` |
+| 网格份数 | `--xs/--ys/--zs`（顶点数 = 份数+1）+ `--z-insert`；**默认 `2×5×5`（=50 点）** |
 | 目标点数 | `--target-count N`：自动选一组份数恰好凑出 N 点，与 `--xs/--ys/--zs/--z-insert` 互斥 |
 
 路点总数 = `(xs+1)(ys+1)(zs+1) + zs·z_insert`。`--target-count` 只在**精确命中**的组合里挑，优先级：
@@ -110,6 +110,21 @@ PYTHONPATH=python python3 -m excitation_trajectory.aabb_snake_scan \
 - `--j5-min` / `--j3-min` / `--seg-min`：J5、J3 与相邻点之间的安全裕度;
 - `--z-insert N`：在每层竖直过渡处插入 N 个点（不是额外整层）；
 - `--skip-ik` 只看网格不求解；`--euler xyz-extrinsic|xyz-intrinsic` 指定欧拉约定，默认外旋。
+
+### 姿态表达（欧拉约定）：轴序与定/动轴都可选
+
+`--euler <轴序>-<定轴|动轴>`，轴序支持 **xyz** 与 **zyx**，共四种组合，大小写不敏感：
+
+| 约定 | 逆解出的旋转矩阵 | 典型用法 |
+| --- | --- | --- |
+| `xyz-extrinsic` | `R = Rz·Ry·Rx` | 定轴 RPY（**默认**，本仓历史行为） |
+| `xyz-intrinsic` | `R = Rx·Ry·Rz` | 动轴 XYZ（Nexbot 控制器 `kXyzIntrinsic`） |
+| `zyx-extrinsic` | `R = Rx·Ry·Rz` | 定轴 ZYX |
+| `zyx-intrinsic` | `R = Rz·Ry·Rx` | 动轴 ZYX |
+
+同一组 `--rpy` 数值在不同约定下代表**不同的姿态**，所以「参考姿态怎么读」和「轴序」必须与
+控制器一致。`--euler` 会写进输出 JSON 的 `meta.euler_convention`；`export_gp --cartesian fk`
+有自己的 `--euler`（默认 `xyz-intrinsic`），需与扫描时用的一致。
 
 条件数的语义、门禁规则与单位换算细节，见脚本 docstring 与 `--help`。
 
@@ -171,7 +186,7 @@ PYTHONPATH=python python3 -m excitation_trajectory.export_gp \
 # 需要笛卡尔位姿时由模型 FK 填充；姿态按控制器读数写弧度
 PYTHONPATH=python python3 -m excitation_trajectory.export_gp \
   scan_result.json position_R1_template.json \
-  -o position_R1.json --cartesian fk --cart-units rad
+  -o position_R1.json --cartesian fk --cart-units rad --euler xyz-intrinsic
 ```
 
 - **关节角始终是度**，与 `robot_pt` 线上单位一致；`--cart-units` 只作用于

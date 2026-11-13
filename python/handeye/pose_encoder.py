@@ -35,10 +35,16 @@ EULER_ORDER = "XYZ"
 #: 是否定轴（外旋）。``False`` = 动轴（内旋），即 ``R = Rx·Ry·Rz``。
 EXTRINSIC = False
 
-#: 支持的欧拉约定（对外统一命名，供 CLI / 会话 JSON 使用）。
-#: ``xyz-intrinsic`` = ``R = Rx·Ry·Rz``（C++ ``kXyzIntrinsic``，Nexbot 链路）；
-#: ``xyz-extrinsic`` = ``R = Rz·Ry·Rx``（RPY 定轴，本仓其他工具默认）。
-EULER_CONVENTIONS = ("xyz-intrinsic", "xyz-extrinsic")
+#: 支持的轴序（与 :func:`robot_model.nexbot_ik.euler_to_rot` 一致）。
+EULER_ORDERS = ("xyz", "zyx")
+
+#: 支持的欧拉约定（对外统一命名，供 CLI / 会话 JSON 使用），``<轴序>-<定/动轴>``。
+#: 定轴（extrinsic）= 固定坐标系、逆序相乘；动轴（intrinsic）= 随体、顺序相乘。
+#: 例：``xyz-intrinsic`` = ``R = Rx·Ry·Rz``（C++ ``kXyzIntrinsic``，Nexbot 链路）；
+#: ``xyz-extrinsic`` = ``R = Rz·Ry·Rx``（RPY 定轴，本仓其他工具默认）；
+#: ``zyx-intrinsic`` = ``R = Rz·Ry·Rx``（外旋 ZYX）；``zyx-extrinsic`` = ``R = Rx·Ry·Rz``。
+EULER_CONVENTIONS = tuple(f"{order}-{sense}" for order in EULER_ORDERS
+                          for sense in ("extrinsic", "intrinsic"))
 
 #: 默认约定：与控制器链路一致（XYZ 内旋）。
 DEFAULT_EULER_CONVENTION = "xyz-intrinsic"
@@ -173,9 +179,15 @@ def normalize_convention(value, where: str = "euler_convention") -> str:
 
 
 def convention_extrinsic(convention) -> bool:
-    """约定名 -> ``extrinsic`` 旗标（``xyz-intrinsic`` -> False，其余 -> True）。"""
+    """约定名 -> ``extrinsic`` 旗标（``*-extrinsic`` -> True，``*-intrinsic`` -> False）。"""
     normalized = normalize_convention(convention)
-    return normalized == "xyz-extrinsic"
+    return normalized.endswith("extrinsic")
+
+
+def convention_order(convention) -> str:
+    """约定名 -> ``euler_to_rot`` / ``rot_to_euler`` 的轴序串（``"XYZ"`` / ``"ZYX"``）。"""
+    normalized = normalize_convention(convention)
+    return normalized.split("-", 1)[0].upper()
 
 
 def rotation_to_euler(rot, convention: str = DEFAULT_EULER_CONVENTION) -> np.ndarray:
@@ -193,18 +205,21 @@ def rotation_to_euler(rot, convention: str = DEFAULT_EULER_CONVENTION) -> np.nda
     """
     normalized = normalize_convention(convention)
     if normalized == "xyz-intrinsic":
+        # XYZ 内旋保留专门的万向锁分支（历史行为，已被测试钉住）
         return rotation_to_euler_intrinsic(rot)
     matrix = _as_rotation(rot)
     return np.asarray(
-        rot_to_euler(matrix, order=EULER_ORDER, extrinsic=True), dtype=float)
+        rot_to_euler(matrix, order=convention_order(normalized),
+                     extrinsic=convention_extrinsic(normalized)),
+        dtype=float)
 
 
 def euler_to_rotation(rpy_deg, convention: str = DEFAULT_EULER_CONVENTION) -> np.ndarray:
     """指定约定的 XYZ 欧拉角（deg）-> 3×3 旋转矩阵。"""
     normalized = normalize_convention(convention)
     angles = _as_vector3(rpy_deg, "rpy_deg")
-    return euler_to_rot(angles, order=EULER_ORDER,
-                        extrinsic=(normalized == "xyz-extrinsic"))
+    return euler_to_rot(angles, order=convention_order(normalized),
+                        extrinsic=convention_extrinsic(normalized))
 
 
 def matrix_to_pose_fields(matrix,
