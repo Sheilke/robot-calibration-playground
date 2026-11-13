@@ -141,7 +141,7 @@ class CliTest(unittest.TestCase):
                     iso9283_points(CUBE), start=1):
                 entry = payload["globalPosition"][f"GP{i:04d}"]
                 np.testing.assert_allclose(entry[0:3], point["pos"], atol=1e-6)
-                self.assertEqual(entry[3:6], [3.0, 73.0, -167.0])
+                self.assertEqual(entry[3:6], [math.radians(a) for a in (3.0, 73.0, -167.0)])
             self.assertEqual(payload["globalPosition"]["GP0006"], [0] * 14)
 
     def test_invalid_cube_rejected(self):

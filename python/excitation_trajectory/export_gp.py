@@ -140,6 +140,9 @@ def main(argv=None) -> int:
                         help="起始 GP 编号（1 基），默认 1")
     parser.add_argument("--flag", type=int, default=DEFAULT_FLAG,
                         help=f"14 字段布局里 idx 6 的标志位，默认 {DEFAULT_FLAG}")
+    parser.add_argument("--cart-units", choices=("deg", "rad"), default="rad",
+                        help="笛卡尔姿态写入单位，默认 rad（示教器/控制器 GP 的读数"
+                             "是弧度：0.056/1.273/-2.906 rad 对应 3.2/72.9/-166.5 度）")
     parser.add_argument("--cartesian", choices=("zero", "fk"), default="zero",
                         help="笛卡尔部分写 0（默认，与现场样例一致）或用模型 FK 填")
     parser.add_argument("--report", default=None, help="额外输出 JSON 报告")
@@ -163,7 +166,10 @@ def main(argv=None) -> int:
 
         def cartesian_of(q_deg):
             position, orientation = matrix_to_pose_fields(robot.fk(q_deg))
-            return list(position) + list(orientation)
+            angles = list(orientation)
+            if args.cart_units == "rad":
+                angles = [math.radians(v) for v in angles]
+            return list(position) + angles
 
     try:
         updated, report = write_gp_entries(template, points, first=args.first,

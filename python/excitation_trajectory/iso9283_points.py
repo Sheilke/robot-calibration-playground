@@ -156,6 +156,8 @@ def main(argv=None) -> int:
     parser.add_argument("--gp-template", default=None,
                         help="控制器 position_R1.json；给了就把 5 点写进 GP0001..GP0005")
     parser.add_argument("--gp-out", default=None, help="GP 文件输出路径（副本）")
+    parser.add_argument("--cart-units", choices=("deg", "rad"), default="rad",
+                        help="GP 里笛卡尔姿态的单位，默认 rad（示教器读数为弧度）")
     parser.add_argument("--gp-first", type=int, default=1,
                         help="起始 GP 编号，默认 1")
     args = parser.parse_args(argv)
@@ -236,6 +238,8 @@ def main(argv=None) -> int:
             print(f"错误: 读 GP 模板失败: {error}", file=sys.stderr)
             return 2
         rpy = [float(v) for v in args.rpy]
+        if args.cart_units == "rad":
+            rpy = [math.radians(v) for v in rpy]
         points_for_gp = []
         for entry in results:
             if entry["q_deg"] is None:
