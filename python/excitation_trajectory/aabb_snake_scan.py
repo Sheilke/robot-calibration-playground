@@ -144,6 +144,175 @@ class ChainStep:
 # ---------------------------------------------------------------------------
 # 路点生成
 # ---------------------------------------------------------------------------
+#: ``--target-count`` 自动凑数时各轴份数的上限。
+COUNT_GRID_MAX_PER_AXIS = 12
+#: ``--target-count`` 自动凑数时允许的最大 ``z_insert``。
+COUNT_GRID_MAX_INSERT = 10
+
+
+def grid_point_count(xs: int, ys: int, zs: int, z_insert: int = 0) -> int:
+    """网格路点总数。
+
+    ``(xs+1)*(ys+1)*(zs+1)`` 个格点，加上 ``zs`` 次换层每次插 ``z_insert`` 个。
+    """
+    return (xs + 1) * (ys + 1) * (zs + 1) + zs * z_insert
+
+
+def choose_grid(target: int, dims, *, max_per_axis: int = COUNT_GRID_MAX_PER_AXIS,
+                max_insert: int = COUNT_GRID_MAX_INSERT):
+    """为给定总点数选一组 ``(xs, ys, zs, z_insert)``。
+
+    只在**精确命中** ``target`` 的组合里挑，评分优先级（字典序）：
+
+    1. 无退化轴（某轴分份数为 0 但边长非 0 的排最后）；
+    2. **优先纯网格**（``z_insert == 0``）：插点只动 Z、不增加 XY 覆盖，
+       同样的总数用纯网格更划算；
+    3. 各轴格距（边长 / 份数）的最大/最小比，越接近 1 越好（点云越各向同性）；
+    4. ``z_insert`` 小的优先；层数 ``zs`` 大的优先。
+
+    Args:
+        target: 目标路点总数（>= 1）。
+        dims: 三轴边长 ``(lx, ly, lz)``（mm），用于估格距。
+        max_per_axis: 单轴份数上限。
+        max_insert: 单次换层插点上限。
+
+    Returns:
+        ``(xs, ys, zs, z_insert)``
+
+    Raises:
+        ValueError: ``target`` 非法，或份数上限内无精确解。
+    """
+    target = int(target)
+    if target < 1:
+        raise ValueError(f"--target-count 需 >= 1，当前为 {target}")
+
+    lengths = [abs(float(v)) for v in dims]
+    best = None                      # (退化惩罚, 各向异性, z_insert, -zs, ...)
+    nearest = []                     # 命中不了时用于提示
+
+    for zs in range(0, max_per_axis + 1):
+        for xs in range(0, max_per_axis + 1):
+            for ys in range(0, max_per_axis + 1):
+                base = (xs + 1) * (ys + 1) * (zs + 1)
+                if base > target:
+                    continue
+                remainder = target - base
+                if remainder == 0:
+                    z_insert = 0
+                elif zs == 0:
+                    continue
+                elif remainder % zs == 0 and remainder // zs <= max_insert:
+                    z_insert = remainder // zs
+                else:
+                    continue
+                nearest.append(base + zs * z_insert)
+
+                segments = (xs, ys, zs)
+                spacings = [length / seg for length, seg in zip(lengths, segments)
+                            if seg > 0]
+                degenerate = any(seg == 0 and length > 0
+                                 for length, seg in zip(lengths, segments))
+                anisotropy = (max(spacings) / min(spacings)
+                              if len(spacings) >= 2 else 1.0)
+                score = (1 if degenerate else 0, 1 if z_insert else 0,
+                         round(anisotropy, 9), z_insert, -zs, sum(segments))
+                if best is None or score < best[0]:
+                    best = (score, (xs, ys, zs, z_insert))
+
+    if best is None:
+        raise ValueError(
+            f"--target-count {target} 在当前约束内无法精确凑出"
+            f"（单轴份数 <= {max_per_axis}、单次插点 <= {max_insert}）；"
+            f"可尝试相邻点数或直接给 --xs/--ys/--zs")
+    return best[1]
+
+
+def _resolve_aabb(parser: argparse.ArgumentParser,
+                  args: argparse.Namespace) -> None:
+    """归一化 AABB 输入：6 个交错数值，或 --point-min/--point-max 两个对角点。
+
+    写入 ``args.x_min/x_max/y_min/y_max/z_min/z_max``，并记录来源
+    ``args.aabb_source``（``"axes"`` / ``"points"``）。
+    """
+    positional = list(getattr(args, "aabb", None) or [])
+    point_min = getattr(args, "point_min", None)
+    point_max = getattr(args, "point_max", None)
+
+    if positional and (point_min is not None or point_max is not None):
+        parser.error("位置参数与 --point-min/--point-max 不能同时给，二选一")
+
+    if len(positional) == 6:
+        bounds = [float(v) for v in positional]
+        args.aabb_source = "axes"
+    elif not positional:
+        if point_min is None or point_max is None:
+            parser.error(
+                "需要 6 个 AABB 数值（x_min x_max y_min y_max z_min z_max），"
+                "或同时给 --point-min X Y Z 与 --point-max X Y Z")
+        bounds = []
+        swapped = False
+        for lo, hi in zip(point_min, point_max):
+            if lo > hi:
+                swapped = True
+            bounds.extend([min(lo, hi), max(lo, hi)])
+        args.aabb_source = "points"
+        if swapped:
+            print("提示: --point-min/--point-max 的某些轴顺序相反，"
+                  "已按分量取小/取大归一化为 AABB 边界")
+    else:
+        parser.error(f"位置参数需恰好 6 个（当前 {len(positional)} 个）；"
+                     "或用 --point-min/--point-max 给两个对角点")
+
+    (args.x_min, args.x_max, args.y_min, args.y_max,
+     args.z_min, args.z_max) = bounds
+
+
+def _resolve_grid(parser: argparse.ArgumentParser,
+                  args: argparse.Namespace) -> None:
+    """归一化网格份数：显式 --xs/--ys/--zs，或 --target-count 自动凑。
+
+    写入 ``args.xs/ys/zs/z_insert``，并记录 ``args.grid_source`` 与
+    ``args.target_count``。
+    """
+    explicit = [getattr(args, "xs", None), getattr(args, "ys", None),
+                getattr(args, "zs", None)]
+    target = getattr(args, "target_count", None)
+
+    if target is not None:
+        if any(v is not None for v in explicit):
+            parser.error("--target-count 与 --xs/--ys/--zs 互斥，二选一")
+        if getattr(args, "z_insert", 0) not in (0, None):
+            parser.error("--target-count 已包含插点计算，不能再给 --z-insert")
+        dims = (args.x_max - args.x_min, args.y_max - args.y_min,
+                args.z_max - args.z_min)
+        try:
+            xs, ys, zs, z_insert = choose_grid(target, dims)
+        except ValueError as error:
+            parser.error(str(error))
+        args.xs, args.ys, args.zs, args.z_insert = xs, ys, zs, z_insert
+        args.grid_source = "target-count"
+        args.target_count = int(target)
+        total = grid_point_count(xs, ys, zs, z_insert)
+        print(f"自动凑数: --target-count {target} -> xs={xs} ys={ys} zs={zs} "
+              f"z_insert={z_insert}，格点 {(xs + 1) * (ys + 1) * (zs + 1)} "
+              f"+ 插点 {zs * z_insert} = {total} 点")
+        spans = (args.x_max - args.x_min, args.y_max - args.y_min,
+                 args.z_max - args.z_min)
+        flat = [name for name, seg, span in
+                zip("XYZ", (xs, ys, zs), spans) if seg == 0 and span > 0]
+        if flat:
+            print(f"警告: {target} 个点在该箱体内无法三向铺开，"
+                  f"{''.join(flat)} 轴只有 1 个取值（退化为平面/直线扫描）；"
+                  f"如需三向覆盖请换用相邻点数或直接给 --xs/--ys/--zs")
+        return
+
+    args.grid_source = "explicit"
+    args.target_count = None
+    for name in ("xs", "ys", "zs"):
+        if getattr(args, name) is None:
+            setattr(args, name, 3)
+
+
 def plan_waypoints(x_min: float, x_max: float,
                    y_min: float, y_max: float,
                    z_min: float, z_max: float,
@@ -1016,27 +1185,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     "一次性设计检查（cond=σmax/σmin，分块报告，一次性判定）+ "
                     "只对扰动后路点链式 IK 选解；"
                     "--no-perturb 开发验证模式用参考姿态直接跑链。")
-    parser.add_argument("x_min", type=float, metavar="X_MIN",
-                        help="AABB X 下界 (mm)")
-    parser.add_argument("x_max", type=float, metavar="X_MAX",
-                        help="AABB X 上界 (mm)")
-    parser.add_argument("y_min", type=float, metavar="Y_MIN",
-                        help="AABB Y 下界 (mm)")
-    parser.add_argument("y_max", type=float, metavar="Y_MAX",
-                        help="AABB Y 上界 (mm)")
-    parser.add_argument("z_min", type=float, metavar="Z_MIN",
-                        help="AABB Z 下界 (mm)")
-    parser.add_argument("z_max", type=float, metavar="Z_MAX",
-                        help="AABB Z 上界 (mm)")
+    parser.add_argument("aabb", nargs="*", metavar="AABB",
+                        help="要么 6 个交错数值 x_min x_max y_min y_max "
+                             "z_min z_max (mm)，要么不给而用 "
+                             "--point-min/--point-max 给两个对角点")
+    parser.add_argument("--point-min", nargs=3, type=float,
+                        metavar=("X", "Y", "Z"), default=None,
+                        help="可达区域最小点 (mm)，与 --point-max 成对使用；"
+                             "与 6 个位置参数互斥")
+    parser.add_argument("--point-max", nargs=3, type=float,
+                        metavar=("X", "Y", "Z"), default=None,
+                        help="可达区域最大点 (mm)，与 --point-min 成对使用")
     parser.add_argument("--rpy", nargs=3, type=float, metavar=("A", "B", "C"),
                         default=list(DEFAULT_RPY),
                         help="参考姿态 roll pitch yaw (deg)，默认 180 0 -90")
-    parser.add_argument("--xs", type=int, default=3,
+    parser.add_argument("--xs", type=int, default=None,
                         help="X 方向份数（顶点数=份数+1），默认 3")
-    parser.add_argument("--ys", type=int, default=3,
+    parser.add_argument("--ys", type=int, default=None,
                         help="Y 方向份数，默认 3")
-    parser.add_argument("--zs", type=int, default=3,
+    parser.add_argument("--zs", type=int, default=None,
                         help="Z 方向份数，默认 3")
+    parser.add_argument("--target-count", type=int, default=None, metavar="N",
+                        help="目标路点总数：自动选一组 (xs, ys, zs, z_insert) "
+                             "恰好凑出 N 个点（各轴格距尽量均匀）；"
+                             "与 --xs/--ys/--zs/--z-insert 互斥")
     parser.add_argument("--j5-min", type=float, default=DEFAULT_J5_MIN_DEG,
                         metavar="DEG",
                         help="|J5| 下限（度），低于则不接受该点的解并重采该点姿态，"
@@ -1051,8 +1223,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--z-insert", type=int, default=0, metavar="N",
                         help="每次换层时在两层之间插入 N 个中间高度路点"
                              "（只变 Z，把大跳拆成短升降），默认 0 不插")
-    parser.add_argument("--urdf", default=str(DEFAULT_URDF),
-                        help="机器人模型路径（.urdf / .json，IK 链使用）")
+    parser.add_argument("--urdf", "--robot-config", dest="urdf",
+                        default=str(DEFAULT_URDF),
+                        help="机器人模型路径（.urdf 或控制器 .json，IK 链使用）；"
+                             "--robot-config 为等价别名")
     parser.add_argument("--q-seed", default=DEFAULT_Q_SEED,
                         help="IK 链种子关节角，逗号分隔 6 个 deg，"
                              "默认 0,20,-20,0,40,0")
@@ -1102,11 +1276,16 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     else:
         args.euler_convention = ("xyz-intrinsic" if args.intrinsic
                                  else "xyz-extrinsic")
+    # AABB 与网格：支持 6 个交错值或两个对角点；支持 --target-count 自动凑数。
+    _resolve_aabb(parser, args)
     for axis, lo, hi in (("X", args.x_min, args.x_max),
                          ("Y", args.y_min, args.y_max),
                          ("Z", args.z_min, args.z_max)):
         if lo > hi:
             parser.error(f"{axis} 轴下界 {lo} 大于上界 {hi}")
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            parser.error(f"{axis} 轴边界必须为有限值，当前为 {lo} / {hi}")
+    _resolve_grid(parser, args)
     for name, n in (("xs", args.xs), ("ys", args.ys), ("zs", args.zs)):
         if n < 0:
             parser.error(f"--{name} 份数需 >= 0，当前为 {n}")
@@ -1252,6 +1431,9 @@ def _run_skip_ik(args: argparse.Namespace) -> int:
             "ys": int(args.ys),
             "zs": int(args.zs),
             "z_insert": int(getattr(args, "z_insert", 0)),
+            "grid_source": getattr(args, "grid_source", "explicit"),
+            "target_count": getattr(args, "target_count", None),
+            "aabb_source": getattr(args, "aabb_source", "axes"),
             "seed": int(args.seed),
             "euler_convention": getattr(args, "euler_convention", "xyz-extrinsic"),
             "skip_ik": bool(args.skip_ik),
@@ -1442,6 +1624,9 @@ def _run_ik_chain(args: argparse.Namespace,
             "ys": int(args.ys),
             "zs": int(args.zs),
             "z_insert": int(getattr(args, "z_insert", 0)),
+            "grid_source": getattr(args, "grid_source", "explicit"),
+            "target_count": getattr(args, "target_count", None),
+            "aabb_source": getattr(args, "aabb_source", "axes"),
             "seed": int(args.seed),
             "euler_convention": getattr(args, "euler_convention", "xyz-extrinsic"),
             "skip_ik": bool(args.skip_ik),

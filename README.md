@@ -30,7 +30,8 @@ robot-calibration-playground/
 │   │   └── tests/
 │   ├── robot_model/
 │   │   ├── nexbot_ik.py          # 6R FK / 解析 IK，URDF 与 JSON 解析
-│   │   └── json_to_urdf.py       # ② 控制器 JSON -> 标准 URDF
+│   │   ├── json_to_urdf.py       # ② 控制器 JSON -> 标准 URDF（--model 后缀）
+│   │   └── tests/
 │   ├── handeye/                  # 仅保留 export_gp --cartesian fk 所需的三件
 │   │   ├── se3.py                # SE(3) 运算、变换矩阵装载/校验/单位换算
 │   │   ├── dh.py                 # URDF 基准 + DH 覆盖 -> FK
@@ -69,7 +70,17 @@ PYTHONPATH=python python -m pytest python -q
 ## 功能一：生成 50 个标定点
 
 ```bash
-# 基本用法：AABB 范围 + 各轴格点 + 姿态扰动 + 链式 IK
+# 最简形式：直接给可达区域的两个对角点 + 目标点数，其余自动
+PYTHONPATH=python python3 -m excitation_trajectory.aabb_snake_scan \
+  --point-min 750 -600 270 --point-max 1300 600 940 \
+  --target-count 50 \
+  --robot-config /path/robot_R1.json \
+  --rpy 3 73 -167 --euler xyz-intrinsic \
+  --q-seed 43,-30,-36,42,-89,-1 \
+  --perturb-deg 20 20 35 --j5-min 20 --seed 0 \
+  --out position_R1_scan50.json
+
+# 等价写法：给 6 个交错数值 + 显式网格（交付那批 = 48 格点 + 2 个换层插点）
 PYTHONPATH=python python3 -m excitation_trajectory.aabb_snake_scan \
   750 1300 -600 600 270 940 --xs 3 --ys 3 --zs 2 --z-insert 1 --seed 0 \
   --urdf data/configs/hyundai_general6s.urdf \
@@ -77,8 +88,20 @@ PYTHONPATH=python python3 -m excitation_trajectory.aabb_snake_scan \
   --q-seed 43,-30,-36,42,-89,-1 --perturb-deg 20 20 35 --j5-min 20
 ```
 
-上面这条即最终交付的那批点：`xs=3, ys=3, zs=2, z-insert=1` → **48 + 2 = 50 个路点**。
-默认在当前目录生成 `scan_result.json` 与 `scan_path.png`（均已 gitignore）。
+### 三种输入形式
+
+| 输入 | 写法 |
+| --- | --- |
+| AABB 边界 | 6 个交错数值：`x_min x_max y_min y_max z_min z_max` |
+| 两个对角点 | `--point-min X Y Z --point-max X Y Z`（与上式互斥；某轴顺序反了会自动按分量归一化并提示） |
+| 网格份数 | `--xs/--ys/--zs`（顶点数 = 份数+1）+ `--z-insert` |
+| 目标点数 | `--target-count N`：自动选一组份数恰好凑出 N 点，与 `--xs/--ys/--zs/--z-insert` 互斥 |
+
+路点总数 = `(xs+1)(ys+1)(zs+1) + zs·z_insert`。`--target-count` 只在**精确命中**的组合里挑，优先级：
+优先纯网格（插点只动 Z、不增加 XY 覆盖）→ 各轴格距最均匀（最大/最小比接近 1）→ 插点更少 → 层数更多。
+例如 50 点选 `2×5×5`；若某轴只能取 1 个值（如 7 点），会打印退化警告。
+
+模型既可用 `--urdf` 也可用等价的 `--robot-config`，两者都接受 `.urdf` 或控制器 `.json`。
 
 主要约束与门禁：
 
@@ -93,10 +116,20 @@ PYTHONPATH=python python3 -m excitation_trajectory.aabb_snake_scan \
 ## 功能二：控制器 JSON → 标准 URDF
 
 ```bash
-# 显式提供公司原始 JSON 与目标路径
-PYTHONPATH=python python3 -m robot_model.json_to_urdf \
-  /path/to/Robot_A.json /tmp/model.urdf
+# 输出名取输入 JSON 的主名：robot_R1.json -> robot_R1.urdf
+PYTHONPATH=python python3 -m robot_model.json_to_urdf /path/to/robot_R1.json
+
+# --model 追加型号后缀：robot_R1_CH2000.urdf
+PYTHONPATH=python python3 -m robot_model.json_to_urdf /path/to/robot_R1.json \
+  --model CH2000
+
+# 显式给输出路径时，后缀加在该名字上：out_CH2000.urdf
+PYTHONPATH=python python3 -m robot_model.json_to_urdf /path/to/robot_R1.json \
+  out.urdf --model CH2000
 ```
+
+型号会同时写入 URDF 的头注释（`型号 model=...`）以便追溯；`--model` 只允许字母数字与
+`. _ -`，因为要进文件名。
 
 转换器读取控制器 JSON 的 `Link&CoupleCoe` / `Joint` 等字段（`Robot_A.json` 那一套），
 输出本仓解析 IK 可用的标准 URDF（球型腕结构前提：`alpha=[90,0,90,90,-90,0]`、`a4=a5=d5=0`），
