@@ -98,10 +98,13 @@ PYTHONPATH=python python3 -m robot_model.json_to_urdf \
   /path/to/Robot_A.json /tmp/model.urdf
 ```
 
-转换器读取控制器 JSON 的 `DH_model` / 杆长 / 限位 / `Direction`，输出本仓解析 IK
-可用的标准 URDF（球型腕结构前提：`alpha=[90,0,90,90,-90,0]`、`a4=a5=d5=0`）。
+转换器读取控制器 JSON 的 `Link&CoupleCoe` / `Joint` 等字段（`Robot_A.json` 那一套），
+输出本仓解析 IK 可用的标准 URDF（球型腕结构前提：`alpha=[90,0,90,90,-90,0]`、`a4=a5=d5=0`），
+并在末尾用 200 个随机位姿自校验 DH-FK 与 URDF-FK 是否严格等价。
 
-`data/configs/robot_sim/` 下是三个 CH2000 控制器配置样例：
+`data/configs/robot_sim/` 下三份是**仿真器资产**（`robot-sim-robot` 导出格式，顶层键为
+`format / id / name / assets / sensors`），**不是控制器配置**，`json_to_urdf` 不读取它们；
+保留仅作 CH2000 的 DH 参考：
 
 | 文件 | 说明 |
 | --- | --- |
@@ -109,8 +112,8 @@ PYTHONPATH=python python3 -m robot_model.json_to_urdf \
 | `ch2000_3sr_inverted_7axis_new.json` | 倒装 7 轴；**其 FK 与 `ch2000_origin.urdf` 一致** |
 | `ch2000_3sr_inverted_8axis.json` | 倒装 8 轴 |
 
-另外两个与 `ch2000_origin.urdf` 相差一个**固定的右侧法兰 `Rz(180°)`**，如需用它们做
-FK/IK，须补上该固定变换。本仓目前**没有**外部轴的 IK 支持，转换出的 URDF 只含六轴本体。
+另外两份与 `ch2000_origin.urdf` 相差一个**固定的右侧法兰 `Rz(180°)`**。本仓目前**没有**
+外部轴的 IK 支持；控制器 JSON 转换出的 URDF 也只含六轴本体。
 
 ## 功能三：50 点写入 GP 文件
 
