@@ -163,6 +163,43 @@ PYTHONPATH=python python3 -m robot_model.json_to_urdf /path/to/robot_R1.json \
 另外两份与 `ch2000_origin.urdf` 相差一个**固定的右侧法兰 `Rz(180°)`**。本仓目前**没有**
 外部轴的 IK 支持；控制器 JSON 转换出的 URDF 也只含六轴本体。
 
+## 功能二·五：奇异点自动重规划
+
+现场跑 50 点时控制器报奇异？把**当时的 6 个关节角**交给这个工具，它会自己判断
+该平移、收缩还是改参考姿态，改多少，并输出一份与扫描器同结构的 JSON（可直接
+喂给 `export_gp`）。不需要人工分析。
+
+```bash
+PYTHONPATH=python python3 -m excitation_trajectory.avoid_singularity \
+  --robot data/configs/hyundai_general6s.urdf \
+  --point-min 1100 -300 1150 --point-max 1500 300 1500 \
+  --rpy 3 73 -167 --euler xyz-intrinsic \
+  --q-seed 43,-30,-36,42,-89,-1 --target-count 50 \
+  --singular-q 0 -30 -60 0 12 0 \
+  --out scan50_repaired.json --report avoid_report.json
+```
+
+`--singular-q` 两种写法等价：`--singular-q 0 0 0 55.7 0 -55.7`（6 个数）或
+`--singular-q="0,0,0,55.7,0,-55.7"`（逗号串），可重复给多个奇异位形。
+
+### 它自己怎么判定
+
+1. 对每个报告的位形算 FK 位置与 `|J3|`/`|J5|`；
+2. **与内置判据一致**（`|J5| < j5_min` 或 `|J3| < j3_min`）→ 把实测裕度当经验
+   阈值上抬（`max(内置, 实测 + --avoid-margin)`），整体推开这一类位形；
+3. **与内置判据不一致**（例如 `|J5|=55.7°` 却报奇异）→ 说明控制器报警条件本仓
+   模型没覆盖，退化为**位置禁区**：以该点 FK 位置为球心、`--avoid-radius` 为
+   半径，禁止任何路点落入；
+4. 评估原域（N 点 IK + 关节裕度 + 段内穿零 + 设计条件数），可行就直接输出；
+5. 不可行则按**改动量从小到大**枚举候选：单轴平移 → 单侧收缩 → 参考姿态微调 →
+   双轴平移组合，第一个可行的再用**二分细化**压到刚好可行（精度 1/16）；
+6. 用完整重试次数复核后输出，报告里写明改动链、每个候选的失败原因。
+
+退出码：`0` 已输出可行方案；`2` 全部候选不可行（报告里给失败原因，不输出扫描）。
+
+已验证的行为（`test_avoid_singularity.py`）：原域可行时不做任何改动；奇异位置
+落在域角点时自动平移拉开；`--no-rpy-change` / `--no-shrink` 可限制手段。
+
 ## 功能三：50 点写入 GP 文件
 
 `export_gp.py` 把扫描结果里的关节角写进控制器 GP 的 14 字段布局，其余字段（笛卡尔
