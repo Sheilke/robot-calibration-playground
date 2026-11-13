@@ -21,11 +21,16 @@ import numpy as np
 from robot_model.nexbot_ik import Nexbot6R, euler_to_rot
 from excitation_trajectory.aabb_snake_scan import (
     DEFAULT_COND_MAX,
+    DEFAULT_GRID,
+    EULER_CONVENTIONS,
+    _reference_rotation,
+    _validate_args,
     config_tag,
     PERTURB_AMPLITUDE_DEG,
     build_arg_parser,
     design_condition_number,
     evaluate_conditioning,
+    grid_point_count,
     main,
     plan_waypoints,
     pose_condition_number,
@@ -103,6 +108,31 @@ class PlanWaypointsTest(unittest.TestCase):
         self.assertEqual(indices[8], (2, 2, 0))
         self.assertEqual(indices[9], (2, 2, 1))
         self.assert_adjacent_grid_steps(indices)
+
+    def test_motion_order_is_y_then_x_then_z(self):
+        """轴优先级 Y -> X -> Z：先扫 Y 到头，再动 X，整层走完才动 Z。"""
+        waypoints = plan_waypoints(
+            0, 1, 0, 2, 0, 1, xs=1, ys=2, zs=1, rpy_ref=(0, 0, 0)
+        )
+        indices = self._grid_indices(waypoints)
+        self.assertEqual(indices, [
+            # 层 0：X=0 扫 Y 0->2，X->1，扫 Y 2->0
+            (0, 0, 0), (0, 1, 0), (0, 2, 0),
+            (1, 2, 0), (1, 1, 0), (1, 0, 0),
+            # 整层走完后才升 Z，随后反向蛇形
+            (1, 0, 1), (1, 1, 1), (1, 2, 1),
+            (0, 2, 1), (0, 1, 1), (0, 0, 1),
+        ])
+
+    def test_first_sweep_moves_along_y(self):
+        """首段必须只动 Y（X、Z 不变）。坐标取 0..3 使单位与网格下标重合。"""
+        waypoints = plan_waypoints(
+            0, 3, 0, 3, 0, 3, xs=3, ys=3, zs=3, rpy_ref=(0, 0, 0)
+        )
+        head = self._grid_indices(waypoints)[:4]
+        self.assertEqual(len({pos[0] for pos in head}), 1, "首段 X 不应变化")
+        self.assertEqual(len({pos[2] for pos in head}), 1, "首段 Z 不应变化")
+        self.assertEqual([pos[1] for pos in head], [0, 1, 2, 3], "首段应沿 Y 递增")
 
     def test_one_by_one_by_one_grid_is_unique_and_continuous(self):
         waypoints = plan_waypoints(
@@ -461,9 +491,36 @@ class EulerConventionOptionTest(unittest.TestCase):
 
     def test_invalid_euler_choice_rejected(self):
         parser = build_arg_parser()
-        with self.assertRaises(SystemExit):
-            parser.parse_args(["0", "200", "0", "200", "0", "200",
-                               "--euler", "zyx-intrinsic"])
+        # 轴序只支持 xyz / zyx；zxy、xyz 以外的拼写均应拒绝
+        for bad in ("zxy-extrinsic", "xyz-wrong", "zyx"):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["0", "200", "0", "200", "0", "200",
+                                   "--euler", bad])
+
+    def test_zyx_conventions_are_accepted(self):
+        """ZYX 轴序必须可选（与 XYZ 同为合法取值）。"""
+        parser = build_arg_parser()
+        for good in ("zyx-extrinsic", "zyx-intrinsic",
+                     "xyz-extrinsic", "xyz-intrinsic",
+                     "ZYX-Intrinsic"):
+            args = parser.parse_args(["0", "200", "0", "200", "0", "200",
+                                      "--euler", good])
+            self.assertEqual(args.euler, good.lower())
+
+    def test_order_and_sense_are_both_honoured(self):
+        """同一组 rpy 在不同轴序下得到不同位姿（轴序真的生效，不仅是个参数）。"""
+        args_xyz = build_arg_parser().parse_args(
+            ["0", "200", "0", "200", "0", "200",
+             "--euler", "xyz-intrinsic"])
+        args_zyx = build_arg_parser().parse_args(
+            ["0", "200", "0", "200", "0", "200",
+             "--euler", "zyx-intrinsic"])
+        _validate_args(build_arg_parser(), args_xyz)
+        _validate_args(build_arg_parser(), args_zyx)
+        rpy = (12.0, 37.0, -58.0)
+        R_xyz = _reference_rotation(args_xyz, rpy)
+        R_zyx = _reference_rotation(args_zyx, rpy)
+        self.assertGreater(float(np.max(np.abs(R_xyz - R_zyx))), 0.05)
 
 
 class ConfigTagTest(unittest.TestCase):

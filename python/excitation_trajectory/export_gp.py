@@ -145,6 +145,11 @@ def main(argv=None) -> int:
                              "是弧度：0.056/1.273/-2.906 rad 对应 3.2/72.9/-166.5 度）")
     parser.add_argument("--cartesian", choices=("zero", "fk"), default="zero",
                         help="笛卡尔部分写 0（默认，与现场样例一致）或用模型 FK 填")
+    parser.add_argument("--euler", default="xyz-intrinsic", type=str.lower,
+                        metavar="CONVENTION",
+                        help="--cartesian fk 写出的笛卡尔姿态欧拉约定 "
+                             "<轴序>-<定/动轴>：轴序 xyz 或 zyx；"
+                             "默认 xyz-intrinsic（R=Rx·Ry·Rz，与控制器链路一致）")
     parser.add_argument("--report", default=None, help="额外输出 JSON 报告")
     args = parser.parse_args(argv)
 
@@ -159,13 +164,17 @@ def main(argv=None) -> int:
     cartesian_of = None
     if args.cartesian == "fk":
         from handeye.dh import DhOverride, RobotKinematics
-        from handeye.pose_encoder import matrix_to_pose_fields
+        from handeye.pose_encoder import EULER_CONVENTIONS, matrix_to_pose_fields
+        if args.euler not in EULER_CONVENTIONS:
+            parser.error(f"--euler 必须为 {EULER_CONVENTIONS} 之一，"
+                         f"当前为 {args.euler!r}")
         urdf = Path(__file__).resolve().parents[2] / "data" / "configs" \
             / "hyundai_general6s.urdf"
         robot = RobotKinematics(urdf, DhOverride.from_base(urdf))
 
         def cartesian_of(q_deg):
-            position, orientation = matrix_to_pose_fields(robot.fk(q_deg))
+            position, orientation = matrix_to_pose_fields(robot.fk(q_deg),
+                                                          convention=args.euler)
             angles = list(orientation)
             if args.cart_units == "rad":
                 angles = [math.radians(v) for v in angles]

@@ -27,27 +27,67 @@ Robot_A.json (inexbot 控制器配置) -> 标准 URDF 转换器
 
 用法（在仓库根目录）::
 
-    PYTHONPATH=python python -m robot_model.json_to_urdf ROBOT_A_JSON [OUTPUT_URDF]
+    PYTHONPATH=python python -m robot_model.json_to_urdf ROBOT_A_JSON [OUTPUT_URDF] \
+        [--model 型号]
 
-``ROBOT_A_JSON`` 为必填的控制器配置；未提供 ``OUTPUT_URDF`` 时，默认写入
-仓库的 ``data/configs/ch2000_origin.urdf``。
+``ROBOT_A_JSON`` 为必填的控制器配置。未提供 ``OUTPUT_URDF`` 时，输出名取
+**输入 JSON 的文件名**（同目录、扩展名改成 ``.urdf``）；给了 ``--model`` 时在
+该基名后追加 ``_<型号>``。例如：
+
+    robot_R1.json                              -> robot_R1.urdf
+    robot_R1.json --model CH2000               -> robot_R1_CH2000.urdf
+    robot_R1.json out.urdf --model CH2000      -> out_CH2000.urdf
 """
 
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import numpy as np
 
 
-DEFAULT_OUTPUT_URDF = (
-    Path(__file__).resolve().parents[2]
-    / "data" / "configs" / "ch2000_origin.urdf"
-)
+#: 型号后缀允许的字符：字母数字与 ``. _ -``。
+MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
+def output_path_for(source, output, model=None) -> Path:
+    """确定 URDF 输出路径。
+
+    规则：
+
+    * 未给 ``output``：基目录取输入 JSON 所在目录，基名取输入 JSON 的主名；
+    * 给了 ``output``：完全按它，只在其主名后追加后缀；
+    * 给了 ``model``：在生效的主名后追加 ``_<model>``。
+
+    Args:
+        source: 输入控制器 JSON 路径。
+        output: 显式输出路径，或 ``None``。
+        model: 型号字符串，或 ``None``。
+
+    Returns:
+        最终的 ``.urdf`` 输出路径（``Path``）。
+    """
+    src = Path(source)
+    if output is None:
+        base_dir, stem = src.parent, src.stem
+    else:
+        out = Path(output)
+        base_dir, stem = out.parent, out.stem
+    if model:
+        stem = f"{stem}_{model}"
+    return base_dir / f"{stem}.urdf"
+
+
+def _validate_model(parser: argparse.ArgumentParser, model) -> None:
+    """型号会进文件名：只允许字母数字与 ``. _ -``，且不得为空。"""
+    if model is None:
+        return
+    if not model or not MODEL_NAME_PATTERN.match(model):
+        parser.error(f"--model 只能是字母数字与 . _ - 组成的非空串，"
+                     f"当前为 {model!r}")
 def rot_x(a):
     c, s = math.cos(a), math.sin(a)
     return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=float)
@@ -87,16 +127,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("source", metavar="ROBOT_A_JSON",
                         help="必填：Robot_A.json 的显式本地路径")
     parser.add_argument("output", metavar="OUTPUT_URDF", nargs="?",
-                        default=str(DEFAULT_OUTPUT_URDF),
-                        help=("可选：输出 URDF 路径；默认 "
-                              "data/configs/ch2000_origin.urdf"))
+                        default=None,
+                        help=("可选：输出 URDF 路径；默认为输入 JSON 的同名 .urdf"))
+    parser.add_argument("--model", default=None, metavar="NAME",
+                        help="型号名，作为输出文件名的后缀：<基名>_<NAME>.urdf；"
+                             "只允许字母数字与 . _ -")
     return parser
 
 
 def main(argv: list[str] | None = None):
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    _validate_model(parser, args.model)
     src = args.source
-    dst = args.output
+    dst = str(output_path_for(src, args.output, args.model))
 
     with open(src, "r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -134,6 +178,9 @@ def main(argv: list[str] | None = None):
     L.append('  <!-- 由 inexbot Robot_A.json 自动转换 (json_to_urdf.py)')
     L.append(f'       robotType={cfg.get("robotType")}  totalAxisNum={cfg.get("totalAxisNum")}'
              f'  mountMethod={cfg["Link&CoupleCoe"].get("mountMethod", 0)}')
+    if args.model:
+        L.append(f'       型号 model={args.model}')
+    L.append(f'       源文件 source={Path(src).name}')
     L.append('       标准 DH (mm/deg): a=' + str([v for v in a]) +
              ' alpha=' + str([float(l["alpha"]) for l in link]) +
              ' d=' + str(d) +

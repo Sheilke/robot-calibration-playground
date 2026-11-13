@@ -135,32 +135,77 @@ def euler_to_rot(abc_deg, order: str = "XYZ", extrinsic: bool = True) -> np.ndar
     return R
 
 
+def _clamp_unit(value: float) -> float:
+    """把 |value| 限到 1 以内（消除浮点溢出）。"""
+    return min(1.0, max(-1.0, value))
+
+
+#: 判万向锁用的 ``cos(pitch)`` 阈值（与旧实现的 ``|sin|=1 且差<1e-9`` 等价）。
+_GIMBAL_EPS = 1e-9
+
+
+def _rot_to_euler_xyz_extrinsic(R: np.ndarray):
+    """``R = Rz(C) @ Ry(B) @ Rx(A)`` -> ``[A, B, C]``（度）。"""
+    sp = _clamp_unit(-R[2, 0])
+    # 用 atan2(sin, cos) 而非 asin：pitch 近 ±90° 时 asin 病态（误差 ~1e-6），
+    # 且 cos 可直接由矩阵同行元素求得，不必假设正交性。
+    cp = math.hypot(R[2, 1], R[2, 2])
+    B = math.atan2(sp, cp)
+    if cp < _GIMBAL_EPS:               # 俯仰奇异
+        A = math.atan2(-R[1, 2], R[1, 1])
+        C = 0.0
+    else:
+        A = math.atan2(R[2, 1], R[2, 2])
+        C = math.atan2(R[1, 0], R[0, 0])
+    return math.degrees(A), math.degrees(B), math.degrees(C)
+
+
 def rot_to_euler(R: np.ndarray, order: str = "XYZ", extrinsic: bool = True):
-    """旋转矩阵 -> 欧拉角 [A,B,C] (度)。与 euler_to_rot 互逆, 奇异位姿取代表解。"""
+    """旋转矩阵 -> 欧拉角 [A,B,C] (度)。与 euler_to_rot 互逆, 奇异位姿取代表解。
+
+    已实现 ``XYZ`` 与 ``ZYX`` 两种轴序，各含定轴/动轴两种解释；其余轴序暂未实现。
+    奇异分支统一取第一个角为 0（定轴）或第三角为 0（动轴）的代表解。
+    """
     R = np.asarray(R, dtype=float)
+    order = str(order).upper()
     if order == "XYZ" and extrinsic:
         # R = Rz(C) Ry(B) Rx(A)
-        sp = min(1.0, max(-1.0, -R[2, 0]))
-        B = math.asin(sp)
-        if abs(abs(sp) - 1.0) < 1e-9:  # 俯仰奇异
-            A = math.atan2(-R[1, 2], R[1, 1])
-            C = 0.0
-        else:
-            A = math.atan2(R[2, 1], R[2, 2])
-            C = math.atan2(R[1, 0], R[0, 0])
-        return [math.degrees(A), math.degrees(B), math.degrees(C)]
+        return list(_rot_to_euler_xyz_extrinsic(R))
     if order == "XYZ" and not extrinsic:
         # R = Rx(A) Ry(B) Rz(C)
-        sb = min(1.0, max(-1.0, R[0, 2]))
-        B = math.asin(sb)
-        if abs(abs(sb) - 1.0) < 1e-9:
-            A = math.atan2(-R[1, 2], R[1, 1])
-            C = 0.0
+        sb = _clamp_unit(R[0, 2])
+        cb = math.hypot(R[0, 1], R[0, 0])
+        B = math.atan2(sb, cb)
+        if cb < _GIMBAL_EPS:
+            # 俯仰奇异：只有 A+C 可定，取 A=0；C 仍能从矩阵恢复
+            # （曾错取 C=0，等于把这一段旋转整个丢掉）
+            A = 0.0
+            C = math.atan2(R[1, 0], R[1, 1])
         else:
             A = math.atan2(-R[1, 2], R[2, 2])
             C = math.atan2(-R[0, 1], R[0, 0])
         return [math.degrees(A), math.degrees(B), math.degrees(C)]
-    raise NotImplementedError(f"暂只实现 XYZ 两种解释 (extrinsic={extrinsic})")
+    if order == "ZYX" and extrinsic:
+        # R = Rx(C) Ry(B) Rz(A)
+        sb = _clamp_unit(R[0, 2])
+        cb = math.hypot(R[0, 0], R[0, 1])
+        B = math.atan2(sb, cb)
+        if cb < _GIMBAL_EPS:           # 俯仰奇异：取 A = 0
+            A = 0.0
+            C = math.atan2(R[1, 0] * (1.0 if sb > 0 else -1.0), R[1, 1])
+        else:
+            A = math.atan2(-R[0, 1], R[0, 0])
+            C = math.atan2(-R[1, 2], R[2, 2])
+        return [math.degrees(A), math.degrees(B), math.degrees(C)]
+    if order == "ZYX" and not extrinsic:
+        # R = Rz(A) Ry(B) Rx(C)，与定轴 XYZ 同形，只需把首尾角互换：
+        # 定轴 XYZ 给出 (Ae, Be, Ce) 使 R = Rz(Ce)Ry(Be)Rx(Ae)，
+        # 对比得 A = Ce, B = Be, C = Ae。
+        ae, be, ce = _rot_to_euler_xyz_extrinsic(R)
+        return [ce, be, ae]
+    raise NotImplementedError(
+        f"欧拉角提取只实现了 XYZ / ZYX 两种轴序（当前 order={order}，"
+        f"extrinsic={extrinsic}）；前向 euler_to_rot 本身支持任意轴序")
 
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,10 @@ class PoseEncoderConventionTest(unittest.TestCase):
         self.assertEqual(normalize_convention("xyz-intrinsic"), "xyz-intrinsic")
         self.assertEqual(normalize_convention(" XYZ-Intrinsic "), "xyz-intrinsic")
         self.assertEqual(normalize_convention("xyz-extrinsic"), "xyz-extrinsic")
-        for bad in ("zyx-intrinsic", "intrinsic", 5, None):
+        # ZYX 轴序同样合法（与 XYZ 并列的两种轴序之一）
+        self.assertEqual(normalize_convention("zyx-intrinsic"), "zyx-intrinsic")
+        self.assertEqual(normalize_convention("ZYX-Extrinsic"), "zyx-extrinsic")
+        for bad in ("zxy-intrinsic", "intrinsic", "zyx", 5, None):
             with self.assertRaises(ValueError):
                 normalize_convention(bad)
 
@@ -141,9 +144,15 @@ class SessionEulerConventionTest(unittest.TestCase):
 
     def test_invalid_convention_rejected(self):
         payload = self._payload()
-        payload["meta"]["euler_convention"] = "zyx-intrinsic"
+        payload["meta"]["euler_convention"] = "zxy-intrinsic"
         with self.assertRaises(SessionError):
             session_from_dict(payload)
+
+    def test_zyx_convention_accepted(self):
+        payload = self._payload()
+        payload["meta"]["euler_convention"] = "zyx-intrinsic"
+        self.assertEqual(session_from_dict(payload).euler_convention,
+                         "zyx-intrinsic")
 
     def test_meta_recorded_in_session(self):
         payload = self._payload()

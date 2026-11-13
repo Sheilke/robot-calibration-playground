@@ -95,8 +95,18 @@ pip install -r requirements.txt
 
 ```bash
 # 1. AABB 扫描：默认执行姿态扰动和链式 IK
+#    默认网格 2x5x5 = 50 点（--xs 1 --ys 4 --zs 4，无插点）
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
-  800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 --seed 0
+  800 1200 -200 200 800 1000 --seed 0
+
+# 1a. 两点式：直接给可达区域的两个对角点 + 目标点数（自动凑出 N 点）
+PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
+  --point-min 800 -200 800 --point-max 1200 200 1000 \
+  --target-count 50 --robot-config data/configs/hyundai_general6s.urdf
+
+# 1a'. 显式网格（顶点数 = 份数+1）：3x3x2 = 48 格点 + 每层插 1 点 = 50
+PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
+  800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 --z-insert 1 --seed 0
 
 # 1b. 姿态激励条件数（一次性设计检查，门禁取设计值，默认阈值 9）
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
@@ -108,9 +118,13 @@ PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
   800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 \
   --perturb-deg 20 15 10 --cond-max 9
 
-# 1b. 指定欧拉约定：xyz-intrinsic = Rx·Ry·Rz（Nexbot 控制器链路）
+# 1d. 指定欧拉约定：<轴序>-<定轴|动轴>，轴序 xyz / zyx 均可选
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
-  800 1200 -200 200 800 1000 --xs 3 --ys 3 --zs 2 --euler xyz-intrinsic
+  800 1200 -200 200 800 1000 --euler xyz-intrinsic
+
+# 1e. ZYX 轴序（外旋）：同一组 --rpy 数值代表的是另一个姿态
+PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
+  800 1200 -200 200 800 1000 --euler zyx-intrinsic
 
 # 2. 仅预览连续蛇形网格，不求解 IK
 PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
@@ -119,9 +133,14 @@ PYTHONPATH=python python -m excitation_trajectory.aabb_snake_scan \
 # 3. Nexbot/CH2000 FK/解析 IK 随机往返自测
 PYTHONPATH=python python -m robot_model.nexbot_ik --selftest 100
 
-# 4. JSON -> 标准 URDF：显式提供内部原始 JSON 和目标文件
+# 4. JSON -> 标准 URDF：输出名默认取输入 JSON 的主名
+#    robot_R1.json -> robot_R1.urdf；--model 追加型号后缀 -> robot_R1_CH2000.urdf
 PYTHONPATH=python python -m robot_model.json_to_urdf \
-  /path/to/Robot_A.json /tmp/ch2000_origin.urdf
+  /path/to/robot_R1.json --model CH2000
+
+# 4b. 显式指定输出路径时，--model 加在该名字上：out_CH2000.urdf
+PYTHONPATH=python python -m robot_model.json_to_urdf \
+  /path/to/robot_R1.json out.urdf --model CH2000
 
 # 5. 扫描结果 -> 9011/N9011 点位报文（DH 标定采点）
 PYTHONPATH=python python -m excitation_trajectory.export_9011 \
@@ -133,6 +152,28 @@ PYTHONPATH=python python -m excitation_trajectory.send_9011 \
 ```
 
 AABB CLI 默认会在当前工作目录生成 `scan_result.json` 和 `scan_path.png`；这两个运行产物已被 `.gitignore` 忽略。JSON 转换器的默认输出是 `data/configs/ch2000_origin.urdf`，但公司内部原始 `Robot_A.json` 始终由调用方显式传入，不会进入仓库。
+
+### 姿态表达（欧拉约定）：轴序与定/动轴都可选
+
+`--euler <轴序>-<定轴|动轴>`，轴序支持 **xyz** 与 **zyx**，共四种组合，大小写不敏感：
+
+| 约定 | 逆解出的旋转矩阵 | 典型用法 |
+| --- | --- | --- |
+| `xyz-extrinsic` | `R = Rz·Ry·Rx` | 定轴 RPY（**默认**，本仓历史行为） |
+| `xyz-intrinsic` | `R = Rx·Ry·Rz` | 动轴 XYZ（Nexbot 控制器 `kXyzIntrinsic`） |
+| `zyx-extrinsic` | `R = Rx·Ry·Rz` | 定轴 ZYX |
+| `zyx-intrinsic` | `R = Rz·Ry·Rx` | 动轴 ZYX |
+
+同一组 `--rpy` 数值在不同约定下代表**不同的姿态**，轴序必须与控制器读数一致。
+`--euler` 写进输出 JSON 的 `meta.euler_convention`；`export_gp --cartesian fk` 有独立的
+`--euler`（默认 `xyz-intrinsic`），需与扫描时一致。
+
+### 路点遍历顺序：Y -> X -> Z
+
+行内以 **Y 为快轴**扫到边界，再动一格 X 反向扫回；**一整层走完后才动 Z**，
+层间保持 X、Y 不变（无 XY 跳变），层与层之间 X/Y 各翻转一次继续蛇形。
+该顺序写在输出 JSON 的 `meta.motion_order`。注意：这决定了 GP0001..GP00NN 的
+点位编号，用旧版本生成过的点位文件与当前版本**不能混用**。
 
 ### 姿态激励条件数（姿态覆盖度诊断）
 
