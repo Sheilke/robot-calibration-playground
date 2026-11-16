@@ -12,9 +12,10 @@
 
 M1 只提供 ``list_robots`` / ``preview_domain`` / ``form_to_namespace`` 三个入口；
 M2 增加 ``run_scan``（完整解算 + 产物落盘，含 ``skip_ik`` 轻量预览分支）；
+M3 增加 ``build_gp``（扫描结果 + GP 模板 -> GP 文件）、``convert_urdf``
+（控制器 JSON -> URDF）与 ``list_runs`` / ``clean_runs``（运行目录盘点与清理）；
 M4 增加 ``locate_segment``（窗口段剖面 + 判定结论）与 ``run_repair``
-（先局部换端点姿态、失败再整体挪箱，产物与 ``run_scan`` 同构）；
-``build_gp`` / ``convert_urdf`` 留给 M3。
+（先局部换端点姿态、失败再整体挪箱，产物与 ``run_scan`` 同构）。
 """
 
 from __future__ import annotations
@@ -22,9 +23,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import hashlib
 import io
 import json
 import math
+import re
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -1764,3 +1768,494 @@ def run_repair(params: dict, job=None, on_progress=None) -> dict:
         return {"ok": False,
                 "error": f"{type(error).__name__}: {error}",
                 "warnings": warnings}
+
+
+# ---------------------------------------------------------------------------
+# M3：工具页（GP 导出 / JSON -> URDF / 运行目录盘点与清理）
+# ---------------------------------------------------------------------------
+#: GP 模板里必须保持原样的元数据字段（写完回读比对，作为"模板未改动"的证据）。
+GP_TEMPLATE_META_KEYS = ("controllerID", "version")
+#: 上传字节里拿不到文件名时的兜底（页面会显式传 ``template_name``）。
+GP_TEMPLATE_NAME = "position_R1.json"
+#: ``--cartesian`` 的全部取值（与 ``export_gp`` 的 CLI 一致）。
+GP_CARTESIAN_MODES = ("zero", "fk")
+#: ``--cart-units`` 的全部取值（与 ``export_gp`` 的 CLI 一致）。
+GP_CART_UNITS = ("rad", "deg")
+#: ``--first`` 的默认值（与 ``export_gp`` 的 CLI 一致）。
+GP_DEFAULT_FIRST = 1
+#: ``--cart-units`` 的默认值（与 ``export_gp`` 的 CLI 一致：控制器读数是弧度）。
+GP_DEFAULT_CART_UNITS = "rad"
+#: ``--euler`` 的默认值（与 ``export_gp`` 的 CLI 一致；等价于
+#: ``handeye.pose_encoder.DEFAULT_EULER_CONVENTION``，测试里核对）。
+GP_DEFAULT_EULER = "xyz-intrinsic"
+#: ``export_gp.main`` 在 ``--cartesian fk`` 时写死使用的模型（照抄同一路径）。
+GP_FK_URDF = CONFIG_DIR / "hyundai_general6s.urdf"
+#: 上传文件名/型号进路径前的清洗白名单（设计文档 §7.6：上传统一落 ASCII 名）。
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+#: JSON -> URDF 的工作目录（系统临时目录下，供下载按钮持续读取）。
+URDF_WORKDIR_NAME = "laser_web_urdf"
+#: 上传名清洗后为空时的兜底主名。
+URDF_DEFAULT_STEM = "controller"
+#: ``json_to_urdf`` 自校验那一行的误差值：``… 最大误差 = 4.547e-13 mm/rad``。
+_SELF_CHECK_PATTERN = re.compile(
+    r"最大误差\s*=\s*([-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?)")
+#: 运行目录里被 :func:`list_runs` 逐个检查的产物（键 -> 文件名，键即 ``has_*``）。
+RUN_ARTIFACTS = {"scan": ARTIFACT_SCAN_JSON, "plot": ARTIFACT_PLOT,
+                 "joints": ARTIFACT_JOINTS, "repair": ARTIFACT_REPAIR}
+
+
+def _bytes_of(raw) -> bytes:
+    """把上传内容归一成 ``bytes``（``str`` 按 UTF-8 编码）。
+
+    Args:
+        raw: ``bytes`` / ``bytearray`` / ``memoryview`` / ``str``。
+
+    Returns:
+        bytes: 内容本身（不做编码猜测，模板与控制器 JSON 都是 UTF-8）。
+
+    Raises:
+        TypeError: 既不是字节串也不是字符串。
+    """
+    if isinstance(raw, bytes):
+        return raw
+    if isinstance(raw, (bytearray, memoryview)):
+        return bytes(raw)
+    if isinstance(raw, str):
+        return raw.encode("utf-8")
+    raise TypeError(f"需要字节串，当前为 {type(raw).__name__}")
+
+
+def _safe_filename(name, default: str) -> tuple[str, bool]:
+    """把上传名清洗成可安全落盘的 ASCII 文件名（保留扩展名）。
+
+    Args:
+        name: 上传时的原始文件名（可能带目录、中文、空格）。
+        default: 清洗后为空时的兜底名。
+
+    Returns:
+        ``(文件名, 是否被改过)``。
+    """
+    candidate = Path(str(name or "")).name.strip()
+    cleaned = _SAFE_NAME.sub("_", candidate).strip("._")
+    if not cleaned:
+        return default, candidate != ""
+    return cleaned, cleaned != candidate
+
+
+def gp_euler_conventions() -> list[str]:
+    """``--euler`` 下拉框的选项（算法模块里的 4 种约定，页面不另抄一份）。"""
+    from handeye.pose_encoder import EULER_CONVENTIONS
+
+    return list(EULER_CONVENTIONS)
+
+
+def gp_defaults() -> dict:
+    """GP 导出表单的默认值（与 ``export_gp`` 的 CLI 默认值一一对应）。"""
+    from excitation_trajectory import export_gp
+
+    return {"first": GP_DEFAULT_FIRST,
+            "flag": int(export_gp.DEFAULT_FLAG),
+            "cartesian": "zero",
+            "cart_units": GP_DEFAULT_CART_UNITS,
+            "euler": GP_DEFAULT_EULER}
+
+
+def _gp_scan_path(params: dict) -> Path:
+    """解析 ``run_dir`` / ``scan`` 两种入参，返回 ``scan.json`` 的绝对路径。
+
+    Args:
+        params: GP 导出入参；``run_dir`` 指向 ``runs/<id>/``（自动补
+            ``scan.json``），``scan`` 直接给 ``scan.json`` 路径（优先）。
+
+    Returns:
+        Path: 已确认存在的 ``scan.json`` 绝对路径。
+
+    Raises:
+        _FormError: 两个键都没给，或文件不存在。
+    """
+    for key in ("scan", "run_dir"):
+        value = params.get(key)
+        if value is None or str(value).strip() == "":
+            continue
+        path = Path(str(value)).expanduser()
+        if not path.is_absolute():
+            path = jobs.repo_root() / path
+        path = path.resolve()
+        if path.is_dir():
+            path = path / ARTIFACT_SCAN_JSON
+        if not path.is_file():
+            raise _FormError(f"{key} 里没有 {ARTIFACT_SCAN_JSON}：{path}")
+        return path
+    raise _FormError(f"需要 run_dir（runs/<id>/）或 scan（{ARTIFACT_SCAN_JSON} 路径）")
+
+
+def _gp_options(params: dict) -> dict:
+    """归一化 GP 导出选项（取值合法性判定与 ``export_gp`` 的 CLI 一致）。"""
+    cartesian = str(params.get("cartesian") or "zero").strip().lower()
+    if cartesian not in GP_CARTESIAN_MODES:
+        raise _FormError(f"--cartesian 需为 {' 或 '.join(GP_CARTESIAN_MODES)}，"
+                         f"当前为 {cartesian!r}")
+    units = str(params.get("cart_units") or GP_DEFAULT_CART_UNITS).strip().lower()
+    if units not in GP_CART_UNITS:
+        raise _FormError(f"--cart-units 需为 {' 或 '.join(GP_CART_UNITS)}，"
+                         f"当前为 {units!r}")
+    euler = str(params.get("euler") or GP_DEFAULT_EULER).strip().lower()
+    first = GP_DEFAULT_FIRST if params.get("first") is None else int(params["first"])
+    flag = params.get("flag")
+    from excitation_trajectory import export_gp
+
+    flag = int(export_gp.DEFAULT_FLAG if flag is None else flag)
+    return {"scan": _gp_scan_path(params or {}),
+            "first": first, "flag": flag, "cartesian": cartesian,
+            "cart_units": units, "euler": euler,
+            "template_name": params.get("template_name")}
+
+
+def _gp_cartesian_of(euler: str, cart_units: str):
+    """构造 ``--cartesian fk`` 的笛卡尔填充函数。
+
+    与 ``excitation_trajectory.export_gp.main`` 的 ``--cartesian fk`` 分支**同一套**：
+    同一个模型（``data/configs/hyundai_general6s.urdf``）、同一个
+    ``DhOverride.from_base``、同一个 ``matrix_to_pose_fields``。本函数只负责
+    把这三者接起来，公式一律来自 ``handeye``（不在这里复制）。
+
+    Args:
+        euler: 欧拉约定（``xyz-intrinsic`` 等，见 :func:`gp_euler_conventions`）。
+        cart_units: ``rad`` 或 ``deg``（与 ``--cart-units`` 同义）。
+
+    Returns:
+        ``q_deg -> [x, y, z, rx, ry, rz]`` 的可调用对象。
+
+    Raises:
+        _FormError: ``euler`` 不在 ``EULER_CONVENTIONS`` 里（报错措辞同 CLI）。
+    """
+    from handeye.dh import DhOverride, RobotKinematics
+    from handeye.pose_encoder import EULER_CONVENTIONS, matrix_to_pose_fields
+
+    if euler not in EULER_CONVENTIONS:
+        raise _FormError(f"--euler 必须为 {EULER_CONVENTIONS} 之一，"
+                         f"当前为 {euler!r}")
+    urdf = _REPO_ROOT / GP_FK_URDF
+    robot = RobotKinematics(urdf, DhOverride.from_base(urdf))
+
+    def cartesian_of(q_deg):
+        position, orientation = matrix_to_pose_fields(robot.fk(q_deg),
+                                                      convention=euler)
+        angles = list(orientation)
+        if cart_units == "rad":
+            angles = [math.radians(value) for value in angles]
+        return list(position) + angles
+
+    return cartesian_of
+
+
+def build_gp(params: dict, template_bytes=None) -> dict:
+    """把一次扫描的关节角写进 GP 模板的副本（CLI ``export_gp`` 的等价入口）。
+
+    与 ``python -m excitation_trajectory.export_gp`` 走**同一条**路径：
+    ``load_scan_points`` 取点、``check_joint_range`` 做写前限位校验、
+    ``write_gp_entries`` 填 14 字段；``--cartesian fk`` 用同一个模型 +
+    ``handeye.pose_encoder.matrix_to_pose_fields``（见 :func:`_gp_cartesian_of`）。
+    模板**只读**：上传的字节先落到临时目录，写完把这份副本再读回来比对
+    sha256 与 ``controllerID`` / ``version``。
+
+    Args:
+        params: 入参：
+
+            * ``run_dir``：某次运行的 ``runs/<id>/``（内含 ``scan.json``），
+              或 ``scan``：直接给 ``scan.json`` 路径（优先）；
+            * ``template``：GP 模板文件字节（**必填**，也可用
+              ``template_bytes`` 参数传，二者等价，参数优先）；
+            * ``template_name``：模板原始文件名（决定输出文件名，
+              缺省 ``position_R1.json``）；
+            * ``first`` / ``flag``：起始 GP 号（默认 1）/ 标志位（默认 0）；
+            * ``cartesian``：``"zero"``（默认）或 ``"fk"``；
+            * ``cart_units``：``"rad"``（默认）或 ``"deg"``；
+            * ``euler``：``--cartesian fk`` 的欧拉约定，默认 ``xyz-intrinsic``。
+        template_bytes: 模板字节（覆盖 ``params["template"]``）。
+
+    Returns:
+        dict: 成功时 ``{"ok": True, "path": 绝对路径, "filename": 文件名,
+        "count": int, "first": int, "last": int,
+        "meta": {"controllerID": ..., "version": ...}, "warnings": [...]}``；
+        失败时 ``{"ok": False, "error": 报错原文, "warnings": [...]}``，不抛异常。
+    """
+    warnings: list[str] = []
+    from excitation_trajectory import export_gp
+
+    try:
+        options = _gp_options(params or {})
+        raw = (template_bytes if template_bytes is not None
+               else (params or {}).get("template"))
+        if raw is None:
+            raise _FormError("需要上传 GP 模板文件（position_R1.json 的字节）")
+        data = _bytes_of(raw)
+        if not data:
+            raise _FormError("GP 模板文件是空的")
+        name, renamed = _safe_filename(options["template_name"], GP_TEMPLATE_NAME)
+        if renamed:
+            warnings.append(f"模板文件名被清洗为 {name}（原 "
+                            f"{options['template_name']!r}）")
+        run_dir = options["scan"].parent
+        out_path = run_dir / name
+    except _FormError as error:
+        return _failure(str(error))
+    except (TypeError, ValueError) as error:
+        return _failure(f"参数无法解析：{error}")
+
+    if out_path.exists():
+        warnings.append(f"输出文件 {name} 已存在，已覆盖")
+
+    with tempfile.TemporaryDirectory(prefix="laser_web_gp-") as tmp:
+        # 模板只读：先落一份临时副本，流程里只碰副本，写完再读回来核对。
+        template_path = Path(tmp) / name
+        try:
+            template_path.write_bytes(data)
+            before_digest = hashlib.sha256(template_path.read_bytes()).hexdigest()
+            template = json.loads(template_path.read_text(encoding="utf-8"))
+            if not isinstance(template, dict):
+                raise ValueError("模板文件顶层需为对象")
+            before_meta = {key: template.get(key) for key in GP_TEMPLATE_META_KEYS}
+            points = export_gp.load_scan_points(options["scan"])
+            for point in points:                       # CLI 的写前限位校验
+                export_gp.check_joint_range(point["q"], f"路点 {point['index']}")
+            cartesian_of = None
+            if options["cartesian"] == "fk":
+                cartesian_of = _gp_cartesian_of(options["euler"],
+                                                options["cart_units"])
+            updated, report = export_gp.write_gp_entries(
+                template, points, first=options["first"], flag=options["flag"],
+                cartesian_of=cartesian_of)
+        except _FormError as error:
+            return {"ok": False, "error": str(error), "warnings": warnings}
+        except SystemExit as exit_error:            # load_scan_points 用 SystemExit 报错
+            return {"ok": False, "error": str(exit_error.code), "warnings": warnings}
+        except (OSError, ValueError, UnicodeDecodeError) as error:
+            return {"ok": False, "error": str(error), "warnings": warnings}
+        except Exception as error:                  # noqa: BLE001 - 一律转 ok:False
+            return {"ok": False, "error": f"{type(error).__name__}: {error}",
+                    "warnings": warnings}
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(updated, ensure_ascii=False, indent=1) + "\n")
+        except OSError as error:
+            return {"ok": False, "error": f"写 GP 文件失败：{error}",
+                    "warnings": warnings}
+
+        # 回读模板副本：字节与 controllerID/version 都必须原样。
+        try:
+            after_digest = hashlib.sha256(template_path.read_bytes()).hexdigest()
+            after_meta = {key: json.loads(template_path.read_text(encoding="utf-8"))
+                          .get(key) for key in GP_TEMPLATE_META_KEYS}
+        except (OSError, ValueError) as error:
+            return {"ok": False, "error": f"回读模板失败：{error}",
+                    "warnings": warnings}
+
+    if after_digest != before_digest or after_meta != before_meta:
+        return {"ok": False,
+                "error": "模板在导出过程中被改动（sha256 或 controllerID/version "
+                         "不一致），已中止",
+                "warnings": warnings}
+    for key in GP_TEMPLATE_META_KEYS:
+        if before_meta[key] is None:
+            warnings.append(f"模板里没有 {key}，无法核对这一项是否被改动")
+
+    first = int(options["first"])
+    count = int(report["count"])
+    return {"ok": True,
+            "path": str(out_path),
+            "filename": name,
+            "count": count,
+            "first": first,
+            "last": first + count - 1,
+            "meta": before_meta,
+            "warnings": warnings}
+
+
+def urdf_workdir() -> Path:
+    """JSON -> URDF 的工作目录：``<系统临时目录>/laser_web_urdf``（自动创建）。"""
+    path = Path(tempfile.gettempdir()) / URDF_WORKDIR_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _urdf_stem(filename) -> tuple[str, bool]:
+    """上传文件名 -> 输出主名（去目录、去扩展名、清洗成 ASCII）。"""
+    name = Path(str(filename or "")).name
+    stem = Path(name).stem if name else ""
+    cleaned = _SAFE_NAME.sub("_", stem).strip("._")
+    if not cleaned:
+        return URDF_DEFAULT_STEM, bool(name)
+    return cleaned, cleaned != stem
+
+
+def _cli_error_text(stderr_text: str) -> str:
+    """从被捕获的 stderr 里取 argparse / 算法的原始报错（末行，去掉 usage/prog）。"""
+    lines = [line.strip() for line in str(stderr_text or "").splitlines()
+             if line.strip()]
+    if not lines:
+        return ""
+    last = lines[-1]
+    marker = "error: "
+    if marker in last:
+        last = last.split(marker, 1)[1]
+    return last.strip()
+
+
+def convert_urdf(json_bytes, model=None, filename=None) -> dict:
+    """控制器 JSON -> URDF（CLI ``python -m robot_model.json_to_urdf`` 的等价入口）。
+
+    直接调 ``robot_model.json_to_urdf.main``：上传的 JSON 落到临时工作目录，
+    输出 ``<原主名>_<型号>.urdf``（型号为空时不追加后缀，与 CLI 不带
+    ``--model`` 一致）。自校验误差由 ``main`` 打印在 stdout 上，这里用正则
+    抓出来给页面显示。
+
+    Args:
+        json_bytes: 控制器 JSON 的字节（``str`` 按 UTF-8 处理）。
+        model: 型号名（进文件名后缀）；``None`` 或空串表示不追加后缀。
+        filename: 上传时的原始文件名（决定输出主名）；缺省 ``controller.json``。
+
+    Returns:
+        dict: 成功时 ``{"ok": True, "path": 绝对路径, "filename": 文件名,
+        "self_check_error": float|None, "warnings": [...]}``；失败时
+        ``{"ok": False, "error": 报错原文, "warnings": [...]}``（型号非法时
+        错误原文来自 ``json_to_urdf`` 的 argparse），不抛异常。
+    """
+    from robot_model import json_to_urdf
+
+    warnings: list[str] = []
+    try:
+        data = _bytes_of(json_bytes)
+    except TypeError as error:
+        return _failure(str(error))
+    if not data:
+        return _failure("需要上传控制器 JSON 文件")
+    model_name = str(model).strip() if model is not None else ""
+    stem, renamed = _urdf_stem(filename)
+    if renamed:
+        warnings.append(f"上传文件名被清洗为 {stem}（原 "
+                        f"{str(filename or '')!r}）")
+
+    try:
+        workdir = urdf_workdir()
+        source = workdir / f"{stem}.json"
+        target = workdir / f"{stem}.urdf"
+        source.write_bytes(data)
+    except OSError as error:
+        return _failure(f"写临时文件失败：{error}")
+
+    argv = [str(source), str(target)]
+    if model_name:
+        argv += ["--model", model_name]
+    stdout, stderr = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = json_to_urdf.main(argv)
+    except SystemExit as exit_error:          # argparse 报错（型号非法）
+        message = _cli_error_text(stderr.getvalue())
+        return {"ok": False,
+                "error": message or f"json_to_urdf 中止（退出码 {exit_error.code}）",
+                "warnings": warnings}
+    except AssertionError as error:           # 自校验断言失败
+        return {"ok": False, "error": f"自校验失败：{error}", "warnings": warnings}
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return {"ok": False, "error": f"{type(error).__name__}: {error}",
+                "warnings": warnings}
+    if code not in (None, 0):
+        return _failure(f"json_to_urdf 返回退出码 {code}")
+
+    produced = json_to_urdf.output_path_for(source, target, model_name or None)
+    if not produced.is_file():
+        return _failure(f"json_to_urdf 没有生成 {produced.name}")
+
+    self_check = None
+    match = _SELF_CHECK_PATTERN.search(stdout.getvalue())
+    if match is not None:
+        try:
+            self_check = float(match.group(1))
+        except ValueError:                    # 正则已限定数字，这里只兜底
+            self_check = None
+    if self_check is None:
+        warnings.append("没能从 json_to_urdf 的输出里解析出自校验误差")
+    elif self_check >= 1e-9:
+        warnings.append(f"自校验误差 {self_check:.3e} 超过 1e-9，"
+                        "URDF 与 DH 可能不等价")
+
+    return {"ok": True,
+            "path": str(produced),
+            "filename": produced.name,
+            "self_check_error": self_check,
+            "warnings": warnings}
+
+
+def _run_row(path: Path) -> dict:
+    """一个运行目录 -> 一行盘点数据（``list_runs`` 的元素）。
+
+    Args:
+        path: ``runs/<id>/`` 目录。
+
+    Returns:
+        dict: ``run_id`` / ``dir`` / ``created``（目录 mtime，与
+        ``jobs.prune_runs`` 的排序键同源）/ 四个 ``has_*`` 产物标记 /
+        ``size_bytes``（目录下所有文件的字节数）。
+    """
+    stat = path.stat()
+    files = set()
+    size = 0
+    for item in path.rglob("*"):
+        try:
+            if not item.is_file():
+                continue
+            files.add(item.name)
+            size += item.stat().st_size
+        except OSError:                       # 正在被删的目录：跳过即可
+            continue
+    row = {"run_id": path.name, "dir": str(path),
+           "created": float(stat.st_mtime), "size_bytes": int(size)}
+    for key, name in RUN_ARTIFACTS.items():
+        row[f"has_{key}"] = name in files
+    return row
+
+
+def list_runs(root=None) -> list[dict]:
+    """列出 ``runs/`` 下的运行目录（按 ``created`` 倒序，最新在前）。
+
+    Args:
+        root: 产物根目录（``None`` 走 ``jobs.runs_root()``：环境变量
+            ``LASER_WEB_RUNS`` > ``<repo>/runs``）。
+
+    Returns:
+        list[dict]: ``[{"run_id", "dir", "created", "has_scan", "has_plot",
+        "has_joints", "has_repair", "size_bytes"}, ...]``；目录不存在或里面
+        没有子目录时返回空列表。
+    """
+    base = jobs.runs_root(root)
+    if not base.is_dir():
+        return []
+    rows = []
+    for path in base.iterdir():
+        try:
+            if not path.is_dir():
+                continue
+            rows.append(_run_row(path))
+        except OSError:                       # 目录在扫描期间消失：忽略
+            continue
+    rows.sort(key=lambda row: (row["created"], row["run_id"]), reverse=True)
+    return rows
+
+
+def clean_runs(keep: int = jobs.KEEP_RUNS, root=None) -> dict:
+    """按保留策略清理运行目录（调 ``jobs.prune_runs``，不自己删目录）。
+
+    Args:
+        keep: 保留最近多少个运行目录（默认 ``jobs.KEEP_RUNS`` = 50；负数按 0
+            处理，与 ``jobs.prune_runs`` 的归一规则一致）。
+        root: 产物根目录（``None`` 走 ``jobs.runs_root()``）。
+
+    Returns:
+        dict: ``{"removed": [被删目录的绝对路径, ...], "kept": 剩余目录数}``。
+    """
+    base = jobs.runs_root(root)
+    removed = [str(path) for path in jobs.prune_runs(base, max(0, int(keep)))]
+    return {"removed": removed, "kept": len(list_runs(base))}

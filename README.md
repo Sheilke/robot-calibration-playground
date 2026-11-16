@@ -278,6 +278,60 @@ PYTHONPATH=python python3 -m excitation_trajectory.export_gp \
 - `--flag` 的取值需与现场已创建的样例一致，默认 0；
 - 输出前会校验关节角是否在 URDF 限位内，越界即报错退出。
 
+## 网页界面（laser_web）
+
+上面这些工具都能点鼠标跑，本质是同一套算法的壳：**界面与 CLI 用同一个校验函数
+（`_validate_args`）与同一批算法模块**，同一组参数的结果逐项相同（下面有验收数字）。
+
+```bash
+# 一次性装依赖（venv 里，复用系统已装的 numpy/matplotlib）
+python3 -m venv --system-site-packages .venv
+.venv/bin/pip install -r requirements-web.txt
+
+# 启动（只监听本机，无鉴权）
+PYTHONPATH=python .venv/bin/python -m laser_web --port 8765
+# 浏览器打开 http://127.0.0.1:8765
+```
+
+`nicegui` / `plotly` 只在 `requirements-web.txt` 里，**核心工具仍然只依赖 numpy + matplotlib**——
+只用命令行的人不需要装界面依赖。
+
+### 三个页面
+
+| 页面 | 做什么 |
+| --- | --- |
+| **生成** | 选模型 → 填采样域（两点或六个数，实时算体积/网格/点数/设计条件数）→ 解算 → 统计卡 + 可旋转 3D 图 + 可排序路点表 + 段诊断表 → 导出 `scan.json` / `joints.txt`（空格分隔）/ `plot.png` / GP |
+| **奇异修复** | 填「已走到第几点」+ 奇异关节角 → 定位段（GP 编号 + 最差点坐标）→ 局部修复（只换端点姿态）或整体搜索 → 前后对比 → 导出修复后的计划 |
+| **工具** | GP 导出（上传模板）、控制器 JSON → URDF（带 `--model` 后缀）、运行目录清理 |
+
+### 几条硬约定
+
+- **只监听 `127.0.0.1`**，不提供局域网开关（无鉴权，不冒险）；
+- 模型下拉只列 `Nexbot6R` **真能加载**的文件——`data/configs` 里 `*_dh.json`（DH 覆盖）、
+  `*_scan.json`（扫描记录）、`robot_sim/*.json`（仿真资产）都缺 `Link&CoupleCoe`，
+  会被折叠到"另有 N 个文件不能当模型用"里并给出原因；
+- 产物落在 `runs/<时间戳-短随机>/`，保留最近 50 次，工具页可一键清理；`runs/` 已 gitignore；
+- GP 模板**只读**：导出前后模板 sha256 不变，`controllerID` / `version` 原样保留。
+
+### 一致性验收（实测）
+
+站点参数（`750..1300 / -600..600 / 270..940`、`rpy 3 73 -167`、`xyz-intrinsic`、
+`target 50`、`q-seed 43,-30,-36,42,-89,-1`、`perturb 20 20 35`、`j5-min 20`、`seed 0`）：
+
+| 指标 | 界面 | CLI |
+| --- | --- | --- |
+| 成功 | 50/50 | 50/50 |
+| 构型切换 | 0 | 0 |
+| ΣdqL2 | 158886.50 | 158886.50 |
+| \|J5\|min | 26.716 | 26.716 |
+| \|J3\|min | 9.759 | 9.759 |
+| design / post_ik 条件数 | 7.812 / 9.191 | 7.812 / 9.191 |
+
+GP 导出也逐字段核对过：界面与 `export_gp` CLI 生成的 14 个字段完全相同（8/8 个 GP）。
+
+> 提醒：上表是 **Hyundai** 模型的结果。同一命令若漏掉 `--urdf`，会退回默认的 CH2000 模型，
+> 数字完全不同（ΣdqL2 152393.15 / \|J5\|min 35.749）——校核时务必带上模型路径。
+
 ## 已入库的机器人模型
 
 | 模型 | URDF | DH 副本 | 关键参数 |
