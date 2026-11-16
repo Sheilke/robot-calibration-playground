@@ -11,7 +11,7 @@
 2. ``scan.json`` 落盘且字段与 CLI 输出一致（``meta`` / ``waypoints`` /
    ``singularity_guard`` / ``segment_check`` / ``conditioning`` /
    ``perturbed_ik``）；
-3. ``joints.txt`` 8 行、每行 6 个 3 位小数、GP 顺序；
+3. ``joints.txt`` 8 行、每行 6 个以空格分隔的 3 位小数、GP 顺序；
 4. ``plot.png`` 真的画出来了；
 5. ``skip_ik=True`` 时不解 IK（``q`` 全 ``None``、``solved == 0``）但仍出图；
 6. 校验失败走 ``ok: False``，不抛异常；
@@ -138,11 +138,11 @@ class RunScanTest(unittest.TestCase):
         self.assertGreater((self.run_dir / "plot.png").stat().st_size, 1024)
 
     def test_joints_txt(self):
-        """joints.txt：8 行、每行 6 个数、逗号分隔、<=3 位小数、GP 顺序。"""
+        """joints.txt：8 行、每行 6 个数、空格分隔、<=3 位小数、GP 顺序。"""
         lines = (self.run_dir / "joints.txt").read_text("utf-8").splitlines()
         self.assertEqual(len(lines), 8)
         for line, row in zip(lines, self.result["waypoints"]):
-            parts = line.split(",")
+            parts = line.split()
             self.assertEqual(len(parts), 6, line)
             for part, expected in zip(parts, row["q"]):
                 self.assertLessEqual(len(part.split(".")[-1]), 3, part)

@@ -435,7 +435,10 @@ def _worst_point(waypoints, steps_by_index, segment) -> tuple:
 
 
 def _write_joints(path: Path, chain) -> int:
-    """写 ``joints.txt``：每行 6 个关节角（deg，逗号分隔，3 位小数，GP 顺序）。
+    """写 ``joints.txt``：每行 6 个关节角（deg，**空格分隔**，3 位小数，GP 顺序）。
+
+    分隔符与已交付的 ``position_R1_scan50_joints.txt`` 保持一致（空格），
+    这样两份文件可以直接 diff。
 
     只写有解的点——GP 程序里没法下发一个「无解」行，缺的点在 ``warnings``
     里单独报。
@@ -447,7 +450,7 @@ def _write_joints(path: Path, chain) -> int:
     Returns:
         int: 写出的行数（= 有解路点数）。
     """
-    lines = [",".join(f"{float(value):.3f}" for value in step.q)
+    lines = [" ".join(f"{float(value):.3f}" for value in step.q)
              for step in chain if step.q is not None]
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     return len(lines)
