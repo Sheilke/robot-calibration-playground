@@ -1,0 +1,18 @@
+# -*- coding: utf-8 -*-
+"""网页界面可选依赖（与核心 CLI 的 ``requirements.txt`` 分开）。
+
+核心算法只依赖 ``numpy`` + ``matplotlib``；只想用命令行的同事装
+``requirements.txt`` 就够，不需要装这两个包。
+
+版本区间对应仓库里已实测的组合：NiceGUI 4.0 / Plotly 7.1。NiceGUI 4.x 的
+上传与下载 API 与 2.x/3.x 不同（``await e.file.read()``、``ui.download.file``），
+升大版本前请重跑 ``python/laser_web`` 的冒烟检查。
+
+    cd ~/projects/robot-calibration-playground
+    python3 -m venv --system-site-packages .venv
+    .venv/bin/pip install -r requirements-web.txt
+    PYTHONPATH=python .venv/bin/python -m laser_web --port 8765
+"""
+
+nicegui>=4.0,<5
+plotly>=7.1,<8
