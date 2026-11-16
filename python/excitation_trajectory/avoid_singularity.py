@@ -82,6 +82,10 @@ from excitation_trajectory.aabb_snake_scan import (
 )
 from robot_model.nexbot_ik import Nexbot6R
 
+#: 判"肘部可疑"的角度阈值（deg）：``|J3|`` 小于它即按肘奇异处理，
+#: 即使 ``--j3-min`` 未启用。现场停机常表现为 J3 贴 0。
+ELBOW_SUSPECT_DEG = 5.0
+
 #: 搜索时每个路点的重试次数（比最终输出的少，先粗筛再精算）。
 SEARCH_ATTEMPTS = 5
 
@@ -146,24 +150,66 @@ def flatten_joint_angles(groups) -> list[list[float]]:
 
 
 def classify_singularity(rbt: Nexbot6R, q_deg, *, j5_min: float, j3_min: float,
-                         avoid_margin: float) -> dict:
-    """把报告的关节角归类：腕奇异 / 肘肩奇异 / 与模型判据不一致。
+                         avoid_margin: float,
+                         degenerate_eps: float = 1.0) -> dict:
+    """把控制器报的关节角归类：腕奇异 / 肘奇异 / 退化读数 / 与模型判据不一致。
+
+    现场停机姿态常常**不是**一个有效位姿：``J5 = 0`` 时 J4 与 J6 共线，只有
+    ``J4+J6`` 有意义，控制器会把这对自由度随手分配（历史上的
+    ``[0,0,0,55.721,0,-55.721]`` 就与零位 ``q=0`` 完全等价，FK 位置差 0.000e+00、
+    旋转差 6e-17）。这种读数**不能**用来定位位置，也不能据此判定是哪一类奇异，
+    否则会把肘奇异误认成腕奇异、并在零位附近造出一个无意义的禁区。
+
+    因此这里先判退化，再判腕/肘；退化时两向都收紧，且不产生位置禁区。
+
+    Args:
+        rbt: 机器人模型。
+        q_deg: 报告到的 6 个关节角（deg）。
+        j5_min: 内置 ``|J5|`` 下限（deg）。
+        j3_min: 内置 ``|J3|`` 下限（deg），0 表示未启用。
+        avoid_margin: 经验阈值上抬量（deg）＝实测裕度之外再加的角度。
+        degenerate_eps: 判定"接近零位/退化"的角度阈值（deg）。
 
     Returns:
-        dict：``q_deg`` / ``position``（FK，mm）/ ``j3_abs`` / ``j5_abs`` /
-        ``kind``（``wrist`` / ``elbow`` / ``unexplained``）/ ``j5_floor`` /
-        ``j3_floor``（建议的有效阈值）。
+        dict：``q_deg`` / ``position`` / ``j3_abs`` / ``j5_abs`` /
+        ``kind``（``wrist`` / ``elbow`` / ``degenerate`` / ``unexplained``）/
+        ``j5_floor`` / ``j3_floor`` / ``note``。
     """
     q = [float(v) for v in q_deg]
     transform = rbt.fk(q)
     position = [float(v) for v in transform[:3, 3]]
     j3_abs, j5_abs = abs(q[2]), abs(q[4])
 
-    kind = "unexplained"
-    if j5_min > 0.0 and j5_abs < j5_min:
+    zero = rbt.fk([0.0] * 6)
+    same_as_zero = (
+        math.dist(position, [float(v) for v in zero[:3, 3]]) < 1e-6
+        and float(np.max(np.abs(transform[:3, :3] - zero[:3, :3]))) < 1e-9)
+
+    degenerate = (j5_abs < j5_min and j3_abs < degenerate_eps) or same_as_zero
+    elbow_threshold = max(float(j3_min), ELBOW_SUSPECT_DEG)
+
+    if degenerate:
+        kind = "degenerate"
+        j5_floor = max(float(j5_min), j5_abs + avoid_margin)
+        j3_floor = max(float(j3_min), float(avoid_margin))
+        note = ("J5≈0 时 J4/J6 共线、只有 J4+J6 有意义，控制器对这对自由度的"
+                "分配是随机的；该读数不能定位位置，也不足以区分腕/肘奇异。"
+                "按段内肘部裕度收紧处理。")
+    elif j5_min > 0.0 and j5_abs < j5_min:
         kind = "wrist"
-    elif j3_min > 0.0 and j3_abs < j3_min:
+        j5_floor = max(float(j5_min), j5_abs + avoid_margin)
+        j3_floor = float(j3_min)
+        note = "端点 |J5| 低于阈值。"
+    elif j3_abs < elbow_threshold:
         kind = "elbow"
+        j5_floor = float(j5_min)
+        j3_floor = max(float(j3_min), j3_abs + avoid_margin)
+        note = "端点 |J3| 接近 0（肘伸展）。"
+    else:
+        kind = "unexplained"
+        j5_floor = float(j5_min)
+        j3_floor = float(j3_min)
+        note = "与内置判据不一致，按位置禁区处理。"
 
     return {
         "q_deg": q,
@@ -171,11 +217,10 @@ def classify_singularity(rbt: Nexbot6R, q_deg, *, j5_min: float, j3_min: float,
         "j3_abs": j3_abs,
         "j5_abs": j5_abs,
         "kind": kind,
-        # 经验阈值：只上抬、不下调
-        "j5_floor": max(float(j5_min), j5_abs + avoid_margin) if kind == "wrist"
-                    else float(j5_min),
-        "j3_floor": max(float(j3_min), j3_abs + avoid_margin) if kind == "elbow"
-                    else float(j3_min),
+        "j5_floor": j5_floor,
+        "j3_floor": j3_floor,
+        "same_as_zero_pose": bool(same_as_zero),
+        "note": note,
     }
 
 
@@ -239,7 +284,7 @@ def evaluate_domain(rbt: Nexbot6R, domain, *, target_count: int, seed: int,
                     cond_max: float, perturb_deg, order: str,
                     extrinsic: bool, attempts: int,
                     forbidden: list, avoid_radius: float,
-                    seg_samples: int = 11) -> dict:
+                    seg_samples: int = 11, j3_seg_min: float = 0.0) -> dict:
     """评估一个采样域是否满足全部约束。
 
     Args:
@@ -329,9 +374,10 @@ def evaluate_domain(rbt: Nexbot6R, domain, *, target_count: int, seed: int,
     if segments.get("j5_abs_min") is not None and \
             segments["j5_abs_min"] < seg_min:
         reasons.append(f"段内 |J5| 最低 {segments['j5_abs_min']:.2f}° < {seg_min:.1f}°")
-    if segments.get("j3_abs_min") is not None and j3_min > 0.0 and \
-            segments["j3_abs_min"] < min(seg_min, j3_min):
-        reasons.append(f"段内 |J3| 最低 {segments['j3_abs_min']:.2f}° 过小")
+    if j3_seg_min > 0.0 and segments.get("j3_abs_min") is not None \
+            and segments["j3_abs_min"] < j3_seg_min:
+        reasons.append(f"MOVL 段内 |J3| 最低 {segments['j3_abs_min']:.2f}° "
+                       f"< {j3_seg_min:.1f}°")
 
     violations = guard.get("violations") or []
     j5_seen = guard.get("j5_abs_min_deg")
@@ -363,7 +409,8 @@ def evaluate_domain(rbt: Nexbot6R, domain, *, target_count: int, seed: int,
         "j5_gap_sum": j5_gap_sum,
         "j3_gap_sum": j3_gap_sum,
         "seg_j5_gap": max(0.0, seg_min - seg_j5) if seg_j5 is not None else 0.0,
-        "seg_j3_gap": max(0.0, seg_min - seg_j3) if seg_j3 is not None else 0.0,
+        "seg_j3_gap": (max(0.0, j3_seg_min - seg_j3)
+                       if (j3_seg_min > 0.0 and seg_j3 is not None) else 0.0),
     }
     return {
         "ok": not reasons,
@@ -675,6 +722,9 @@ def run(args) -> int:
 
     j5_eff = max([args.j5_min] + [a["j5_floor"] for a in analyses])
     j3_eff = max([args.j3_min] + [a["j3_floor"] for a in analyses])
+    elbow_required = any(a["kind"] in ("elbow", "degenerate") for a in analyses)
+    # 报了肘/退化时，段内肘部也要有裕度（端点合格 ≠ 路径合格）
+    j3_seg_min = max(args.seg_min, j3_eff) if elbow_required else 0.0
     forbidden = [a["position"] for a in analyses if a["kind"] == "unexplained"]
 
     print("奇异位形分析:")
@@ -693,7 +743,7 @@ def run(args) -> int:
             cond_max=args.cond_max, perturb_deg=args.perturb_deg,
             order=order, extrinsic=extrinsic, attempts=attempts,
             forbidden=forbidden, avoid_radius=args.avoid_radius,
-            seg_samples=args.seg_samples)
+            seg_samples=args.seg_samples, j3_seg_min=j3_seg_min)
 
     # ---- 2) 先看原域 ----
     print("\n评估原域 ...")

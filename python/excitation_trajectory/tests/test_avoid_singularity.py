@@ -118,6 +118,59 @@ class ClassifyTest(unittest.TestCase):
             self.assertAlmostEqual(got, float(want), places=6)
 
 
+class FieldStopRegressionTest(unittest.TestCase):
+    """2026-11-05 现场那次停机（约第 41 点、运动中）的回归。
+
+    控制器停在 ``[0,0,0,55.721,0,-55.721]``：J5=0 时 J4/J6 共线，只有 J4+J6
+    有意义，该姿态与零位 q=0 完全等价——不能据此定位、也不能判成腕奇异，
+    真正越界的是插补途中的肘部（J3 穿 0）。这三条必须钉死。
+    """
+
+    STOP_Q = [0.0, 0.0, 0.0, 55.721, 0.0, -55.721]
+
+    def test_stop_pose_equals_zero_pose(self):
+        import numpy as np
+        rbt = _robot()
+        stop, zero = rbt.fk(self.STOP_Q), rbt.fk([0.0] * 6)
+        np.testing.assert_allclose(stop[:3, 3], zero[:3, 3], atol=1e-9)
+        np.testing.assert_allclose(stop[:3, :3], zero[:3, :3], atol=1e-12)
+
+    def test_classified_degenerate_not_wrist(self):
+        info = classify_singularity(_robot(), self.STOP_Q, j5_min=20.0,
+                                    j3_min=0.0, avoid_margin=10.0)
+        self.assertEqual(info["kind"], "degenerate")
+        self.assertTrue(info["same_as_zero_pose"])
+        # 退化读数必须同时收紧肘部裕度，而不是只提 |J5|
+        self.assertGreaterEqual(info["j3_floor"], 10.0)
+        self.assertIn("J4+J6", info["note"])
+
+    def test_degenerate_does_not_create_forbidden_sphere(self):
+        """退化位形的位置无意义，不能变成禁区球（否则会去躲零位）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = ["--robot", str(ROBOT)] + BOX + [
+                "--rpy", "3", "73", "-167", "--euler", "xyz-intrinsic",
+                "--q-seed", Q_SEED, "--target-count", "8",
+                "--singular-q"] + [f"{v}" for v in self.STOP_Q] + [
+                "--out", str(Path(tmp) / "s.json"),
+                "--report", str(Path(tmp) / "r.json"),
+                "--j5-attempts", "10"]
+            with redirect_stdout(io.StringIO()):
+                code = main(argv)
+            self.assertEqual(code, 0)
+            report = json.loads((Path(tmp) / "r.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["forbidden_positions"], [])
+            self.assertEqual(report["singularity_analysis"][0]["kind"],
+                             "degenerate")
+
+    def test_elbow_suspected_even_without_j3_min(self):
+        """``--j3-min`` 未启用时，|J3| 贴 0 也要按肘奇异收紧。"""
+        info = classify_singularity(_robot(), [0, -30, 1.5, 0, 60, 0],
+                                    j5_min=20.0, j3_min=0.0,
+                                    avoid_margin=10.0)
+        self.assertEqual(info["kind"], "elbow")
+        self.assertAlmostEqual(info["j3_floor"], 11.5, places=6)
+
+
 class DomainTest(unittest.TestCase):
     """域的量度与改动代价。"""
 
