@@ -12,6 +12,11 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
+from excitation_trajectory.aabb_snake_scan import (
+    _expm_so3,
+    check_segments_cartesian,
+    interpolate_pose,
+)
 from excitation_trajectory.avoid_singularity import (
     _describe_change,
     change_cost,
@@ -151,6 +156,97 @@ class DomainTest(unittest.TestCase):
                          [{"type": "shrink", "axis": "Y", "side": "max",
                            "delta_mm": -20.0}])
         self.assertIn("Y max 内收 20 mm", info["label"])
+
+
+class MovlInterpolationTest(unittest.TestCase):
+    """MOVL（笛卡尔直线）路径模型：位置线性 + 姿态测地线插补。"""
+
+    @staticmethod
+    def _pose(position, rpy):
+        from robot_model.nexbot_ik import euler_to_rot
+        transform = __import__("numpy").eye(4)
+        transform[:3, :3] = euler_to_rot(rpy, order="XYZ", extrinsic=False)
+        transform[:3, 3] = position
+        return transform
+
+    @staticmethod
+    def _angle(R1, R2):
+        import numpy as np
+        return float(np.degrees(np.arccos(max(
+            -1.0, min(1.0, (float(np.trace(R1.T @ R2)) - 1.0) / 2.0)))))
+
+    def test_endpoints_match(self):
+        import numpy as np
+        start = self._pose((100, 0, 0), (10, 20, 30))
+        end = self._pose((300, 100, 50), (-40, 25, 80))
+        np.testing.assert_allclose(interpolate_pose(start, end, 0.0), start,
+                                   atol=1e-12)
+        np.testing.assert_allclose(interpolate_pose(start, end, 1.0), end,
+                                   atol=1e-12)
+
+    def test_position_is_linear(self):
+        import numpy as np
+        start = self._pose((100, 0, 0), (10, 20, 30))
+        end = self._pose((300, 100, 50), (-40, 25, 80))
+        mid = interpolate_pose(start, end, 0.5)
+        np.testing.assert_allclose(mid[:3, 3], (start[:3, 3] + end[:3, 3]) / 2,
+                                   atol=1e-12)
+
+    def test_orientation_splits_the_geodesic(self):
+        """frac=0.5 时两端张角相等；姿态保持正交、det=1。"""
+        import numpy as np
+        start = self._pose((0, 0, 0), (10, 20, 30))
+        end = self._pose((0, 0, 0), (-40, 25, 80))
+        mid = interpolate_pose(start, end, 0.5)
+        R = mid[:3, :3]
+        np.testing.assert_allclose(R @ R.T, np.eye(3), atol=1e-12)
+        self.assertAlmostEqual(float(np.linalg.det(R)), 1.0, places=12)
+        self.assertAlmostEqual(self._angle(start[:3, :3], R),
+                               self._angle(R, end[:3, :3]), places=9)
+
+    def test_expm_matches_axis_rotation(self):
+        import numpy as np
+        from robot_model.nexbot_ik import rot_z
+        np.testing.assert_allclose(_expm_so3([0, 0, np.pi / 2]), rot_z(np.pi / 2),
+                                   atol=1e-12)
+
+
+class CartesianSegmentCheckTest(unittest.TestCase):
+    """MOVL 段检查的输出结构与可复现性。"""
+
+    def _plan(self, bounds):
+        from excitation_trajectory.aabb_snake_scan import (
+            _sample_perturbations, plan_waypoints, solve_chain_guarded)
+        rbt = _robot()
+        x0, x1, y0, y1, z0, z1 = bounds
+        waypoints = plan_waypoints(x0, x1, y0, y1, z0, z1, 1, 1, 1,
+                                   (3.0, 73.0, -167.0))
+        _sample_perturbations(waypoints, 0, (20, 20, 35))
+        steps, _ = solve_chain_guarded(
+            rbt, waypoints, [43, -30, -36, 42, -89, -1], j5_min=20.0,
+            attempts=10, seed=0, amplitudes_deg=(20, 20, 35),
+            order="XYZ", extrinsic=False)
+        return rbt, waypoints, steps
+
+    def test_reports_mode_and_margins(self):
+        rbt, waypoints, steps = self._plan((900, 1100, -100, 100, 500, 700))
+        report = check_segments_cartesian(rbt, waypoints, steps, samples=9,
+                                          order="XYZ", extrinsic=False)
+        self.assertEqual(report["mode"], "cartesian-movl")
+        self.assertEqual(report["samples"], 9)
+        self.assertIsNotNone(report["j5_abs_min"])
+        self.assertEqual(report["ik_failures"], 0)
+        self.assertEqual(len(report["segments"]), 7)   # 8 点 7 段
+        for segment in report["segments"]:
+            self.assertIn("max_jump_deg", segment)
+
+    def test_deterministic(self):
+        rbt, waypoints, steps = self._plan((900, 1100, -100, 100, 500, 700))
+        first = check_segments_cartesian(rbt, waypoints, steps, samples=9,
+                                         order="XYZ", extrinsic=False)
+        second = check_segments_cartesian(rbt, waypoints, steps, samples=9,
+                                          order="XYZ", extrinsic=False)
+        self.assertEqual(first, second)
 
 
 class EndToEndTest(unittest.TestCase):

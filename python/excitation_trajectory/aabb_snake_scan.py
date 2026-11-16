@@ -671,6 +671,142 @@ def check_segments(steps, *, samples: int = 101) -> dict:
     }
 
 
+def _skew(vector) -> np.ndarray:
+    """3 维向量 -> 反对称矩阵（``exp`` 的辅助）。"""
+    x, y, z = (float(v) for v in vector)
+    return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=float)
+
+
+def _expm_so3(rotvec) -> np.ndarray:
+    """Rodrigues：旋转向量 -> 旋转矩阵。"""
+    rotvec = np.asarray(rotvec, dtype=float).reshape(3)
+    theta = float(np.linalg.norm(rotvec))
+    skew = _skew(rotvec)
+    if theta < 1e-12:
+        return np.eye(3) + skew
+    return (np.eye(3) + math.sin(theta) / theta * skew
+            + (1.0 - math.cos(theta)) / theta ** 2 * (skew @ skew))
+
+
+def interpolate_pose(T0, T1, frac: float) -> np.ndarray:
+    """两齐次位姿的插补：位置线性 + 姿态测地线（单位四元数意义的 SLERP）。
+
+    MOVL（笛卡尔直线）在控制器里就是把位置按直线插补、姿态按两姿态之间的
+    最短旋转插补，因此这里用 ``R0 · exp(frac · log(R0ᵀR1))``。
+
+    Args:
+        T0, T1: 起止 4x4 齐次矩阵。
+        frac: 0..1 之间的插补比例。
+
+    Returns:
+        插补出的 4x4 齐次矩阵。
+    """
+    T0 = np.asarray(T0, dtype=float)
+    T1 = np.asarray(T1, dtype=float)
+    frac = float(frac)
+    transform = np.eye(4)
+    transform[:3, 3] = (1.0 - frac) * T0[:3, 3] + frac * T1[:3, 3]
+    relative = T0[:3, :3].T @ T1[:3, :3]
+    angle = math.acos(max(-1.0, min(1.0, (float(np.trace(relative)) - 1.0) / 2.0)))
+    if angle < 1e-12:
+        transform[:3, :3] = T0[:3, :3]
+        return transform
+    axis = np.array([relative[2, 1] - relative[1, 2],
+                     relative[0, 2] - relative[2, 0],
+                     relative[1, 0] - relative[0, 1]], dtype=float)
+    norm = float(np.linalg.norm(axis))
+    if norm < 1e-12:                      # 180°：退化为绕某个正交轴转
+        transform[:3, :3] = T0[:3, :3]
+        return transform
+    rotvec = axis / norm * angle * frac
+    transform[:3, :3] = T0[:3, :3] @ _expm_so3(rotvec)
+    return transform
+
+
+def check_segments_cartesian(rbt, waypoints, steps, *, samples: int = 21,
+                             order: str = "XYZ",
+                             extrinsic: bool = True) -> dict:
+    """检查相邻路点之间**笛卡尔直线插补**（MOVL）段内是否接近奇异。
+
+    ``check_segments`` 假设关节直线插补（PTP）；现场 JOB 多用 MOVL，控制器
+    沿**笛卡尔直线**走，姿态按最短旋转插补，关节轨迹因此不是直线。本函数按
+    MOVL 语义重建路径：位置线性、姿态测地线插补，再对每个采样点求 IK
+    （以上一个采样解为参考，保持构型），统计段内最小 ``|J3|``/``|J5|``、
+    是否穿零、以及沿途是否存在无解点。
+
+    Args:
+        rbt: ``Nexbot6R`` 实例。
+        waypoints: 路点序列（用 ``pos`` 与 ``rpy_pert``，为 None 时退回 ``rpy_ref``）。
+        steps: 与 ``waypoints`` 等长的 ``ChainStep`` 序列。
+        samples: 每段采样点数（含端点）。
+        order / extrinsic: 欧拉约定。
+
+    Returns:
+        与 ``check_segments`` 同名的统计键，另加 ``mode="cartesian-movl"``、
+        ``ik_failures``（段内无解的段数）与 ``max_jump_deg``（相邻采样最大
+        关节跳变，用于发现构型切换）。
+    """
+    usable = [(wp, s) for wp, s in zip(waypoints, steps)
+              if s.ok and s.q is not None]
+    count = max(2, int(samples))
+    segments = []
+    for (wp0, s0), (wp1, s1) in zip(usable, usable[1:]):
+        T0 = rbt.pose_to_T(wp0.pos,
+                           wp0.rpy_pert if wp0.rpy_pert is not None else wp0.rpy_ref,
+                           order=order, extrinsic=extrinsic)
+        T1 = rbt.pose_to_T(wp1.pos,
+                           wp1.rpy_pert if wp1.rpy_pert is not None else wp1.rpy_ref,
+                           order=order, extrinsic=extrinsic)
+        j3_values, j5_values = [], []
+        q_ref = list(s0.q)
+        ik_failures = 0
+        max_jump = 0.0
+        for index in range(count):
+            frac = index / (count - 1)
+            if index == 0:
+                q = list(s0.q)
+            elif index == count - 1:
+                q = list(s1.q)
+            else:
+                solutions = rbt.ik(interpolate_pose(T0, T1, frac), q_ref=q_ref)
+                if not solutions:
+                    ik_failures += 1
+                    break
+                q = [float(v) for v in solutions[0]]
+            if j3_values:
+                max_jump = max(max_jump,
+                               max(abs(wrap_180(a - b)) for a, b in zip(q, q_ref)))
+            j3_values.append(q[2])
+            j5_values.append(q[4])
+            q_ref = q
+        j3 = np.asarray(j3_values, dtype=float)
+        j5 = np.asarray(j5_values, dtype=float)
+        segments.append({
+            "from": int(s0.index), "to": int(s1.index),
+            "j3_abs_min": float(np.min(np.abs(j3))) if len(j3) else None,
+            "j5_abs_min": float(np.min(np.abs(j5))) if len(j5) else None,
+            "j3_crosses_zero": bool(len(j3) and np.min(j3) < 0.0 < np.max(j3)),
+            "j5_crosses_zero": bool(len(j5) and np.min(j5) < 0.0 < np.max(j5)),
+            "ik_failures": int(ik_failures),
+            "max_jump_deg": float(max_jump),
+        })
+    return {
+        "mode": "cartesian-movl",
+        "samples": int(count),
+        "segments": segments,
+        "j3_abs_min": (min(s["j3_abs_min"] for s in segments
+                           if s["j3_abs_min"] is not None)
+                       if any(s["j3_abs_min"] is not None for s in segments) else None),
+        "j5_abs_min": (min(s["j5_abs_min"] for s in segments
+                           if s["j5_abs_min"] is not None)
+                       if any(s["j5_abs_min"] is not None for s in segments) else None),
+        "j3_crossings": sum(1 for s in segments if s["j3_crosses_zero"]),
+        "j5_crossings": sum(1 for s in segments if s["j5_crosses_zero"]),
+        "ik_failures": sum(int(s["ik_failures"]) for s in segments),
+        "max_jump_deg": max((s["max_jump_deg"] for s in segments), default=0.0),
+    }
+
+
 def solve_chain_guarded(rbt, waypoints, q_seed, *, j5_min: float = 0.0,
                         j3_min: float = 0.0, attempts: int = 30,
                         seed: int = 0, amplitudes_deg=None,
@@ -741,13 +877,17 @@ def solve_chain_guarded(rbt, waypoints, q_seed, *, j5_min: float = 0.0,
                               extrinsic=extrinsic)
             q_sel, n_sols, dq_l2, dq_l1, cfg, ok = _select_solution(
                 rbt, T, q_prev, cfg_ref)
+            pose = (None if wp.delta_rpy is None else tuple(wp.delta_rpy),
+                    None if wp.rpy_pert is None else tuple(wp.rpy_pert))
             if q_sel is not None and ok:
                 if not guard_on or not _violates(q_sel):
-                    best = (None, q_sel, n_sols, dq_l2, dq_l1, cfg, ok, tries)
+                    best = (None, q_sel, n_sols, dq_l2, dq_l1, cfg, ok, tries,
+                            pose)
                     break
                 margin = abs(q_sel[4]) * 1e6 + abs(q_sel[2])
                 if best is None or margin > best[0]:
-                    best = (margin, q_sel, n_sols, dq_l2, dq_l1, cfg, ok, tries)
+                    best = (margin, q_sel, n_sols, dq_l2, dq_l1, cfg, ok, tries,
+                            pose)
             if not guard_on:
                 break                     # 不守卫时只试一次
             _resample(wp)
@@ -761,7 +901,13 @@ def solve_chain_guarded(rbt, waypoints, q_seed, *, j5_min: float = 0.0,
                                    config=None, dq_l2=None, dq_l1=None, ok=False))
             continue
 
-        _, q_sel, n_sols, dq_l2, dq_l1, cfg, ok, used = best
+        _, q_sel, n_sols, dq_l2, dq_l1, cfg, ok, used, pose = best
+        # 关键：重采出来的姿态必须与选中的 q 配套。此前只保留了 q，路点上留的
+        # 是"最后一次采样"的姿态，导致 JSON 记录与 q 不一致、笛卡尔段检查
+        # 也会沿错误位姿插补。
+        if pose[1] is not None:
+            wp.delta_rpy = pose[0]
+            wp.rpy_pert = pose[1]
         if used > 1:
             resampled.append({"index": wp.index, "tries": used,
                               "delta_rpy": [float(v) for v in wp.delta_rpy],
@@ -1251,6 +1397,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              f"默认 {DEFAULT_J5_MIN_DEG:g}；0 关闭")
     parser.add_argument("--j3-min", type=float, default=0.0, metavar="DEG",
                         help="|J3| 下限（度，肘奇异守卫），默认 0 关闭")
+    parser.add_argument("--seg-mode", choices=("joint", "cartesian"),
+                        default="joint",
+                        help="段内奇异的插补模型：joint=关节直线（PTP，默认，"
+                             "历史行为）；cartesian=笛卡尔直线 MOVL（位置线性 +"
+                             "姿态测地线插补，现场 MOVL 作业请用这个）")
+    parser.add_argument("--seg-samples", type=int, default=21, metavar="N",
+                        help="cartesian 模式每段采样点数，默认 21")
     parser.add_argument("--seg-min", type=float, default=5.0, metavar="DEG",
                         help="相邻两点关节插补段内 |J3|/|J5| 的最小允许值（度），"
                              "低于则告警；穿 0 直接判失败，默认 5")
@@ -1577,7 +1730,12 @@ def _run_ik_chain(args: argparse.Namespace,
                   f"dqL2={s.dq_l2:.2f} nSols={s.n_sols}")
 
     # ---- 5b. 段内奇异检查（端点安全 ≠ 路径安全） ----
-    segment_report = check_segments(chain)
+    if args.seg_mode == "cartesian":
+        segment_report = check_segments_cartesian(
+            rbt, waypoints, chain, samples=args.seg_samples,
+            order=_order_of(args), extrinsic=_extrinsic_of(args))
+    else:
+        segment_report = check_segments(chain)
     if segment_report["j3_crossings"] or segment_report["j5_crossings"]:
         print(f"段内奇异: J3 穿 0 的段 {segment_report['j3_crossings']} 处"
               f"（段内 |J3| 最小 {_fmt_cond(segment_report['j3_abs_min'])}），"

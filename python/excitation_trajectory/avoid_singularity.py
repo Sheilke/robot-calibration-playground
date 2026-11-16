@@ -73,7 +73,7 @@ from excitation_trajectory.aabb_snake_scan import (
     PERTURB_AMPLITUDE_DEG,
     _conditioning_to_json,
     _sample_perturbations,
-    check_segments,
+    check_segments_cartesian,
     choose_grid,
     evaluate_conditioning,
     grid_point_count,
@@ -238,7 +238,8 @@ def evaluate_domain(rbt: Nexbot6R, domain, *, target_count: int, seed: int,
                     q_seed, j5_min: float, j3_min: float, seg_min: float,
                     cond_max: float, perturb_deg, order: str,
                     extrinsic: bool, attempts: int,
-                    forbidden: list, avoid_radius: float) -> dict:
+                    forbidden: list, avoid_radius: float,
+                    seg_samples: int = 11) -> dict:
     """评估一个采样域是否满足全部约束。
 
     Args:
@@ -316,9 +317,14 @@ def evaluate_domain(rbt: Nexbot6R, domain, *, target_count: int, seed: int,
         reasons.append(f"{len(guard['violations'])} 个路点重采后仍低于奇异阈值"
                        f"（首个 #{first['index']}, |J5|={first['q5_deg']:.2f}°）")
 
-    segments = check_segments(steps)
+    # 现场用 MOVL：按笛卡尔直线插补重建路径，关节轨迹不是直线
+    segments = check_segments_cartesian(rbt, waypoints, steps,
+                                        samples=seg_samples, order=order,
+                                        extrinsic=extrinsic)
+    if segments.get("ik_failures"):
+        reasons.append(f"MOVL 段内有 {segments['ik_failures']} 个采样点无解")
     if segments.get("j5_crossings") or segments.get("j3_crossings"):
-        reasons.append(f"段内穿零 J3={segments.get('j3_crossings')} "
+        reasons.append(f"MOVL 段内穿零 J3={segments.get('j3_crossings')} "
                        f"J5={segments.get('j5_crossings')}")
     if segments.get("j5_abs_min") is not None and \
             segments["j5_abs_min"] < seg_min:
@@ -349,6 +355,7 @@ def evaluate_domain(rbt: Nexbot6R, domain, *, target_count: int, seed: int,
         "violations": len(violations),
         "j3_crossings": int(segments.get("j3_crossings") or 0),
         "j5_crossings": int(segments.get("j5_crossings") or 0),
+        "ik_failures": int(segments.get("ik_failures") or 0),
         "j5_deficit": max(0.0, j5_min - j5_seen) if j5_seen is not None
                       else float(j5_min),
         "j3_deficit": (max(0.0, j3_min - j3_seen) if j3_min > 0.0
@@ -480,6 +487,7 @@ def failure_score(metrics) -> float:
     用于爬山搜索比较候选优劣。
     """
     return (1e7 * float(metrics.get("forbidden", 0))
+            + 1e7 * float(metrics.get("ik_failures", 0))
             + 1e6 * float(metrics.get("unsolved", 0))
             + 1e4 * float(metrics.get("violations", 0))
             + 1e3 * float(metrics.get("j3_crossings", 0)
@@ -594,6 +602,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="|J5| 下限（deg），默认 20")
     parser.add_argument("--j3-min", type=float, default=0.0, metavar="DEG",
                         help="|J3| 下限（deg），默认 0（关闭）")
+    parser.add_argument("--seg-samples", type=int, default=11, metavar="N",
+                        help="MOVL 段检查每段采样点数，默认 11（搜索时求快；"
+                             "最终复核用 --seg-samples-final）")
+    parser.add_argument("--seg-samples-final", type=int, default=31, metavar="N",
+                        help="最终复核时每段采样点数，默认 31")
     parser.add_argument("--seg-min", type=float, default=5.0, metavar="DEG",
                         help="段内 |J5|/|J3| 最小允许值（deg），默认 5")
     parser.add_argument("--avoid-margin", type=float, default=10.0, metavar="DEG",
@@ -679,7 +692,8 @@ def run(args) -> int:
             q_seed=q_seed, j5_min=j5_eff, j3_min=j3_eff, seg_min=args.seg_min,
             cond_max=args.cond_max, perturb_deg=args.perturb_deg,
             order=order, extrinsic=extrinsic, attempts=attempts,
-            forbidden=forbidden, avoid_radius=args.avoid_radius)
+            forbidden=forbidden, avoid_radius=args.avoid_radius,
+            seg_samples=args.seg_samples)
 
     # ---- 2) 先看原域 ----
     print("\n评估原域 ...")
@@ -756,7 +770,10 @@ def run(args) -> int:
         _, _, chosen, chosen_eval = best
         # 用完整重试次数复核，避免粗筛阶段的低重试次数造成假可行
         print(f"\n用完整重试次数复核：{chosen['label']}")
+        original_samples = args.seg_samples
+        args.seg_samples = args.seg_samples_final
         confirm = _evaluate(chosen, args.j5_attempts)
+        args.seg_samples = original_samples
         if not confirm["ok"]:
             print("复核未通过：" + "；".join(confirm["reasons"]), file=sys.stderr)
             write_report(args, analyses, base, baseline, search_log,
