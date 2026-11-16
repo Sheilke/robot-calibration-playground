@@ -65,6 +65,7 @@ from pathlib import Path
 import numpy as np
 
 from excitation_trajectory.aabb_snake_scan import (
+    interpolate_pose,
     DEFAULT_EULER_CONVENTION,
     DEFAULT_GRID,
     DEFAULT_Q_SEED,
@@ -73,6 +74,7 @@ from excitation_trajectory.aabb_snake_scan import (
     PERTURB_AMPLITUDE_DEG,
     _conditioning_to_json,
     _sample_perturbations,
+    _select_solution,
     check_segments_cartesian,
     choose_grid,
     evaluate_conditioning,
@@ -284,7 +286,8 @@ def evaluate_domain(rbt: Nexbot6R, domain, *, target_count: int, seed: int,
                     cond_max: float, perturb_deg, order: str,
                     extrinsic: bool, attempts: int,
                     forbidden: list, avoid_radius: float,
-                    seg_samples: int = 11, j3_seg_min: float = 0.0) -> dict:
+                    seg_samples: int = 11, j3_seg_min: float = 0.0,
+                    steps_override=None, waypoints_override=None) -> dict:
     """评估一个采样域是否满足全部约束。
 
     Args:
@@ -309,9 +312,13 @@ def evaluate_domain(rbt: Nexbot6R, domain, *, target_count: int, seed: int,
     b = domain["bounds"]
     rpy = tuple(domain["rpy"])
     xs, ys, zs = domain["grid"]
-    waypoints = plan_waypoints(b[0], b[1], b[2], b[3], b[4], b[5],
-                               xs, ys, zs, rpy, z_insert=domain["z_insert"])
-    _sample_perturbations(waypoints, seed, perturb_deg)
+    if waypoints_override is not None:
+        # 局部修复过的路点：姿态已被改写，不能重新采样覆盖
+        waypoints = list(waypoints_override)
+    else:
+        waypoints = plan_waypoints(b[0], b[1], b[2], b[3], b[4], b[5],
+                                   xs, ys, zs, rpy, z_insert=domain["z_insert"])
+        _sample_perturbations(waypoints, seed, perturb_deg)
 
     reasons = []
     # 位置禁区：任何路点落在球内即判不可行
@@ -348,19 +355,38 @@ def evaluate_domain(rbt: Nexbot6R, domain, *, target_count: int, seed: int,
     if conditioning.get("status") == "rejected":
         reasons.append(f"姿态设计条件数 {gate.get('value')} > {cond_max}")
 
-    # 链式 IK（带奇异守卫）
-    with redirect_stdout(io.StringIO()):
-        steps, guard = solve_chain_guarded(
-            rbt, waypoints, q_seed, j5_min=j5_min, j3_min=j3_min,
-            attempts=attempts, seed=seed, amplitudes_deg=perturb_deg,
-            order=order, extrinsic=extrinsic, strict=False)
+    # 链式 IK（带奇异守卫）；局部修复过的链直接沿用，不重解
+    if steps_override is None:
+        with redirect_stdout(io.StringIO()):
+            steps, guard = solve_chain_guarded(
+                rbt, waypoints, q_seed, j5_min=j5_min, j3_min=j3_min,
+                attempts=attempts, seed=seed, amplitudes_deg=perturb_deg,
+                order=order, extrinsic=extrinsic, strict=False)
+    else:
+        steps = list(steps_override)
+        solved = [s for s in steps if s.ok and s.q is not None]
+        guard = {
+            "j5_min": float(j5_min), "j3_min": float(j3_min),
+            "attempts": int(attempts), "resampled": [],
+            "violations": [
+                {"index": s.index, "q3_deg": float(s.q[2]),
+                 "q5_deg": float(s.q[4]), "tries": 1}
+                for s in solved
+                if abs(s.q[4]) < j5_min
+                or (j3_min > 0.0 and abs(s.q[2]) < j3_min)],
+            "j5_abs_min_deg": (min(abs(s.q[4]) for s in solved)
+                               if solved else None),
+            "j3_abs_min_deg": (min(abs(s.q[2]) for s in solved)
+                               if solved else None),
+        }
     failed = [s.index for s in steps if not s.ok]
     if failed:
         reasons.append(f"{len(failed)} 个路点无解（首个 #{failed[0]}）")
     if guard.get("violations"):
         first = guard["violations"][0]
         reasons.append(f"{len(guard['violations'])} 个路点重采后仍低于奇异阈值"
-                       f"（首个 #{first['index']}, |J5|={first['q5_deg']:.2f}°）")
+                       f"（首个 #{first['index']}, "
+                       f"|J5|={abs(first['q5_deg']):.2f}°）")
 
     # 现场用 MOVL：按笛卡尔直线插补重建路径，关节轨迹不是直线
     segments = check_segments_cartesian(rbt, waypoints, steps,
@@ -434,6 +460,164 @@ def evaluate_domain(rbt: Nexbot6R, domain, *, target_count: int, seed: int,
 # ---------------------------------------------------------------------------
 # 候选生成 + 选择
 # ---------------------------------------------------------------------------
+def segment_profiles(rbt, waypoints, steps, start: int, *, window: int,
+                     order: str, extrinsic: bool, samples: int) -> list:
+    """给出 ``start`` 附近各段的 MOVL 剖面对比（含最差点位置）。
+
+    Args:
+        start: 0 基的段起点下标（即"已到的点"对应的 index）。
+        window: 向前后各看多少段。
+
+    Returns:
+        list[dict]：``index``（段起点，0 基）/``gp_from``/``gp_to``（1 基 GP 号）/
+        ``ok``/``j3_abs_min``/``j5_abs_min``/``crossings``/``worst_frac``/
+        ``worst_pos``（最差采样点的法兰位置，mm）。
+    """
+    total = min(len(waypoints), len(steps))
+    lo = max(0, int(start) - int(window))
+    hi = min(total - 1, int(start) + int(window) + 1)
+    profiles = []
+    for index in range(lo, hi):
+        first, second = steps[index], steps[index + 1]
+        if not (first.ok and second.ok and first.q and second.q):
+            continue
+        wp0, wp1 = waypoints[index], waypoints[index + 1]
+        T0 = rbt.pose_to_T(wp0.pos,
+                           wp0.rpy_pert if wp0.rpy_pert is not None else wp0.rpy_ref,
+                           order=order, extrinsic=extrinsic)
+        T1 = rbt.pose_to_T(wp1.pos,
+                           wp1.rpy_pert if wp1.rpy_pert is not None else wp1.rpy_ref,
+                           order=order, extrinsic=extrinsic)
+        q_ref = list(first.q)
+        j3, j5, worst, worst_frac, worst_pos, ik_fail = [], [], None, 0.0, None, 0
+        for step_index in range(max(2, int(samples))):
+            frac = step_index / (max(2, int(samples)) - 1)
+            if step_index == 0:
+                q = list(first.q)
+                position = [float(v) for v in T0[:3, 3]]
+            elif step_index == max(2, int(samples)) - 1:
+                q = list(second.q)
+                position = [float(v) for v in T1[:3, 3]]
+            else:
+                pose = interpolate_pose(T0, T1, frac)
+                solutions = rbt.ik(pose, q_ref=q_ref)
+                if not solutions:
+                    ik_fail += 1
+                    break
+                q = [float(v) for v in solutions[0]]
+                position = [float(v) for v in pose[:3, 3]]
+            margin = min(abs(q[2]), abs(q[4]))
+            if worst is None or margin < worst:
+                worst, worst_frac = margin, frac
+                worst_pos = position
+            j3.append(q[2])
+            j5.append(q[4])
+            q_ref = q
+        profiles.append({
+            "index": index,
+            "gp_from": index + 1,
+            "gp_to": index + 2,
+            "j3_abs_min": min(abs(v) for v in j3) if j3 else None,
+            "j5_abs_min": min(abs(v) for v in j5) if j5 else None,
+            "crossings": int(len(j3) > 1 and (
+                (min(j3) < 0.0 < max(j3)) or (min(j5) < 0.0 < max(j5)))),
+            "ik_failures": ik_fail,
+            "worst_frac": round(worst_frac, 3),
+            "worst_pos": None if worst_pos is None
+                         else [round(v, 1) for v in worst_pos],
+        })
+    return profiles
+
+
+def repair_segment(rbt, waypoints, steps, index: int, *, order: str,
+                   extrinsic: bool, perturb_deg, seed: int, attempts: int,
+                   j5_min: float, j3_min: float, seg_samples: int,
+                   neighbors: int = 1):
+    """只重采该段两端点的姿态扰动，使这一段在 MOVL 下不撞奇异。
+
+    与"整体挪箱"相比这是最小改动：位置、网格、点数都不变，只换端点姿态。
+    依次尝试改**后端点**、再改**前端点**，每次都要求：
+
+    * 该端点的端点裕度仍满足 ``|J5| >= j5_min``、``|J3| >= j3_min``；
+    * 前后各 ``neighbors`` 段（含本段）在 MOVL 下都不穿零、裕度达标；
+    * 构型标签与相邻点一致（不换肘上/肘下分支）。
+
+    Returns:
+        ``(steps, changed)``：``changed`` 为 ``None`` 表示没改成；
+        否则 ``{"index": i, "delta_rpy": [...], "q": [...]}``。
+    """
+    count = min(len(waypoints), len(steps))
+    if index < 0 or index + 1 >= count:
+        return steps, None
+    rng = np.random.default_rng(int(seed) + 0x5E9)
+    amps = [float(v) for v in perturb_deg]
+    lo = max(0, index - neighbors)
+    hi = min(count - 1, index + 1 + neighbors)
+
+    for target in (index + 1, index):      # 先换后端点（未到位的那点）
+        if target < 0 or target >= count:
+            continue
+        previous = steps[target - 1] if target > 0 else None
+        cfg_ref = previous.config if previous is not None and previous.config \
+            else steps[target].config
+        for _ in range(max(1, int(attempts))):
+            delta = tuple(float(rng.uniform(-a, a)) for a in amps)
+            waypoint = waypoints[target]
+            rpy = tuple(r + d for r, d in zip(waypoint.rpy_ref, delta))
+            pose = rbt.pose_to_T(waypoint.pos, rpy, order=order,
+                                 extrinsic=extrinsic)
+            q_sel, _, _, _, cfg, ok = _select_solution(
+                rbt, pose, previous.q if previous is not None else q_sel_seed(steps),
+                cfg_ref)
+            if not ok or q_sel is None:
+                continue
+            if abs(q_sel[4]) < j5_min or (j3_min > 0.0 and abs(q_sel[2]) < j3_min):
+                continue
+            if previous is not None and previous.config and cfg != previous.config:
+                continue
+
+            trial_steps = list(steps)
+            original_q = trial_steps[target].q
+            trial_steps[target] = type(steps[target])(
+                index=steps[target].index, q=q_sel,
+                n_sols=steps[target].n_sols, config=cfg,
+                dq_l2=steps[target].dq_l2, dq_l1=steps[target].dq_l1, ok=True)
+            original_pose = (waypoint.delta_rpy, waypoint.rpy_pert)
+            waypoint.delta_rpy = delta
+            waypoint.rpy_pert = rpy
+
+            sub_wp = waypoints[lo:hi + 1]
+            sub_steps = trial_steps[lo:hi + 1]
+            report = check_segments_cartesian(
+                rbt, sub_wp, sub_steps, samples=seg_samples,
+                order=order, extrinsic=extrinsic)
+            good = (not report["ik_failures"]
+                    and not report["j3_crossings"]
+                    and not report["j5_crossings"]
+                    and (report["j5_abs_min"] is None
+                         or report["j5_abs_min"] >= j5_min)
+                    and (j3_min <= 0.0 or report["j3_abs_min"] is None
+                         or report["j3_abs_min"] >= j3_min))
+            if good:
+                return trial_steps, {"index": target,
+                                     "delta_rpy": [float(v) for v in delta],
+                                     "q": [float(v) for v in q_sel]}
+            trial_steps[target] = type(steps[target])(
+                index=steps[target].index, q=original_q,
+                n_sols=steps[target].n_sols, config=steps[target].config,
+                dq_l2=steps[target].dq_l2, dq_l1=steps[target].dq_l1, ok=True)
+            waypoint.delta_rpy, waypoint.rpy_pert = original_pose
+    return steps, None
+
+
+def q_sel_seed(steps):
+    """取链上第一个有解的点作为种子（用于首个路点的 q_ref）。"""
+    for step in steps:
+        if step.ok and step.q:
+            return list(step.q)
+    return [0.0] * 6
+
+
 def ordered_candidates(base, *, allow_rpy: bool, allow_shrink: bool,
                        include_pairs: bool = False):
     """按**改动量从小到大**排序的候选域列表（确定性）。
@@ -641,6 +825,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "``--singular-q 0 0 0 55.7 0 -55.7``（6 个数）或 "
                              "``--singular-q=\"0,0,0,55.7,0,-55.7\"``（逗号串）；"
                              "可重复给多次以报告多个奇异位形")
+    parser.add_argument("--stopped-at", type=int, default=None, metavar="N",
+                        help="现场已走到的 GP 点号（1 基）。给了它就先定位 "
+                             "N->N+1 这一段、先做局部修复，失败才整体挪箱")
+    parser.add_argument("--segment-window", type=int, default=3, metavar="W",
+                        help="--stopped-at 时向前后各看多少段找最危险段，默认 3")
+    parser.add_argument("--force-search", action="store_true",
+                        help="即使模型判定报告段安全，也强行做整体搜索")
+    parser.add_argument("--repair-attempts", type=int, default=60, metavar="N",
+                        help="局部修复时每端点的姿态重采次数，默认 60")
     parser.add_argument("--perturb-deg", nargs=3, type=float,
                         default=list(PERTURB_AMPLITUDE_DEG),
                         metavar=("A_RX", "A_RY", "A_RZ"),
@@ -736,18 +929,122 @@ def run(args) -> int:
           + (f", 位置禁区 {len(forbidden)} 个（r={args.avoid_radius:g} mm）"
              if forbidden else ""))
 
-    def _evaluate(domain, attempts):
+    def _evaluate(domain, attempts, steps_override=None,
+                  waypoints_override=None):
         return evaluate_domain(
             rbt, domain, target_count=args.target_count, seed=args.seed,
             q_seed=q_seed, j5_min=j5_eff, j3_min=j3_eff, seg_min=args.seg_min,
             cond_max=args.cond_max, perturb_deg=args.perturb_deg,
             order=order, extrinsic=extrinsic, attempts=attempts,
             forbidden=forbidden, avoid_radius=args.avoid_radius,
-            seg_samples=args.seg_samples, j3_seg_min=j3_seg_min)
+            seg_samples=args.seg_samples, j3_seg_min=j3_seg_min,
+            steps_override=steps_override,
+            waypoints_override=waypoints_override)
 
     # ---- 2) 先看原域 ----
     print("\n评估原域 ...")
     baseline = _evaluate(base, args.j5_attempts)
+    segment_diagnostics = None
+    local_change = None
+    if args.stopped_at is not None:
+        target_index = int(args.stopped_at) - 1
+        if not 0 <= target_index < args.target_count - 1:
+            print(f"错误: --stopped-at 需在 1..{args.target_count - 1} 之间"
+                  f"（它表示已走到的点，后面还得有一点）", file=sys.stderr)
+            return 2
+        profiles = segment_profiles(
+            rbt, baseline["waypoints"], baseline["steps"], target_index,
+            window=args.segment_window, order=order, extrinsic=extrinsic,
+            samples=args.seg_samples_final)
+        segment_diagnostics = {"reported_gp": int(args.stopped_at),
+                               "window": int(args.segment_window),
+                               "profiles": profiles}
+        print(f"\n段定位（已到 GP{args.stopped_at}，故障应在 "
+              f"GP{args.stopped_at}->GP{args.stopped_at + 1}）:")
+        for profile in profiles:
+            if profile["j3_abs_min"] is None:
+                continue
+            flag = "  <== 报告段" if profile["index"] == target_index else ""
+            print(f"  GP{profile['gp_from']:02d}->GP{profile['gp_to']:02d}  "
+                  f"|J3|min={profile['j3_abs_min']:7.3f}  "
+                  f"|J5|min={profile['j5_abs_min']:7.3f}  "
+                  f"穿零={profile['crossings']}  无解={profile['ik_failures']}"
+                  f"  最差点={profile['worst_pos']} (t={profile['worst_frac']})"
+                  f"{flag}")
+        worst_segment = min(
+            [p for p in profiles if p["j3_abs_min"] is not None],
+            key=lambda p: min(p["j3_abs_min"], p["j5_abs_min"]),
+            default=None)
+        if worst_segment is not None and worst_segment["index"] != target_index:
+            print(f"  注意: 附近最危险的是 GP{worst_segment['gp_from']}->"
+                  f"GP{worst_segment['gp_to']}，不是报告的那一段"
+                  f"（现场点号可能有偏差）")
+
+        def _profile_fails(profile) -> bool:
+            """这一段是否真的越界（用于决定要不要动手）。"""
+            if profile["j3_abs_min"] is None:
+                return False
+            if profile["crossings"] or profile["ik_failures"]:
+                return True
+            if profile["j5_abs_min"] < args.seg_min:
+                return True
+            return bool(j3_seg_min > 0.0
+                        and profile["j3_abs_min"] < j3_seg_min)
+
+        offenders = [p for p in profiles if _profile_fails(p)]
+        by_index = {p["index"]: p for p in profiles}
+        reported = by_index.get(target_index)
+        if not offenders:
+            if baseline["ok"]:
+                print("  窗口内各段都满足阈值，且整链无越界：不动采样域。")
+            else:
+                segment_stats = baseline.get("segments") or {}
+                print("  窗口内各段都满足阈值：这一点附近复现不出报警，"
+                      "建议核对现场点号或控制器报警类型。")
+                print(f"  但整条链另有 {segment_stats.get('j3_crossings', 0)} 处 "
+                      f"J3 穿零 / {segment_stats.get('j5_crossings', 0)} 处 "
+                      f"J5 穿零，接着做整体搜索。")
+                bad = [f"GP{s['from'] + 1}->GP{s['to'] + 1}"
+                       for s in (segment_stats.get("segments") or [])
+                       if s["j3_crosses_zero"] or s["j5_crosses_zero"]]
+                if bad:
+                    print("  穿零段：" + "、".join(bad[:12])
+                          + ("…" if len(bad) > 12 else ""))
+        else:
+            repair_index = (target_index if reported is not None
+                            and _profile_fails(reported)
+                            else min(offenders,
+                                     key=lambda p: min(p["j3_abs_min"],
+                                                       p["j5_abs_min"]))["index"])
+            if repair_index != target_index:
+                print(f"  报告段本身安全，改修最危险的 "
+                      f"GP{repair_index + 1}->GP{repair_index + 2}")
+
+        # 先试局部修复：只换端点姿态，不动网格与位置
+        repaired_steps, changed = repair_segment(
+            rbt, baseline["waypoints"], baseline["steps"],
+            repair_index if offenders else -1,
+            order=order, extrinsic=extrinsic, perturb_deg=args.perturb_deg,
+            seed=args.seed, attempts=args.repair_attempts,
+            j5_min=j5_eff, j3_min=j3_eff,
+            seg_samples=args.seg_samples_final)
+        if changed is not None:
+            local_change = changed
+            print(f"  局部修复成功：重采第 {changed['index'] + 1} 点"
+                  f"（GP{changed['index'] + 1}）的姿态，"
+                  f"delta_rpy={[round(v, 2) for v in changed['delta_rpy']]}")
+            repaired_eval = _evaluate(
+                base, args.j5_attempts, steps_override=repaired_steps,
+                waypoints_override=baseline["waypoints"])
+            if repaired_eval["ok"]:
+                baseline = repaired_eval
+                print("  全链复核通过（局部修复后整计划安全）")
+            else:
+                print("  局部修复后全链仍不满足：" +
+                      "；".join(repaired_eval["reasons"][:2]))
+                local_change = None
+        elif offenders:
+            print("  局部修复未成功（换端点姿态解决不了），转整体挪箱")
     if baseline["ok"]:
         print("原域已满足全部约束，无需修改。")
         chosen, chosen_eval = base, baseline

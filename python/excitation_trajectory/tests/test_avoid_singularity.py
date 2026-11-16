@@ -19,6 +19,8 @@ from excitation_trajectory.aabb_snake_scan import (
 )
 from excitation_trajectory.avoid_singularity import (
     _describe_change,
+    repair_segment,
+    segment_profiles,
     change_cost,
     classify_singularity,
     domain_center,
@@ -300,6 +302,86 @@ class CartesianSegmentCheckTest(unittest.TestCase):
         second = check_segments_cartesian(rbt, waypoints, steps, samples=9,
                                           order="XYZ", extrinsic=False)
         self.assertEqual(first, second)
+
+
+class SegmentLocateAndRepairTest(unittest.TestCase):
+    """按"已到的点号"定位段，并做只换端点姿态的局部修复。"""
+
+    def _plan(self, bounds=(750, 1300, -600, 600, 270, 940)):
+        from excitation_trajectory.aabb_snake_scan import (
+            _sample_perturbations, plan_waypoints, solve_chain_guarded)
+        rbt = _robot()
+        x0, x1, y0, y1, z0, z1 = bounds
+        waypoints = plan_waypoints(x0, x1, y0, y1, z0, z1, 1, 4, 4,
+                                   (3.0, 73.0, -167.0))
+        _sample_perturbations(waypoints, 0, (20, 20, 35))
+        steps, _ = solve_chain_guarded(
+            rbt, waypoints, [43, -30, -36, 42, -89, -1], j5_min=20.0,
+            attempts=30, seed=0, amplitudes_deg=(20, 20, 35),
+            order="XYZ", extrinsic=False)
+        return rbt, waypoints, steps
+
+    def test_profiles_cover_window_and_report_gp_numbers(self):
+        rbt, waypoints, steps = self._plan()
+        profiles = segment_profiles(rbt, waypoints, steps, 40, window=2,
+                                    order="XYZ", extrinsic=False, samples=9)
+        # window=2 -> 以 40 为中心前后各 2 段，共 5 段
+        self.assertEqual([p["index"] for p in profiles], [38, 39, 40, 41, 42])
+        self.assertEqual(profiles[2]["gp_from"], 41)
+        self.assertEqual(profiles[2]["gp_to"], 42)
+        for profile in profiles:
+            self.assertIsNotNone(profile["j3_abs_min"])
+            self.assertEqual(profile["ik_failures"], 0)
+
+    def test_repair_fixes_a_tampered_segment_without_moving_points(self):
+        """把某点 J3 反号制造穿零，局部修复应只换该点姿态、位置不变。"""
+        import copy
+        rbt, waypoints, steps = self._plan()
+        victim = 20
+        from excitation_trajectory.aabb_snake_scan import ChainStep
+        tampered = list(steps)
+        flipped = list(steps[victim].q)
+        flipped[2] = -flipped[2]
+        tampered[victim] = ChainStep(index=steps[victim].index, q=flipped,
+                                     n_sols=steps[victim].n_sols,
+                                     config=steps[victim].config,
+                                     dq_l2=steps[victim].dq_l2,
+                                     dq_l1=steps[victim].dq_l1, ok=True)
+
+        before = check_segments_cartesian(rbt, waypoints, tampered, samples=21,
+                                          order="XYZ", extrinsic=False)
+        self.assertGreater(before["j3_crossings"], 0, "人为反号应造成穿零")
+
+        positions = [wp.pos for wp in waypoints]
+        fixed, changed = repair_segment(
+            rbt, waypoints, tampered, victim, order="XYZ", extrinsic=False,
+            perturb_deg=(20, 20, 35), seed=0, attempts=80,
+            j5_min=20.0, j3_min=10.0, seg_samples=21)
+        self.assertIsNotNone(changed, "应能通过重采该点姿态修好")
+        after = check_segments_cartesian(rbt, waypoints, fixed, samples=21,
+                                         order="XYZ", extrinsic=False)
+        self.assertEqual(after["j3_crossings"], 0)
+        self.assertEqual([wp.pos for wp in waypoints], positions,
+                         "局部修复不得移动任何点")
+        self.assertEqual(len(fixed), len(steps))
+
+    def test_repair_returns_none_when_nothing_helps(self):
+        """阈值抬到不可能满足时，应老实返回 None 而不是假装成功。"""
+        from excitation_trajectory.aabb_snake_scan import ChainStep
+        rbt, waypoints, steps = self._plan()
+        tampered = list(steps)
+        flipped = list(steps[10].q)
+        flipped[2] = -flipped[2]
+        tampered[10] = ChainStep(index=steps[10].index, q=flipped,
+                                 n_sols=steps[10].n_sols,
+                                 config=steps[10].config,
+                                 dq_l2=steps[10].dq_l2,
+                                 dq_l1=steps[10].dq_l1, ok=True)
+        _, changed = repair_segment(
+            rbt, waypoints, tampered, 10, order="XYZ", extrinsic=False,
+            perturb_deg=(20, 20, 35), seed=0, attempts=3,
+            j5_min=1000.0, j3_min=0.0, seg_samples=9)
+        self.assertIsNone(changed)
 
 
 class EndToEndTest(unittest.TestCase):
