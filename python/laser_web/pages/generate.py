@@ -24,6 +24,7 @@ from nicegui import ui
 from excitation_trajectory import aabb_snake_scan as scan
 
 from .. import core, figures, jobs
+from . import POINT_COUNT_WARN, adopt_running_job, download_button
 from ..ui_state import default_form_values, euler_conventions
 
 #: M2 新增字段的默认值——**不抄数字**，全部问 CLI 的参数解析器要。
@@ -253,7 +254,14 @@ def render() -> None:
                 ui.label("网格").classes("text-grey-7")
                 ui.label(f"{cells}{insert}")
                 ui.label("点数").classes("text-grey-7")
-                ui.label(f"{result['point_count']} 点")
+                over = result["point_count"] > POINT_COUNT_WARN
+                ui.label(f"{result['point_count']} 点").classes(
+                    "text-negative" if over else "")
+                if over:
+                    ui.label(f"超过 {POINT_COUNT_WARN} 点：规划与解算会占满内存，"
+                             f"且取消要等当前阶段结束。请减少份数或改用"
+                             f"目标点数。").classes(
+                        "text-negative text-caption whitespace-pre-wrap")
                 ui.label("设计条件数").classes("text-grey-7")
                 ui.label(_fmt(result["design_condition"]))
             ui.label(f"欧拉约定 {result['convention']}").classes("text-caption")
@@ -548,15 +556,20 @@ def render() -> None:
                 name = artifacts.get(key)
                 if not name:
                     continue
-                path = run_dir / name
-                ui.button(button_label, icon="download",
-                          on_click=lambda target=path, filename=name:
-                          ui.download.file(target, filename)).props("flat dense")
+                download_button(run_dir / name, name, button_label,
+                                      icon="download").props("flat dense")
+
+    def _domains_too_big() -> bool:
+        """当前表单算出来的点数是否超软上限（笔误保护，见 POINT_COUNT_WARN）。"""
+        preview = core.preview_domain(collect())
+        return bool(preview.get("ok")
+                    and preview["point_count"] > POINT_COUNT_WARN)
 
     def set_running(running: bool) -> None:
-        """解算期间禁用两个按钮并显示取消；结束后反过来。"""
+        """解算期间禁用两个按钮并显示取消；结束后按点数上限决定能否再点。"""
+        blocked = (not running) and _domains_too_big()
         for button in (preview_button, solve_button):
-            (button.disable if running else button.enable)()
+            (button.disable if (running or blocked) else button.enable)()
         cancel_button.set_visibility(running)
 
     def poll() -> None:
@@ -646,6 +659,18 @@ def render() -> None:
 
     poll_timer = ui.timer(POLL_INTERVAL, poll, active=False)
     set_running(False)
+
+    # 页面重建（F5 / 切页回来）时接管仍在跑的任务：否则任务不可见、取消不了，
+    # 还会把新提交的任务堵在「排队中」（单消费者队列）。
+    running_job = adopt_running_job(registry, "scan")
+    if running_job is not None:
+        state["job_id"] = running_job.id
+        state["log_cursor"] = 0
+        progress_card.set_visibility(True)
+        set_running(True)
+        stage_label.set_text("接管在跑的任务（上一次页面已关闭）")
+        poll_timer.activate()
+
     result_area()
     switch_domain(defaults["domain_mode"])
     switch_grid(defaults["grid_mode"])

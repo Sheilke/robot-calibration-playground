@@ -97,7 +97,8 @@ def new_run_id(now: datetime | None = None) -> str:
     return f"{stamp}-{suffix}"
 
 
-def prune_runs(root: str | Path | None = None, keep: int = KEEP_RUNS) -> list[Path]:
+def prune_runs(root: str | Path | None = None, keep: int = KEEP_RUNS,
+               exclude=None) -> list[Path]:
     """删掉最旧的运行目录，使 ``runs/`` 下不超过 ``keep`` 个。
 
     排序键是 ``(目录 mtime, 目录名)``：同一秒内创建的目录按名字（即时间戳 +
@@ -106,14 +107,18 @@ def prune_runs(root: str | Path | None = None, keep: int = KEEP_RUNS) -> list[Pa
     Args:
         root: 产物根目录（``None`` 走 :func:`runs_root`）。
         keep: 保留个数。
+        exclude: 不许删的目录（绝对路径或名字）；调度器会把**还没结束的任务**
+            的目录传进来，否则长任务算完写盘时目录已被别人清掉。
 
     Returns:
-        list[Path]: 被删掉的目录（从最旧到次新）；目录不存在时返回空列表。
+        list[Path]: 被删掉的目录（从最旧到次新）；目录不存e时返回空列表。
     """
     base = runs_root(root)
     if not base.is_dir():
         return []
-    directories = [path for path in base.iterdir() if path.is_dir()]
+    keep_paths = {str(Path(item).resolve()) for item in (exclude or ())}
+    directories = [path for path in base.iterdir()
+                   if path.is_dir() and str(path.resolve()) not in keep_paths]
     if len(directories) <= max(0, int(keep)):
         return []
     directories.sort(key=lambda path: (path.stat().st_mtime, path.name))
@@ -125,13 +130,14 @@ def prune_runs(root: str | Path | None = None, keep: int = KEEP_RUNS) -> list[Pa
 
 
 def make_run_dir(root: str | Path | None = None, run_id: str | None = None,
-                 keep: int = KEEP_RUNS) -> tuple[str, Path]:
+                 keep: int = KEEP_RUNS, exclude=None) -> tuple[str, Path]:
     """新建一个运行目录并执行保留策略。
 
     Args:
         root: 产物根目录（``None`` 走 :func:`runs_root`）。
         run_id: 指定 id；``None`` 则用 :func:`new_run_id` 生成（重名时重试）。
         keep: ``runs/`` 下保留的目录个数。
+        exclude: 不参与淘汰的目录（活跃任务的目录）。
 
     Returns:
         ``(run_id, run_dir)``：目录已创建（产物根目录会一并创建）。
@@ -152,7 +158,7 @@ def make_run_dir(root: str | Path | None = None, run_id: str | None = None,
             candidate = None   # 随机后缀撞车：换一个再试
             continue
         break
-    prune_runs(base, keep)
+    prune_runs(base, keep, exclude)
     return candidate, run_dir
 
 
@@ -289,6 +295,12 @@ class JobRegistry:
         self._queue: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
 
+    def active_dirs(self) -> set[str]:
+        """还没结束的任务的目录（清理时必须跳过，否则会删掉正在写的产物）。"""
+        with self._lock:
+            return {str(job.run_dir.resolve()) for job in self._jobs.values()
+                    if job.state not in TERMINAL_STATES}
+
     # ------------------------------------------------------------------ 提交
     def submit(self, kind: str, fn: Callable[[Job], Any]) -> str:
         """登记一条任务并返回 id（不阻塞、不执行）。
@@ -300,7 +312,8 @@ class JobRegistry:
         Returns:
             str: 任务 id（同时也是 ``runs/<id>/`` 的目录名）。
         """
-        run_id, run_dir = make_run_dir(self.root, keep=self.keep)
+        run_id, run_dir = make_run_dir(self.root, keep=self.keep,
+                                       exclude=self.active_dirs())
         job = Job(id=run_id, kind=str(kind), state="pending",
                   progress={"stage": "排队", "index": 0, "total": 0,
                             "fraction": 0.0},
@@ -311,6 +324,11 @@ class JobRegistry:
         self._ensure_worker()
         self._queue.put((run_id, fn))
         return run_id
+
+    def clean(self, keep: int | None = None) -> list[Path]:
+        """按保留策略清理，跳过还没结束的任务目录。"""
+        return prune_runs(self.root, self.keep if keep is None else int(keep),
+                          exclude=self.active_dirs())
 
     # ------------------------------------------------------------------ 查询
     def get(self, job_id: str) -> Job | None:
@@ -341,11 +359,14 @@ class JobRegistry:
         Returns:
             bool: 是否受理（任务不存在或已结束返回 ``False``）。
         """
-        job = self.get(job_id)
-        if job is None or job.state in TERMINAL_STATES:
-            return False
-        job.cancel.set()
-        return True
+        with self._lock:
+            job = self._jobs.get(job_id)
+            # 读状态与置标志必须在同一把锁里：否则 worker 可能刚把 state 写成
+            # done，这边仍看到 running 并返回 True，用户以为取消了但结果照旧落盘。
+            if job is None or job.state in TERMINAL_STATES:
+                return False
+            job.cancel.set()
+            return True
 
     # -------------------------------------------------------------- 工作线程
     def shutdown(self, timeout: float = 5.0) -> None:

@@ -250,3 +250,65 @@ class RunScanFailureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuardParityTest(unittest.TestCase):
+    """守卫真的重采时，scan.json 仍必须与 CLI 逐字段一致。
+
+    这是评审抓到的回归点：早先 ``evaluate_conditioning`` 放在 ``solve_chain_guarded``
+    之后，拿的是**重采后**的位姿，于是 ``conditioning.realized`` 与 CLI 不同；守卫
+    没触发时（例如站点参数）恰好一致，所以人工核对发现不了。
+    """
+
+    PARAMS = {
+        "robot": "data/configs/hyundai_general6s.urdf",
+        "point_min": [900, -100, 500], "point_max": [1100, 100, 700],
+        "rpy": [3, 73, -167], "euler": "xyz-intrinsic",
+        "perturb_deg": [20, 20, 35], "target_count": 8,
+        "seg_mode": "cartesian", "seg_samples": 11,
+        "q_seed": [43, -30, -36, 42, -89, -1],
+        "j5_min": 88, "j3_min": 0, "seg_min": 5, "cond_max": 99, "seed": 0,
+    }
+
+    def test_scan_matches_cli_while_guard_resamples(self):
+        import json
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        result = core.run_scan(dict(self.PARAMS))
+        self.assertTrue(result["ok"], result)
+        web = json.loads((Path(result["run_dir"]) / "scan.json").read_text("utf-8"))
+        self.assertGreater(len(web["singularity_guard"]["resampled"]), 0,
+                           "本用例必须真的触发重采，否则测不到回归")
+
+        cli_out = Path("/tmp") / "laser_web_guard_parity.json"
+        subprocess.run(
+            [sys.executable, "-m", "excitation_trajectory.aabb_snake_scan",
+             "900", "1100", "-100", "100", "500", "700",
+             "--target-count", "8",
+             "--urdf", "data/configs/hyundai_general6s.urdf",
+             "--rpy", "3", "73", "-167", "--euler", "xyz-intrinsic",
+             "--perturb-deg", "20", "20", "35", "--j5-min", "88",
+             "--q-seed", "43,-30,-36,42,-89,-1", "--seed", "0",
+             "--cond-max", "99", "--seg-mode", "cartesian",
+             "--seg-samples", "11",
+             "--out", str(cli_out), "--plot", "/tmp/laser_web_guard_parity.png"],
+            check=True, capture_output=True)
+        cli = json.loads(cli_out.read_text("utf-8"))
+        for key in ("conditioning", "perturbed_ik", "singularity_guard",
+                    "segment_check", "waypoints"):
+            self.assertEqual(web[key], cli[key], f"{key} 与 CLI 不一致")
+        # meta 除 aabb_source 外应完全一致：界面用两点式输入，CLI 这条命令用
+        # 六个数，如实记录来源是设计如此（两者归一化后的边界相同）。
+        web_meta = dict(web["meta"], aabb_source=None)
+        cli_meta = dict(cli["meta"], aabb_source=None)
+        self.assertEqual(web_meta, cli_meta, "meta 与 CLI 不一致")
+        self.assertEqual(web["meta"]["aabb_source"], "points")
+
+    def test_feasible_is_false_when_guard_violations_remain(self):
+        """有守卫违规时不能报"可行"——判据要与 evaluate_domain 一致。"""
+        result = core.run_scan(dict(self.PARAMS))
+        self.assertTrue(result["ok"], result)
+        self.assertGreater(result["stats"]["guard_violations"], 0)
+        self.assertFalse(result["stats"]["feasible"])

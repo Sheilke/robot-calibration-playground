@@ -52,6 +52,14 @@ class _FormError(Exception):
     """表单参数非法；异常消息就是 CLI ``parser.error`` 收到的报错原文。"""
 
 
+def _resolve_model_path(path) -> str:
+    """模型路径按仓库根解析，避免服务从别的目录启动时 ``FileNotFoundError``。"""
+    candidate = Path(str(path)).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+    return str((_REPO_ROOT / candidate).resolve())
+
+
 def _as_float_list(values, length: int, name: str) -> list[float]:
     """把表单里的序列转成 ``length`` 个浮点数（不是校验规则，只是类型归一）。
 
@@ -657,9 +665,15 @@ def _summary_stats(args: argparse.Namespace, conditioning_json, chain,
     seg_j3_min = None if segment_report is None else segment_report["j3_abs_min"]
     j3_crossings = 0 if segment_report is None else segment_report["j3_crossings"]
     j5_crossings = 0 if segment_report is None else segment_report["j5_crossings"]
+    violations = 0 if guard_report is None else len(
+        guard_report.get("violations") or [])
     feasible = None
     if not skip_ik:
+        # 判据必须与 avoid_singularity.evaluate_domain 一致：守卫重采后仍低于
+        # 阈值的点、段内裕度不足、段内穿零、条件数被拒，任一条都算不可行。
+        # 早先只看「有解 + 无穿零 + 条件数」，会出现卡片绿"可行"而算法判不可行。
         feasible = (bool(ok_steps) and len(ok_steps) == len(chain)
+                    and violations == 0
                     and j3_crossings == 0 and j5_crossings == 0
                     and conditioning_json["status"] != "rejected")
     return {"solved": len(ok_steps), "total": len(chain),
@@ -668,7 +682,7 @@ def _summary_stats(args: argparse.Namespace, conditioning_json, chain,
             "design_cond": design, "post_ik_cond": post_ik_cond,
             "seg_j5_min": seg_j5_min, "seg_j3_min": seg_j3_min,
             "j3_crossings": j3_crossings, "j5_crossings": j5_crossings,
-            "feasible": feasible}
+            "guard_violations": violations, "feasible": feasible}
 
 
 def _execute(args: argparse.Namespace, q_seed: list[float], job,
@@ -687,7 +701,7 @@ def _execute(args: argparse.Namespace, q_seed: list[float], job,
     rpy_ref = tuple(float(value) for value in args.rpy)
     skip_ik = bool(args.skip_ik)
 
-    rbt = Nexbot6R(args.urdf)
+    rbt = Nexbot6R(_resolve_model_path(args.urdf))
 
     # ---- 1. 路点生成 ----
     _check_cancel(job)
@@ -714,6 +728,14 @@ def _execute(args: argparse.Namespace, q_seed: list[float], job,
             scan._sample_perturbations(waypoints, args.seed, args.perturb_deg)
             progress(STAGES[1], 1, 1)
             poses = _poses(lambda waypoint: waypoint.rpy_pert)
+
+    # ---- 2.5 姿态激励条件数（设计值 + 实测值） ----
+    # CLI 的顺序是「采样 -> evaluate_conditioning -> 链式 IK」，这里的 realized
+    # 必须用**重采之前**的位姿；守卫重采后再算会得到另一批 poses，scan.json 的
+    # conditioning.realized 就与 CLI 不一致（守卫没重采时恰好看不出来）。
+    _check_cancel(job)
+    progress(STAGES[4], 0, 2)
+    conditioning = scan.evaluate_conditioning(args, waypoints, rpy_ref, poses)
 
     # ---- 3. 链式 IK 选解（带奇异守卫） ----
     chain: list = []
@@ -748,10 +770,8 @@ def _execute(args: argparse.Namespace, q_seed: list[float], job,
             segment_report = scan.check_segments(chain)
         progress(STAGES[3], segment_total, segment_total)
 
-    # ---- 5. 姿态激励条件数（设计值 + 实测值 + IK 后实测值） ----
+    # ---- 5. IK 后的实测条件数（只用成功子集，CLI 同样只报告） ----
     _check_cancel(job)
-    progress(STAGES[4], 0, 2)
-    conditioning = scan.evaluate_conditioning(args, waypoints, rpy_ref, poses)
     ok_poses = [poses[step.index] for step in chain if step.ok]
     if ok_poses:
         info = scan.pose_condition_number(
@@ -1070,7 +1090,7 @@ def _repair_context(args: argparse.Namespace, q_seed: list[float]) -> dict:
     """
     from robot_model.nexbot_ik import Nexbot6R
 
-    rbt = Nexbot6R(args.urdf)
+    rbt = Nexbot6R(_resolve_model_path(args.urdf))
     order, extrinsic = scan._order_of(args), scan._extrinsic_of(args)
     bounds = [float(args.x_min), float(args.x_max),
               float(args.y_min), float(args.y_max),
@@ -1146,6 +1166,12 @@ def _window_profiles(ctx: dict, baseline: dict, target_index: int,
         ``(profiles, offenders)``：``offenders`` 是 ``profiles`` 里真的越界的
         那几段（CLI 用它决定修哪一段）。
     """
+    # 原域可能因「位置禁区」在 evaluate_domain 里早退（steps/segments 为 None），
+    # 此时没有任何链可做段剖面——直接返回空，让 verdict/warnings 讲清原因，
+    # 而不是抛 "NoneType has no len()" 这种把真实原因埋掉的类型错误。
+    if not baseline.get("steps") or not baseline.get("segments"):
+        return [], []
+
     profiles = [dict(profile) for profile in avoid.segment_profiles(
         ctx["rbt"], baseline["waypoints"], baseline["steps"], target_index,
         window=args.segment_window, order=ctx["order"],
@@ -1363,8 +1389,12 @@ def _json_safe(value):
 def _repair_report(args: argparse.Namespace, ctx: dict, baseline: dict,
                    profiles: list[dict], offenders: list[dict],
                    search_log: list[dict], chosen, chosen_eval,
-                   repair: dict) -> dict:
-    """``repair.json`` 的内容（骨架对齐 CLI ``write_report``）。"""
+                   repair: dict, succeeded: bool = True) -> dict:
+    """``repair.json`` 的内容（骨架对齐 CLI ``write_report``）。
+
+    ``succeeded=False`` 时 ``decision`` 写 ``null``——与 CLI 失败时的报告一致，
+    否则读者会把"原域"当成最终决定。
+    """
     base = ctx["base"]
     bounds = list(base["bounds"])
     return _json_safe({
@@ -1405,7 +1435,7 @@ def _repair_report(args: argparse.Namespace, ctx: dict, baseline: dict,
                      "ok": bool(baseline["ok"]),
                      "reasons": list(baseline["reasons"])},
         "search": search_log,
-        "decision": {"label": chosen["label"],
+        "decision": None if not succeeded else {"label": chosen["label"],
                      "tier": int(chosen["tier"]),
                      "bounds": [round(float(v), 3) for v in chosen["bounds"]],
                      "rpy": [round(float(v), 3) for v in chosen["rpy"]],
@@ -1533,7 +1563,8 @@ def _execute_repair(args: argparse.Namespace, q_seed: list[float],
             report_path = run_dir / ARTIFACT_REPAIR
             report_path.write_text(json.dumps(
                 _repair_report(args, ctx, baseline, profiles, offenders,
-                               search_log, chosen, chosen_eval, repair),
+                               search_log, chosen, chosen_eval, repair,
+                               succeeded=False),
                 ensure_ascii=False, indent=2, allow_nan=False),
                 encoding="utf-8")
             return {"ok": False,
@@ -2257,5 +2288,8 @@ def clean_runs(keep: int = jobs.KEEP_RUNS, root=None) -> dict:
         dict: ``{"removed": [被删目录的绝对路径, ...], "kept": 剩余目录数}``。
     """
     base = jobs.runs_root(root)
-    removed = [str(path) for path in jobs.prune_runs(base, max(0, int(keep)))]
+    # 跳过活跃任务目录：工具页的"清理"可能点在一个任务正在跑的时候
+    active = jobs.get_registry().active_dirs()
+    removed = [str(path) for path in
+               jobs.prune_runs(base, max(0, int(keep)), exclude=active)]
     return {"removed": removed, "kept": len(list_runs(base))}

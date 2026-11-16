@@ -952,10 +952,16 @@ def run(args) -> int:
             print(f"错误: --stopped-at 需在 1..{args.target_count - 1} 之间"
                   f"（它表示已走到的点，后面还得有一点）", file=sys.stderr)
             return 2
-        profiles = segment_profiles(
-            rbt, baseline["waypoints"], baseline["steps"], target_index,
-            window=args.segment_window, order=order, extrinsic=extrinsic,
-            samples=args.seg_samples_final)
+        if not baseline.get("steps") or not baseline.get("segments"):
+            # 原域因位置禁区早退时没有链可分段，直接说明原因（否则 len(None) 崩）
+            print(f"  原域在生成链之前就判不可行，跳过段定位："
+                  f"{'；'.join(baseline['reasons'][:2])}")
+            profiles = []
+        else:
+            profiles = segment_profiles(
+                rbt, baseline["waypoints"], baseline["steps"], target_index,
+                window=args.segment_window, order=order, extrinsic=extrinsic,
+                samples=args.seg_samples_final)
         segment_diagnostics = {"reported_gp": int(args.stopped_at),
                                "window": int(args.segment_window),
                                "profiles": profiles}

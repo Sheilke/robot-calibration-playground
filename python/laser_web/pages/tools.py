@@ -25,6 +25,7 @@ from datetime import datetime
 from nicegui import ui
 
 from .. import core, jobs
+from . import download_button
 
 #: GP 导出表单的默认值（与 ``export_gp`` 的 CLI 同源，见 ``core.gp_defaults``）。
 _GP_DEFAULTS = core.gp_defaults()
@@ -64,10 +65,8 @@ def _artifact_marks(row: dict) -> str:
 
 
 def _download_button(path: str, filename: str, label: str | None = None) -> None:
-    """一个下载按钮（``ui.download.file`` 是 NiceGUI 4.0 的写法）。"""
-    ui.button(label or f"下载 {filename}", icon="download",
-              on_click=lambda target=path, name=filename:
-              ui.download.file(target, name)).props("unelevated")
+    """下载按钮：统一走 ``pages.download_button``（文件缺失时给提示）。"""
+    download_button(path, filename, label).props("unelevated")
 
 
 def render() -> None:

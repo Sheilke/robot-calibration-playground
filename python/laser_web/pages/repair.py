@@ -28,7 +28,7 @@ from excitation_trajectory import aabb_snake_scan as scan
 
 from .. import core, jobs
 from ..ui_state import default_form_values, euler_conventions
-from . import generate
+from . import adopt_running_job, download_button, generate
 
 #: 扫描页 CLI 的默认值（采样域/守卫那部分两页同源）。
 _CLI_DEFAULTS = scan.build_arg_parser().parse_args([])
@@ -166,8 +166,11 @@ def _bound_rows(repair: dict) -> list[dict]:
 def _log_rows(repair: dict) -> list[dict]:
     """候选评估记录（label / ok / score / reasons；失败行标红）。"""
     rows = []
-    for entry in repair.get("log") or []:
+    # seq 是行 key：_refine 会产出多条同名 label（同一候选不同 factor），
+    # 拿 label 当 key 会撞车，导致 Vue 复用/丢失行。
+    for seq, entry in enumerate(repair.get("log") or []):
         rows.append({
+            "seq": seq,
             "phase": entry.get("phase") or "原域",
             "label": entry.get("label") or "—",
             "ok": "✓" if entry.get("ok") else "✗",
@@ -756,7 +759,7 @@ def render() -> None:
                               "sortable": True},
                              {"name": "reasons", "label": "失败原因（前两条）",
                               "field": "reasons", "align": "left"}],
-                    rows=rows, row_key="label",
+                    rows=rows, row_key="seq",
                     pagination={"rowsPerPage": 15}).classes("w-full text-caption")
                 table.add_slot("body-row", _LOG_ROW_SLOT)
 
@@ -849,11 +852,8 @@ def render() -> None:
                 name = artifacts.get(key)
                 if not name:
                     continue
-                path = run_dir / name
-                ui.button(label, icon="download",
-                          on_click=lambda target=path, filename=name:
-                          ui.download.file(target, filename)).props(
-                    "flat dense")
+                download_button(run_dir / name, name, label,
+                                icon="download").props("flat dense")
 
     def set_running(running: bool) -> None:
         """修复期间禁用按钮并显示取消；结束后反过来。"""
@@ -963,6 +963,16 @@ def render() -> None:
 
     poll_timer = ui.timer(POLL_INTERVAL, poll, active=False)
     set_running(False)
+
+    # 修复要十几秒：页面重建后接管在跑的任务，否则既看不到也取消不了
+    running_job = adopt_running_job(registry, "repair")
+    if running_job is not None:
+        state["job_id"] = running_job.id
+        state["log_cursor"] = 0
+        stage_label.set_text("接管在跑的任务（上一次页面已关闭）")
+        set_running(True)
+        poll_timer.activate()
+
     result_area()
     switch_domain(defaults["domain_mode"])
     switch_grid(defaults["grid_mode"])

@@ -229,3 +229,35 @@ class RunDirTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PruneKeepsActiveRunsTest(unittest.TestCase):
+    """清理不能删掉还在跑的任务目录（评审抓到的回归点）。"""
+
+    def test_prune_skips_active_job_directory(self):
+        import threading
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = jobs.JobRegistry(tmp, keep=1)
+            started = threading.Event()
+
+            def slow(job):
+                started.set()
+                time.sleep(0.4)
+                (job.run_dir / "scan.json").write_text("{}")
+                return {"ok": True}
+
+            first = registry.submit("scan", slow)
+            self.assertTrue(started.wait(2.0))
+            first_dir = registry.get(first).run_dir
+
+            # 再提交两个任务：keep=1，若不做保护会把第一个（最旧）删掉
+            for _ in range(2):
+                registry.submit("scan", lambda job: {"ok": True})
+            time.sleep(0.9)
+
+            self.assertTrue(first_dir.is_dir(),
+                            "正在跑的任务目录被 prune 删掉了")
+            self.assertTrue((first_dir / "scan.json").exists())
+            self.assertEqual(registry.get(first).state, "done")
