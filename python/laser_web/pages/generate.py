@@ -24,7 +24,8 @@ from nicegui import ui
 from excitation_trajectory import aabb_snake_scan as scan
 
 from .. import core, figures, jobs
-from . import POINT_COUNT_WARN, adopt_running_job, download_button
+from . import (POINT_COUNT_WARN, adopt_running_job, cancelled_result,
+               download_button)
 from ..ui_state import default_form_values, euler_conventions
 
 #: M2 新增字段的默认值——**不抄数字**，全部问 CLI 的参数解析器要。
@@ -63,10 +64,11 @@ _WAYPOINT_COLUMNS = (
 _PREVIEW_COLUMNS = tuple(column for column in _WAYPOINT_COLUMNS
                          if column[0] in ("gp", "x", "y", "z"))
 #: 失败行标红的 Vue 模板（Quasar ``body-row`` 槽，保留排序与分页）。
+#: 空单元格画 ``—``：失败路点没有关节角，留白看着像“值太小被吃掉了”。
 _FAILED_ROW_SLOT = """
 <q-tr :props="props" :class="props.row.failed ? 'bg-red-1 text-negative' : ''">
     <q-td v-for="col in props.cols" :key="col.name" :props="props">
-        {{ col.value }}
+        {{ col.value === null || col.value === undefined ? '—' : col.value }}
     </q-td>
 </q-tr>
 """
@@ -97,7 +99,12 @@ def _columns(spec) -> list[dict]:
 
 
 def _waypoint_rows(result: dict) -> list[dict]:
-    """``run_scan`` 的路点行 -> 表格行（数值保留 1~3 位，失败行标红）。"""
+    """``run_scan`` 的路点行 -> 表格行（数值保留 1~3 位，失败行标红）。
+
+    数值**保持数字类型**（点表头排序要按大小排，变成字符串就成字典序了）；
+    失败路点的关节角是 ``None``，由 ``_FAILED_ROW_SLOT`` 画成 ``—``——与
+    :func:`_fmt` 的约定一致，但不在 Python 里转字符串。
+    """
     preview = bool(result["meta"].get("skip_ik"))
     rows = []
     for row in result["waypoints"]:
@@ -118,6 +125,19 @@ def _waypoint_rows(result: dict) -> list[dict]:
         table_row["dq_l2"] = _round(row["dq_l2"], 2)
         rows.append(table_row)
     return rows
+
+
+def _result_mode(result) -> str:
+    """结果区该画哪种卡片：``empty`` / ``cancelled`` / ``failed`` / ``ok``。
+
+    取消**不是**失败：它是现场工程师主动点的，用灰色中性卡片而不是红字，
+    否则看着像算法炸了（评审提的“取消被渲染成失败”）。
+    """
+    if result is None:
+        return "empty"
+    if result.get("cancelled"):
+        return "cancelled"
+    return "ok" if result.get("ok") else "failed"
 
 
 def _segment_rows(result: dict) -> list[dict]:
@@ -173,7 +193,7 @@ def render() -> None:
     fields = {}      # 表单控件（ui.number / ui.select / ui.toggle / ui.input）
     boxes = {}       # 需要整块显隐的容器（两点/六数、凑数/手填）
     state = {"job_id": None, "log_cursor": 0, "result": None,
-             "color_by": "order"}
+             "color_by": "order", "preview": None}
     registry = jobs.get_registry()
 
     def collect() -> dict:
@@ -234,10 +254,24 @@ def render() -> None:
         boxes["explicit"].set_visibility(mode == "explicit")
         preview_card.refresh()
 
+    def _preview() -> dict:
+        """当前表单的预览结果（``preview_card`` 与点数守卫共用，按参数缓存）。
+
+        ``core.preview_domain`` 走 ``_validated_namespace``，后者用
+        ``redirect_stdout`` 收 CLI 的提示行——那是**进程级**的副作用：任务在
+        跑的时候每调一次，都可能把工作线程这一瞬间的 ``print`` 吞进临时
+        ``StringIO``（日志少一行）。所以只在参数变了才重新算，不每次重算。
+        """
+        params = collect()
+        cached = state.get("preview")
+        if cached is None or cached[0] != params:
+            state["preview"] = (params, core.preview_domain(params))
+        return state["preview"][1]
+
     @ui.refreshable
     def preview_card() -> None:
         """预览卡片：体积 / 网格 / 点数 / 设计条件数，或一行红字报错。"""
-        result = core.preview_domain(collect())
+        result = _preview()
         with ui.card().classes("w-full gap-1"):
             ui.label("预览（不跑 IK）").classes("text-subtitle1")
             if not result["ok"]:
@@ -435,13 +469,21 @@ def render() -> None:
     def result_area() -> None:
         """结果区：统计卡 / 3D 图 / 路点表 / 段诊断 / 导出。"""
         result = state["result"]
-        if result is None:
+        mode = _result_mode(result)
+        if mode == "empty":
             with ui.card().classes("w-full"):
                 ui.label("还没有结果").classes("text-subtitle1")
                 ui.label("点「生成并解算」跑一次；只想看路径就点「预览路点」。"
                          ).classes("text-caption text-grey-7")
             return
-        if not result.get("ok"):
+        if mode == "cancelled":
+            with ui.card().classes("w-full bg-grey-2"):
+                ui.label("已取消").classes("text-subtitle1 text-grey-8")
+                ui.label("任务在当前阶段末尾停止：没来得及落盘的运行目录已删掉，"
+                         "已经写出 scan.json 的目录会保留。").classes(
+                    "text-caption text-grey-7 whitespace-pre-wrap")
+            return
+        if mode == "failed":
             with ui.card().classes("w-full"):
                 ui.label("失败").classes("text-subtitle1 text-negative")
                 ui.label(str(result.get("error") or "未知错误")).classes(
@@ -557,11 +599,11 @@ def render() -> None:
                 if not name:
                     continue
                 download_button(run_dir / name, name, button_label,
-                                      icon="download").props("flat dense")
+                                icon="download").props("flat dense")
 
     def _domains_too_big() -> bool:
         """当前表单算出来的点数是否超软上限（笔误保护，见 POINT_COUNT_WARN）。"""
-        preview = core.preview_domain(collect())
+        preview = _preview()
         return bool(preview.get("ok")
                     and preview["point_count"] > POINT_COUNT_WARN)
 
@@ -604,8 +646,7 @@ def render() -> None:
             stage_label.set_text("完成")
             ui.notify("解算完成", type="positive")
         elif snapshot["state"] == "cancelled":
-            state["result"] = {"ok": False, "error": "任务已取消",
-                              "warnings": []}
+            state["result"] = cancelled_result()
             stage_label.set_text("已取消")
             ui.notify("任务已取消", type="warning")
         else:
@@ -620,6 +661,11 @@ def render() -> None:
         """提交一次解算（``extra`` 决定走完整解算还是路点预览）。"""
         if state["job_id"] is not None:
             ui.notify("已有任务在跑，先等它结束或点取消", type="warning")
+            return
+        # 硬守卫：即使按钮因参数改变而没来得及重新禁用，也不放过超限提交
+        if _domains_too_big():
+            ui.notify(f"点数超过 {POINT_COUNT_WARN}：请减少份数或改用目标点数",
+                      type="warning")
             return
         params = collect()
         params.update(extra)

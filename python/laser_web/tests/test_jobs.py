@@ -10,11 +10,14 @@
 2. 任务内部抛异常 -> ``failed`` + ``error`` 有内容（不冒到调用方）；
 3. ``request_cancel`` -> ``cancelled``（假任务自己看标志收工）；
 4. 日志环形缓冲不超过 :data:`jobs.LOG_LIMIT` 行，且能按游标增量取；
-5. ``runs/`` 超过 50 个时最旧的被删掉（直接造目录，不真跑 50 次）。
+5. ``runs/`` 超过 50 个时最旧的被删掉（直接造目录，不真跑 50 次）；
+6. 收尾修复：``_JobStream`` 并发写不丢行、终态任务有上限、取消后删
+   半成品运行目录。
 """
 
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -261,3 +264,188 @@ class PruneKeepsActiveRunsTest(unittest.TestCase):
                             "正在跑的任务目录被 prune 删掉了")
             self.assertTrue((first_dir / "scan.json").exists())
             self.assertEqual(registry.get(first).state, "done")
+
+
+def _stream(name: str) -> "jobs._JobStream":
+    """建一个挂在裸 :class:`jobs.Job` 上的日志流（不启动工作线程）。"""
+    job = jobs.Job(id=name, kind="scan", state="running", progress={},
+                   log=[], result=None, error=None,
+                   run_dir=Path("/nonexistent"), cancel=threading.Event())
+    return jobs._JobStream(job)
+
+
+class JobStreamConcurrencyTest(unittest.TestCase):
+    """``_JobStream`` 的写入是**多线程并发**的（评审抓到 ``+=`` 缓冲无锁）。
+
+    ``redirect_stdout`` 换的是进程级 ``sys.stdout``，任务线程与其它线程（UI 线程
+    上的 ``core.preview_domain`` 之类）可能同时往里写；``str +=`` 是
+    "读-拼-写"三步，被切线程就会丢字。
+    """
+
+    def test_write_takes_the_stream_lock(self):
+        """锁真的被用上了：占住它，另一条线程的 ``write`` 必须等着。
+
+        这是本类的**确定性**回归钉：原实现是裸的 ``self._buffer += text``，
+        占锁对它没影响，写作线程会先把行追加进去。
+        """
+        stream = _stream("lock")
+        stream._lock.acquire()
+        try:
+            worker = threading.Thread(target=stream.write, args=("占用锁期间\n",))
+            worker.start()
+            worker.join(0.3)
+            self.assertTrue(worker.is_alive(), "write 没拿缓冲锁就写进去了")
+            self.assertEqual(stream._job.log, [])
+        finally:
+            stream._lock.release()
+        worker.join(2.0)
+        self.assertEqual(stream._job.log, ["占用锁期间"])
+
+    def test_concurrent_writes_do_not_lose_or_tear_lines(self):
+        """8 条线程同时写 160 行：一行不丢、一行不残（压力测试）。"""
+        stream = _stream("concurrency")
+        threads, per_thread = 8, 20            # 160 行 < LOG_LIMIT，不会被挤掉
+        barrier = threading.Barrier(threads)
+
+        def writer(tag: int) -> None:
+            barrier.wait()                     # 尽量让 8 条线程同时进 write
+            for index in range(per_thread):
+                stream.write(f"{tag:02d}-{index:03d}-" + "x" * 40 + "\n")
+
+        workers = [threading.Thread(target=writer, args=(tag,))
+                   for tag in range(threads)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        stream.flush()
+
+        job = stream._job
+        expected = {f"{tag:02d}-{index:03d}-" + "x" * 40
+                    for tag in range(threads) for index in range(per_thread)}
+        self.assertEqual(len(job.log), threads * per_thread)
+        self.assertEqual(set(job.log), expected)
+        self.assertEqual(job._log_total, threads * per_thread)
+
+    def test_flush_keeps_partial_line(self):
+        """没换行的尾巴由 ``flush`` 落进缓冲（不会丢到最后一行）。"""
+        stream = _stream("flush")
+        stream.write("没有换行")
+        self.assertEqual(stream._job.log, [])
+        stream.flush()
+        self.assertEqual(stream._job.log, ["没有换行"])
+        stream.flush()                         # 再 flush 一次不该重复追加
+        self.assertEqual(stream._job.log, ["没有换行"])
+
+
+class FinishedJobRetentionTest(JobRegistryTestCase):
+    """登记表只保留最近若干条**已结束**任务，未结束的永不淘汰。"""
+
+    def test_oldest_finished_jobs_are_evicted(self):
+        registry = jobs.JobRegistry(self.root, keep=5, max_finished=2)
+        try:
+            ids = []
+            for _ in range(4):
+                job_id = registry.submit("scan", lambda job: {"ok": True})
+                ids.append(job_id)
+                _wait(registry, job_id)
+            remaining = {job.id for job in registry.jobs()}
+            self.assertNotIn(ids[0], remaining, "最旧的终态任务没被淘汰")
+            self.assertEqual(len(remaining), 3)      # 2 条终态 + 刚提交的
+            self.assertIn(ids[-1], remaining)
+            self.assertIsNone(registry.snapshot(ids[0]))
+        finally:
+            registry.shutdown()
+
+    def test_running_job_is_never_evicted(self):
+        """``max_finished=0``（最激进的淘汰）也不能动未结束的任务。"""
+        registry = jobs.JobRegistry(self.root, keep=5, max_finished=0)
+        try:
+            slow_id = registry.submit("scan",
+                                      lambda job: (time.sleep(0.4),
+                                                   {"ok": True})[1])
+            pending_ids = [registry.submit("scan", lambda job: {"ok": True})
+                           for _ in range(2)]
+            self.assertIsNotNone(registry.get(slow_id))
+            for job_id in pending_ids:
+                _wait(registry, job_id)
+            self.assertIsNotNone(registry.get(slow_id),
+                                 "还在跑的任务被淘汰了")
+            self.assertEqual(registry.get(slow_id).state, "done")
+        finally:
+            registry.shutdown()
+
+
+class CancelCleanupTest(JobRegistryTestCase):
+    """取消后的半成品运行目录要删；已落下 ``scan.json`` 的必须保留。"""
+
+    def test_partial_run_dir_is_removed(self):
+        def task(job):
+            job.set_progress("出图", 1, 1)
+            (job.run_dir / "plot.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            raise jobs.JobCancelled("用户取消")
+
+        job_id = self.registry.submit("scan", task)
+        snapshot = _wait(self.registry, job_id)
+        self.assertEqual(snapshot["state"], "cancelled")
+        self.assertFalse(Path(snapshot["run_dir"]).exists(),
+                         "只有 plot.png 的半成品目录没删掉")
+        self.assertTrue(any("已删除半成品" in line for line in snapshot["log"]))
+
+    def test_complete_run_dir_is_kept(self):
+        def task(job):
+            (job.run_dir / jobs.SCAN_ARTIFACT).write_text(
+                "{}", encoding="utf-8")
+            raise jobs.JobCancelled("取消发生在落盘之后")
+
+        job_id = self.registry.submit("scan", task)
+        snapshot = _wait(self.registry, job_id)
+        self.assertEqual(snapshot["state"], "cancelled")
+        run_dir = Path(snapshot["run_dir"])
+        self.assertTrue((run_dir / jobs.SCAN_ARTIFACT).is_file())
+        self.assertTrue(any("保留完整运行目录" in line for line in snapshot["log"]))
+
+    def test_cancel_after_return_keeps_finished_dir(self):
+        """结果算完但用户已点取消：状态 cancelled，产物完整，目录保留。"""
+
+        def task(job):
+            (job.run_dir / jobs.SCAN_ARTIFACT).write_text(
+                "{}", encoding="utf-8")
+            job.cancel.set()
+            return {"ok": True}
+
+        job_id = self.registry.submit("scan", task)
+        snapshot = _wait(self.registry, job_id)
+        self.assertEqual(snapshot["state"], "cancelled")
+        self.assertIsNone(snapshot["result"])
+        self.assertTrue((Path(snapshot["run_dir"])
+                         / jobs.SCAN_ARTIFACT).is_file())
+
+
+class ArtifactNameTest(unittest.TestCase):
+    """``jobs.SCAN_ARTIFACT`` 必须与 ``core.ARTIFACT_SCAN_JSON`` 同名（防漂移）。"""
+
+    def test_matches_core_constant(self):
+        from laser_web import core
+
+        self.assertEqual(jobs.SCAN_ARTIFACT, core.ARTIFACT_SCAN_JSON)
+
+
+class MakeRunDirKeepTest(unittest.TestCase):
+    """``make_run_dir`` 是"先建目录再 prune"，keep 至少按 1 算——新建的不会被删。"""
+
+    def test_new_directory_survives_prune(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            last = None
+            for _ in range(5):
+                last = jobs.make_run_dir(tmp, keep=1)[1]
+                self.assertTrue(last.is_dir())
+            self.assertTrue(last.is_dir(), "刚建的运行目录被 prune 删了")
+            self.assertEqual([path.name for path in Path(tmp).iterdir()],
+                             [last.name])
+
+    def test_keep_zero_is_clamped_to_one(self):
+        """``keep=0`` 也不会把刚建的删掉（``make_run_dir`` 里 max(1, keep)）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _run_id, run_dir = jobs.make_run_dir(tmp, keep=0)
+            self.assertTrue(run_dir.is_dir())

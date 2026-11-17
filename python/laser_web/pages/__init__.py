@@ -4,8 +4,8 @@
 每个页面模块只暴露一个 ``render()``，由 :mod:`laser_web.app` 放进各自的
 页面容器里；页面只负责“收集参数 -> 调 core -> 渲染”，不出现算法公式。
 
-这里另外放两个三个页面共用的 UI 小工具（下载守卫与任务接管），避免各页
-各写一份、行为不一致。
+这里另外放几个三个页面共用的 UI 小工具（下载守卫、任务接管、取消占位），
+避免各页各写一份、行为不一致。
 """
 
 from __future__ import annotations
@@ -20,6 +20,20 @@ from .. import jobs
 #: 8M 点会在 ``plan_waypoints`` 里直接把内存吃穿（评审实测 xs=200 即 8120601 点），
 #: 而取消只在阶段边界生效，一旦提交就只能等或杀进程。
 POINT_COUNT_WARN = 5000
+
+
+def cancelled_result() -> dict:
+    """取消后的结果占位（两个页面共用，形状与 ``run_scan`` 的失败返回一致）。
+
+    ``cancelled=True`` 是关键：取消是现场工程师主动点的，不是算法出错，页面
+    据此画灰色中性卡片而不是红字"失败"。没有这个键的话，``{"ok": False}``
+    只能被当成失败渲染。
+
+    Returns:
+        dict: ``{"ok": False, "cancelled": True, "error", "warnings"}``。
+    """
+    return {"ok": False, "cancelled": True, "error": "任务已取消",
+            "warnings": []}
 
 
 def download_button(path, filename: str, label: str | None = None, **kwargs):

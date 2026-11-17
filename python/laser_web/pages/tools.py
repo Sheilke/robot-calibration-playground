@@ -34,6 +34,11 @@ _NO_RUN_HINT = "还没有运行记录：先在「生成」页跑一次，或点�
 #: 产物标记的显示顺序（键与 ``core.list_runs`` 的 ``has_*`` 对应）。
 _ARTIFACTS = (("scan", "scan"), ("plot", "plot"), ("joints", "joints"),
               ("repair", "repair"))
+#: 上传文件的大小上限（字节）。真实的模板 / 控制器 JSON 只有几十 KB，8 MB
+#: 已经非常宽松，又能拦住“顺手拖进来一个几百 MB 的日志”把服务端内存吃穿。
+#: ``ui.upload(max_file_size=...)`` 只是浏览器端的 ``max-file-size`` prop，
+#: 服务端不信它，读之前、读完之后各再判一次。
+UPLOAD_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _fmt_size(size_bytes: int) -> str:
@@ -62,6 +67,43 @@ def _artifact_marks(row: dict) -> str:
     """一行产物标记（✓ = 有，✗ = 没有）。"""
     return " ".join(f"{label}{'✓' if row[f'has_{key}'] else '✗'}"
                     for key, label in _ARTIFACTS)
+
+
+def _upload_too_large(size) -> bool:
+    """大小是否超过 :data:`UPLOAD_MAX_BYTES`（``None`` = 服务端没给出大小，不算超）。"""
+    return size is not None and int(size) > UPLOAD_MAX_BYTES
+
+
+async def _read_upload(event, hint, what: str):
+    """读一个上传文件；超限则提示并返回 ``None``（服务端再判一次大小）。
+
+    ``ui.upload(max_file_size=...)`` 只能拦住浏览器端，直接 POST 就能绕过，
+    所以服务端在**读取之前**看声明的 ``size``、**读取之后**再看实际字节数。
+
+    Args:
+        event: ``ui.upload`` 的 ``UploadEventArguments``。
+        hint: 该卡片的状态标签（被拒时改成红字说明）。
+        what: 文件的中文名（拼提示语用）。
+
+    Returns:
+        ``bytes``；文件过大时返回 ``None``，调用方直接 ``return`` 即可。
+    """
+    limit = _fmt_size(UPLOAD_MAX_BYTES)
+
+    def reject() -> None:
+        """提示并标注“没读”，返回 ``None`` 由调用方收摊。"""
+        ui.notify(f"{what}超过 {limit} 上限，已忽略", type="negative")
+        hint.set_text(f"{what}超过 {limit} 上限，未读取。").classes(
+            remove="text-positive", add="text-negative")
+
+    if _upload_too_large(getattr(event.file, "size", None)):
+        reject()
+        return None
+    data = await event.file.read()
+    if _upload_too_large(len(data)):
+        reject()
+        return None
+    return data
 
 
 def _download_button(path: str, filename: str, label: str | None = None) -> None:
@@ -131,6 +173,7 @@ def render() -> None:
         run_hint = ui.label("").classes("text-caption text-grey-7")
         template_upload = ui.upload(
             label="上传 GP 模板（position_R1.json）", auto_upload=True,
+            max_file_size=UPLOAD_MAX_BYTES,
         ).props("accept=.json flat bordered").classes("w-full")
         template_hint = ui.label("尚未上传模板。").classes("text-caption text-grey-7")
         with ui.row().classes("w-full items-center gap-2 flex-wrap"):
@@ -163,7 +206,9 @@ def render() -> None:
 
         async def on_template(event) -> None:
             """收模板文件：内容只留在内存里（模板本身不落地、不修改）。"""
-            data = await event.file.read()
+            data = await _read_upload(event, template_hint, "GP 模板")
+            if data is None:
+                return
             state["template"] = {"name": event.file.name, "bytes": data}
             template_hint.set_text(
                 f"模板：{event.file.name}（{len(data)} 字节，只读引用）"
@@ -207,6 +252,7 @@ def render() -> None:
                  "比对 DH-FK 与 URDF-FK，误差 < 1e-9 才算通过。"
                  ).classes("text-caption text-grey-7")
         json_upload = ui.upload(label="上传控制器 JSON", auto_upload=True,
+                                max_file_size=UPLOAD_MAX_BYTES,
                                 ).props("accept=.json flat bordered").classes("w-full")
         json_hint = ui.label("尚未上传控制器 JSON。").classes(
             "text-caption text-grey-7")
@@ -219,7 +265,9 @@ def render() -> None:
 
         async def on_json(event) -> None:
             """收控制器 JSON：内容留在内存，转换时才落临时目录。"""
-            data = await event.file.read()
+            data = await _read_upload(event, json_hint, "控制器 JSON")
+            if data is None:
+                return
             state["json"] = {"name": event.file.name, "bytes": data}
             json_hint.set_text(
                 f"文件：{event.file.name}（{len(data)} 字节）"

@@ -645,7 +645,8 @@ def _summary_stats(args: argparse.Namespace, conditioning_json, chain,
         dict: ``solved`` / ``total`` / ``switches`` / ``dq_l2_sum`` /
         ``j5_abs_min`` / ``j3_abs_min`` / ``design_cond`` / ``post_ik_cond`` /
         ``seg_j5_min`` / ``seg_j3_min`` / ``j3_crossings`` / ``j5_crossings`` /
-        ``feasible``。
+        ``guard_violations``（守卫重采后仍低于阈值的点数）/ ``feasible``
+        （``skip_ik`` 时为 ``None``，表示「没跑 IK 就没有可行性」）。
     """
     skip_ik = bool(getattr(args, "skip_ik", False))
     ok_steps = [step for step in chain if step.ok]
@@ -689,8 +690,10 @@ def _execute(args: argparse.Namespace, q_seed: list[float], job,
              progress: _StageReporter, warnings: list[str]) -> dict:
     """``run_scan`` 的主体（校验已通过，产物目录在这里建）。
 
-    顺序与设计文档 §8 的 M2 任务项一致：规划路点 -> 采样扰动 -> 链式 IK ->
-    段内检查 -> 条件数 -> 出图 -> 写文件；每两个阶段之间检查一次取消标志。
+    **界面阶段**（``STAGES``）的顺序与设计文档 §8 的 M2 任务项一致：规划路点 ->
+    采样扰动 -> 链式 IK -> 段内检查 -> 条件数 -> 出图 -> 写文件；每两个阶段
+    之间检查一次取消标志。**计算**顺序按 CLI：设计条件数在链式 IK **之前**
+    算（见下方 2.5 的注释），它的阶段名仍在段检查之后上报。
     """
     from robot_model.nexbot_ik import Nexbot6R
 
@@ -733,8 +736,10 @@ def _execute(args: argparse.Namespace, q_seed: list[float], job,
     # CLI 的顺序是「采样 -> evaluate_conditioning -> 链式 IK」，这里的 realized
     # 必须用**重采之前**的位姿；守卫重采后再算会得到另一批 poses，scan.json 的
     # conditioning.realized 就与 CLI 不一致（守卫没重采时恰好看不出来）。
+    # 这一步没有同步的阶段进度：它一毫秒级就完事，而 STAGES[4]（条件数）在
+    # 阶段表里排在段检查之后，此时上报会让进度条先跳到「条件数」再退回
+    # 「解算 IK」。stage 名只用于显示，计算顺序按 CLI。
     _check_cancel(job)
-    progress(STAGES[4], 0, 2)
     conditioning = scan.evaluate_conditioning(args, waypoints, rpy_ref, poses)
 
     # ---- 3. 链式 IK 选解（带奇异守卫） ----
@@ -772,6 +777,7 @@ def _execute(args: argparse.Namespace, q_seed: list[float], job,
 
     # ---- 5. IK 后的实测条件数（只用成功子集，CLI 同样只报告） ----
     _check_cancel(job)
+    progress(STAGES[4], 0, 2)
     ok_poses = [poses[step.index] for step in chain if step.ok]
     if ok_poses:
         info = scan.pose_condition_number(
@@ -1212,7 +1218,16 @@ def _chain_summary(segment_report) -> dict:
 
 def _verdict(baseline: dict, profiles: list[dict], offenders: list[dict],
              target_index, chain: dict) -> str:
-    """一句话结论（四选一，措辞与 CLI 一致；无现场点号时另给一句）。"""
+    """一句话结论（措辞与 CLI 一致；无现场点号时另给一句）。
+
+    四种情形：原域根本没生成链（位置禁区早退） / 整链无越界 / 窗口内无越界 /
+    报告段或窗口内最危险段越界。
+    """
+    if not baseline.get("steps"):
+        # 原域在出链之前就判不可行（典型是位置禁区）。此时没有任何段可定位，
+        # 结论必须直说原因，而不是「窗口内各段都满足阈值」（那就成误导了）。
+        reasons = "；".join(baseline.get("reasons") or []) or "未知原因"
+        return f"原域在生成链之前就判不可行（{reasons}），无法定位到具体段。"
     if target_index is None:
         if baseline["ok"]:
             return "整链无越界：不动采样域。"
@@ -1497,13 +1512,18 @@ def _execute_repair(args: argparse.Namespace, q_seed: list[float],
         _check_cancel(job)
         progress("局部修复", 0, 1)
         index = _repair_index(profiles, offenders, target_index)
-        repaired_steps, changed = avoid.repair_segment(
-            ctx["rbt"], baseline["waypoints"], baseline["steps"],
-            -1 if index is None else index,
-            order=ctx["order"], extrinsic=ctx["extrinsic"],
-            perturb_deg=args.perturb_deg, seed=args.seed,
-            attempts=args.repair_attempts, j5_min=ctx["j5_eff"],
-            j3_min=ctx["j3_eff"], seg_samples=args.seg_samples_final)
+        if baseline.get("steps") and index is not None:
+            repaired_steps, changed = avoid.repair_segment(
+                ctx["rbt"], baseline["waypoints"], baseline["steps"], index,
+                order=ctx["order"], extrinsic=ctx["extrinsic"],
+                perturb_deg=args.perturb_deg, seed=args.seed,
+                attempts=args.repair_attempts, j5_min=ctx["j5_eff"],
+                j3_min=ctx["j3_eff"], seg_samples=args.seg_samples_final)
+        else:
+            # 原域在出链之前就判不可行（位置禁区）或没有越界段：没有链可改，
+            # 直接去整体搜索。不能把 steps=None 传给 repair_segment——
+            # 它第一行就 len(steps)，会抛出一个埋掉真实原因的 TypeError。
+            repaired_steps, changed = baseline["steps"], None
         progress("局部修复", 1, 1)
         if changed is not None:
             q_before = None

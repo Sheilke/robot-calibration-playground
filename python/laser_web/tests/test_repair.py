@@ -21,6 +21,9 @@ from pathlib import Path
 
 from laser_web import core, jobs
 
+#: 仓库根（``<repo>/python/laser_web/tests/test_repair.py`` 往上三级）。
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
 #: 交付域：与现场 50 点运行完全一致的采样域与姿态。
 DELIVERY_DOMAIN = {"point_min": [750.0, -600.0, 270.0],
                    "point_max": [1300.0, 600.0, 940.0]}
@@ -380,6 +383,105 @@ class DefaultsTest(unittest.TestCase):
         self.assertEqual(core.REPAIR_STAGES,
                          ("定位段", "局部修复", "整体搜索", "复核"))
         self.assertIs(core.repair_cli_defaults(), defaults)   # 缓存同一份
+
+class WindowProfilesEarlyExitTest(unittest.TestCase):
+    """原域因位置禁区早退（``steps``/``segments`` 为 None）时不能抛 TypeError。
+
+    上一批修复的点：``segment_profiles`` 会 ``len(None)``，把真正的原因
+    （禁区命中）埋在一句类型错误里。这里钉住"直接返回空 + 不碰 ctx"。
+    """
+
+    def test_missing_steps_returns_empty(self):
+        import argparse
+
+        args = argparse.Namespace(segment_window=3, seg_samples_final=11,
+                                  seg_min=5.0)
+        for baseline in ({"steps": None, "segments": None},
+                         {"steps": [], "segments": None},
+                         {"steps": [object()], "segments": None},
+                         {}):
+            self.assertEqual(
+                core._window_profiles({}, baseline, 0, args), ([], []),
+                baseline)
+
+    def test_empty_profiles_keep_verdict_and_report_alive(self):
+        """空 profiles 交给 ``_verdict`` / 报告时不炸（不出现未定义变量）。"""
+        import argparse
+
+        args = argparse.Namespace(segment_window=3, seg_samples_final=11,
+                                  seg_min=5.0)
+        baseline = {"steps": None, "segments": None, "ok": False,
+                    "reasons": ["路点 #3 距奇异位形位置 20.0 mm < 禁区半径 80.0 mm"]}
+        profiles, offenders = core._window_profiles({}, baseline, 2, args)
+        verdict = core._verdict(baseline, profiles, offenders, 2,
+                               core._chain_summary(None))
+        self.assertEqual(profiles, [])
+        self.assertEqual(offenders, [])
+        # 结论必须说真话：是"生成链之前就不可行"，不是"各段都满足阈值"
+        self.assertIn("生成链之前", verdict)
+        self.assertIn("禁区", verdict)
+        # 报告里 segment_diagnostics.profiles 也得是空列表（不是 None）
+        ctx = {"base": {"label": "原域", "bounds": [0, 1, 0, 1, 0, 1],
+                        "rpy": [0, 0, 0], "moves": []},
+               "analyses": [], "j5_eff": 20.0, "j3_eff": 0.0,
+               "j3_seg_min": 0.0, "forbidden": [], "target_count": 8}
+        report = core._repair_report(
+            argparse.Namespace(urdf="x.urdf", rpy=[0, 0, 0],
+                              euler_convention="xyz-intrinsic",
+                              singular_q=[], perturb_deg=[0, 0, 0],
+                              stopped_at=2, segment_window=3,
+                              avoid_radius=80.0),
+            ctx, baseline, profiles, offenders, [],
+            ctx["base"], {}, {"label": "无改动"}, succeeded=False)
+        self.assertEqual(report["segment_diagnostics"]["profiles"], [])
+        self.assertIsNone(report["decision"])
+
+class ForbiddenPositionTest(TemporaryRuns):
+    """位置禁区命中（``steps=None``）时，定位与修复都要说真话、不崩。
+
+    上一批只修了 ``segment_profiles`` 那一处 ``len(None)``；修复路径上紧接着
+    调用的 ``repair_segment`` 同样会 ``len(None)``，会把"禁区命中"埋成一句
+    TypeError。这里用报告位形自己的位置造一个整箱都在禁区里的采样域，把两条
+    路径都跑一遍。
+    """
+
+    #: 报告位形：``|J5|=89 / |J3|=36``，落在判据之外 -> ``unexplained`` -> 有禁区。
+    UNEXPLAINED_Q = [43.0, -30.0, -36.0, 42.0, -89.0, -1.0]
+    #: 箱子半边长（mm）：角点 69 mm < 禁区半径 80 mm，整箱都在禁区里。
+    HALF = 40.0
+
+    @classmethod
+    def setup_case(cls) -> None:
+        """围绕报告位形的 FK 位置造一个小箱，定位 + 修复各跑一次。"""
+        from robot_model.nexbot_ik import Nexbot6R
+
+        rbt = Nexbot6R(str(REPO_ROOT / "data/configs/hyundai_general6s.urdf"))
+        position = [float(v) for v in rbt.fk(cls.UNEXPLAINED_Q)[:3, 3]]
+        cls.params = _params(
+            FIELD_PARAMS, {"point_min": [p - cls.HALF for p in position],
+                           "point_max": [p + cls.HALF for p in position]},
+            singular_q=[list(cls.UNEXPLAINED_Q)], stopped_at=3,
+            target_count=8)
+        cls.located = core.locate_segment(cls.params)
+        cls.result = core.run_repair(cls.params)
+
+    def test_locate_reports_the_real_reason(self):
+        self.assertTrue(self.located["ok"], self.located)
+        self.assertEqual(len(self.located["forbidden_positions"]), 1)
+        self.assertEqual(self.located["profiles"], [])
+        self.assertIn("生成链之前", self.located["verdict"])
+        self.assertIn("禁区", self.located["verdict"])
+
+    def test_repair_does_not_crash_on_missing_steps(self):
+        self.assertTrue(self.result["ok"], self.result)
+        self.assertIsNone(self.result.get("error"))
+        self.assertNotIn("TypeError", " ".join(self.result["warnings"]))
+        self.assertEqual(self.result["repair"]["mode"], "domain")
+        self.assertIn("禁区", " ".join(self.result["warnings"]))
+
+    def test_repair_found_a_plan_outside_the_forbidden_sphere(self):
+        self.assertTrue(self.result["stats"]["solved"]
+                        == self.result["stats"]["total"])
 
 
 if __name__ == "__main__":

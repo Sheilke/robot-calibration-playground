@@ -37,6 +37,13 @@ from typing import Any
 LOG_LIMIT = 200
 #: ``runs/`` 下保留的运行目录个数（含最新创建的那个）。
 KEEP_RUNS = 50
+#: 登记表里最多保留多少条**已结束**的任务（未结束的永不淘汰）。
+#: 每条任务带着 200 行日志与完整 result（几十 KB~几百 KB），不设上限的话
+#: 挂机一整天就是在漏内存。超过时在 :meth:`JobRegistry.submit` 里丢最旧的。
+MAX_FINISHED = 50
+#: 判定“运行目录已经有成果”的产物名（与 ``core.ARTIFACT_SCAN_JSON`` 同名）。
+#: ``core`` 反过来 import 本模块，所以常量放在这边，由测试钉住两边一致。
+SCAN_ARTIFACT = "scan.json"
 #: 运行产物目录名（仓库根下，已写入 ``.gitignore``）。
 RUNS_DIRNAME = "runs"
 #: 覆盖产物目录的环境变量（测试用；不设则 ``<repo>/runs``）。
@@ -250,27 +257,46 @@ class Job:
 
 
 class _JobStream(io.TextIOBase):
-    """把 ``print`` 的字节流按行送进 :class:`Job` 的环形缓冲。"""
+    """把 ``print`` 的字节流按行送进 :class:`Job` 的环形缓冲。
+
+    ``write`` 可能从**多条线程**并发进入：``redirect_stdout`` 换的是进程级的
+    ``sys.stdout``，任务线程自己会 ``print``，别的线程（例如 UI 线程上的
+    ``core.preview_domain``/``convert_urdf``）也可能在同一时刻写；而
+    ``self._buffer += text`` 是“读属性-拼接-写属性”三步，中间被切线程就会
+    丢字。所以行缓冲自己带锁（往 :class:`Job` 里追加本来就有锁，不冲突）。
+
+    **已知限制**：``redirect_stdout`` 是进程级的，不是线程局部的——任务运行
+    期间**其它线程**的 ``print`` 也会被收进这个任务的日志（而不是服务端终端），
+    反过来 UI 线程临时 ``redirect_stdout`` 时任务的那几行也可能进不了日志。
+    单进程/单任务的设计下这个副作用可以接受（比给所有算法函数改成传 logger
+    简单得多），但排查服务端问题时要知道日志里混着 UI 线程的输出。
+    """
 
     def __init__(self, job: Job) -> None:
         super().__init__()
         self._job = job
         self._buffer = ""
+        self._lock = threading.Lock()
 
     def writable(self) -> bool:      # noqa: D102 - TextIOBase 协议
         return True
 
     def write(self, text: str) -> int:      # noqa: D102 - TextIOBase 协议
-        self._buffer += text
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
+        with self._lock:
+            self._buffer += text
+            lines = []
+            while "\n" in self._buffer:
+                line, self._buffer = self._buffer.split("\n", 1)
+                lines.append(line)
+        for line in lines:               # 追加到 Job 自己会加锁，不放在上面那层
             self._job.append_log(line)
         return len(text)
 
     def flush(self) -> None:         # noqa: D102 - TextIOBase 协议
-        if self._buffer:
-            self._job.append_log(self._buffer)
-            self._buffer = ""
+        with self._lock:
+            pending, self._buffer = self._buffer, ""
+        if pending:
+            self._job.append_log(pending)
 
 
 class JobRegistry:
@@ -281,15 +307,18 @@ class JobRegistry:
     """
 
     def __init__(self, root: str | Path | None = None,
-                 keep: int = KEEP_RUNS) -> None:
+                 keep: int = KEEP_RUNS,
+                 max_finished: int = MAX_FINISHED) -> None:
         """登记表。
 
         Args:
             root: 产物根目录（``None`` 走 :func:`runs_root`）。
             keep: ``runs/`` 下保留的目录个数。
+            max_finished: 最多保留多少条已结束的任务（未结束的永不淘汰）。
         """
         self.root = runs_root(root)
         self.keep = int(keep)
+        self.max_finished = max(0, int(max_finished))
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
         self._queue: queue.Queue = queue.Queue()
@@ -300,6 +329,21 @@ class JobRegistry:
         with self._lock:
             return {str(job.run_dir.resolve()) for job in self._jobs.values()
                     if job.state not in TERMINAL_STATES}
+
+    def _prune_finished(self) -> int:
+        """只留最近 :attr:`max_finished` 条**已结束**的任务，返回丢掉几条。
+
+        插入顺序就是提交顺序（``dict`` 保序），所以“最旧的”= 最早插入的。
+        未结束（``pending`` / ``running``）的任务**永远不会**被选中：它们还
+        要写产物、还要被轮询。
+        """
+        with self._lock:
+            finished = [job_id for job_id, job in self._jobs.items()
+                        if job.state in TERMINAL_STATES]
+            excess = len(finished) - self.max_finished
+            for job_id in finished[:max(0, excess)]:
+                del self._jobs[job_id]
+            return max(0, excess)
 
     # ------------------------------------------------------------------ 提交
     def submit(self, kind: str, fn: Callable[[Job], Any]) -> str:
@@ -312,6 +356,8 @@ class JobRegistry:
         Returns:
             str: 任务 id（同时也是 ``runs/<id>/`` 的目录名）。
         """
+        # 先淘汰最旧的已结束任务：新任务要登记，正在跑的那个不能占份额
+        self._prune_finished()
         run_id, run_dir = make_run_dir(self.root, keep=self.keep,
                                        exclude=self.active_dirs())
         job = Job(id=run_id, kind=str(kind), state="pending",
@@ -405,12 +451,14 @@ class JobRegistry:
         """跑一个任务：捕获 stdout、把任何异常转成 failed，最后收尾。
 
         注意 ``redirect_stdout`` 是**进程级**的：任务执行期间服务端自己的
-        ``print`` 也会落进这条任务的日志。本工具单进程单任务，这个副作用比
-        「给每个函数传一个 logger」简单得多，也正好让界面日志等价于终端输出。
+        ``print`` 也会落进这条任务的日志（详见 :class:`_JobStream` 的已知限制）。
+        本工具单进程单任务，这个副作用比「给每个函数传一个 logger」简单得多，
+        也正好让界面日志等价于终端输出。
         """
         if job.cancel.is_set():
             job.append_log("已取消（任务未开始）")
             job.set_state("cancelled")
+            self._discard_partial_run(job)
             return
         job.set_state("running")
         job.set_progress("启动", 0, 1)
@@ -425,6 +473,7 @@ class JobRegistry:
             if cancelled:
                 job.append_log("已取消")
                 job.set_state("cancelled")
+                self._discard_partial_run(job)
             else:
                 message = f"{type(error).__name__}: {error}"
                 job.append_log(f"[失败] {message}")
@@ -433,9 +482,36 @@ class JobRegistry:
         if job.cancel.is_set():
             job.append_log("已取消（任务已结束，结果丢弃）")
             job.set_state("cancelled")
+            self._discard_partial_run(job)
         else:
             job.set_state("done", result=result)
             job.set_progress("完成", 1, 1)
+
+    @staticmethod
+    def _discard_partial_run(job: Job) -> None:
+        """取消后清掉「半成品」运行目录；已经落下 ``scan.json`` 的则保留。
+
+        取消只在阶段边界生效，所以最常出现的是「出图之后、写文件之前」：目录
+        里只有一个 ``plot.png``。这种目录既不能导出 GP（没 ``scan.json``），
+        又会在工具页的运行列表里伪装成一次正常运行，不如删掉。
+
+        反过来，若取消发生在产物都写完、结果被丢弃那一刻，目录是**完整**的
+        （``scan.json`` 已在），保留才能事后回看——所以判据是「有没有
+        ``scan.json``」，而不是「是不是取消的」。
+
+        删不掉（竞态/权限）也不报错：取消本来就该安静结束。
+        """
+        run_dir = Path(job.run_dir)
+        try:
+            if (run_dir / SCAN_ARTIFACT).is_file():
+                job.append_log(f"保留完整运行目录 {run_dir}")
+                return
+            if not run_dir.is_dir():
+                return
+            shutil.rmtree(run_dir, ignore_errors=True)
+        except OSError:                 # 竞态下手慢：别人已经删了 / 没权限
+            return
+        job.append_log(f"已删除半成品运行目录 {run_dir}")
 
 
 _default_registry: JobRegistry | None = None

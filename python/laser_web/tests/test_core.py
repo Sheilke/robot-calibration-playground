@@ -193,6 +193,61 @@ class FormToNamespaceTest(unittest.TestCase):
         # 归一化（x_min..z_max / euler_convention）由 _validate_args 完成
         self.assertFalse(hasattr(args, "x_min"))
 
+class PreviewStabilityTest(unittest.TestCase):
+    """同一份表单值两次预览必须相等（页面按参数缓存预览结果的前提）。"""
+
+    def test_same_params_give_equal_preview(self):
+        first = core.preview_domain(_point_params())
+        second = core.preview_domain(_point_params())
+        self.assertTrue(first["ok"], first.get("error"))
+        self.assertEqual(first, second)
+
+
+class SummaryStatsTest(unittest.TestCase):
+    """``_summary_stats``：守卫违规必须让 ``feasible`` 变 False。"""
+
+    def _args(self, skip_ik: bool = False):
+        args = build_arg_parser().parse_args([])
+        args.skip_ik = skip_ik
+        return args
+
+    def _step(self, j5: float = 30.0):
+        from excitation_trajectory import aabb_snake_scan as scan
+
+        return scan.ChainStep(index=0, q=[0.0, 0.0, 20.0, 0.0, j5, 0.0],
+                              n_sols=1, config=(1, 0, 0), dq_l2=0.0,
+                              dq_l1=0.0, ok=True)
+
+    def _guard(self, violations):
+        return {"violations": violations, "resampled": [],
+                "j5_abs_min_deg": 30.0, "j3_abs_min_deg": 20.0}
+
+    def _conditioning(self):
+        from excitation_trajectory import aabb_snake_scan as scan
+
+        return scan._conditioning_to_json({})
+
+    def test_no_violation_is_feasible(self):
+        stats = core._summary_stats(self._args(), self._conditioning(),
+                                    [self._step()], self._guard([]), None)
+        self.assertEqual(stats["guard_violations"], 0)
+        self.assertTrue(stats["feasible"])
+
+    def test_violation_is_infeasible(self):
+        """重采后仍低于阈值 = 算法判不可行，徽标不能是绿的。"""
+        stats = core._summary_stats(
+            self._args(), self._conditioning(), [self._step()],
+            self._guard([{"index": 0}]), None)
+        self.assertEqual(stats["guard_violations"], 1)
+        self.assertFalse(stats["feasible"])
+
+    def test_skip_ik_leaves_feasible_none(self):
+        """``skip_ik`` 没跑 IK，``feasible`` 只能是 ``None``（不是 False）。"""
+        stats = core._summary_stats(self._args(skip_ik=True),
+                                    self._conditioning(), [], None, None)
+        self.assertIsNone(stats["feasible"])
+        self.assertEqual(stats["guard_violations"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

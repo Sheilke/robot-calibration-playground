@@ -28,7 +28,7 @@ from excitation_trajectory import aabb_snake_scan as scan
 
 from .. import core, jobs
 from ..ui_state import default_form_values, euler_conventions
-from . import adopt_running_job, download_button, generate
+from . import adopt_running_job, cancelled_result, download_button, generate
 
 #: 扫描页 CLI 的默认值（采样域/守卫那部分两页同源）。
 _CLI_DEFAULTS = scan.build_arg_parser().parse_args([])
@@ -210,6 +210,23 @@ def _stat_rows(repair: dict) -> list[dict]:
              "after": ("是" if after.get("feasible") else "否")}]
 
 
+def _result_mode(located, result, locate_error) -> str:
+    """结果区该画哪种卡片：``empty`` / ``locate_failed`` / ``cancelled`` /
+    ``failed`` / ``ok``。
+
+    「先定位段再修复」是两个独立动作，所以几种状态要分开：定位失败要把
+    报错**留在页面上**（toast 几秒就没了），取消是中性状态（不是红字失败），
+    而只做过定位时画判定卡片就算 ``ok``。
+    """
+    if result is not None:
+        if result.get("cancelled"):
+            return "cancelled"
+        return "ok" if result.get("ok") else "failed"
+    if locate_error is not None:
+        return "locate_failed"
+    return "empty" if located is None else "ok"
+
+
 def render() -> None:
     """渲染奇异修复页（表单 + 定位 / 修复 + 结果区）。"""
     defaults = default_form_values()
@@ -236,7 +253,7 @@ def render() -> None:
     boxes: dict = {}           # 需要整块显隐的容器（两点/六数、凑数/手填）
     q_groups: list[dict] = []  # 奇异读数：每项 {"fields": [6 个 ui.number]}
     state = {"job_id": None, "log_cursor": 0, "result": None,
-             "located": None, "color_by": "order"}
+             "located": None, "locate_error": None, "color_by": "order"}
     registry = jobs.get_registry()
 
     def collect() -> dict:
@@ -567,7 +584,9 @@ def render() -> None:
         """结果区：判定徽标 / 段定位表 / 前后对比 / 候选日志 / 修复后的计划。"""
         located = state["located"]
         result = state["result"]
-        if located is None and result is None:
+        locate_error = state["locate_error"]
+        mode = _result_mode(located, result, locate_error)
+        if mode == "empty":
             with ui.card().classes("w-full"):
                 ui.label("还没有结果").classes("text-subtitle1")
                 ui.label("先点「定位段」看窗口内哪一段最危险（不修改任何参数），"
@@ -575,7 +594,26 @@ def render() -> None:
                     "text-caption text-grey-7")
             return
 
-        if result is not None and not result.get("ok"):
+        if mode == "locate_failed":
+            # toast 只闪几秒；报错必须留在页面上，否则用户回过神就不知道改哪
+            with ui.card().classes("w-full"):
+                ui.label("定位失败").classes("text-subtitle1 text-negative")
+                ui.label(str(locate_error.get("error") or "未知错误")).classes(
+                    "text-negative text-body2 whitespace-pre-wrap")
+                for line in locate_error.get("warnings") or []:
+                    ui.label(line).classes(
+                        "text-warning text-caption whitespace-pre-wrap")
+            return
+
+        if mode == "cancelled":
+            with ui.card().classes("w-full bg-grey-2"):
+                ui.label("已取消").classes("text-subtitle1 text-grey-8")
+                ui.label("任务在当前阶段末尾停止：没来得及落盘的运行目录已删掉，"
+                         "已经写出 scan.json 的目录会保留。").classes(
+                    "text-caption text-grey-7 whitespace-pre-wrap")
+            return
+
+        if mode == "failed":
             with ui.card().classes("w-full"):
                 ui.label("失败").classes("text-subtitle1 text-negative")
                 ui.label(str(result.get("error") or "未知错误")).classes(
@@ -588,16 +626,16 @@ def render() -> None:
                     _log_card(repair)
             return
 
-        # 修复结果自带判定信息；只做过定位时用定位结果。
-        view = located
-        if result is not None and result.get("ok"):
-            view = result.get("repair") or located
+        # mode == "ok"：修复结果自带判定信息；只做过定位时用定位结果
+        if result is None:
+            _verdict_card(located)
+            return
+        view = result.get("repair") or located
         if view is not None:
             _verdict_card(view)
-
-        if result is None or not result.get("ok"):
+        repair = result.get("repair")
+        if not repair:
             return
-        repair = result["repair"]
         _compare_card(repair)
         _log_card(repair)
         _plan_card(result)
@@ -867,9 +905,12 @@ def render() -> None:
             ui.notify("修复任务在跑，等它结束再看定位", type="warning")
             return
         result = core.locate_segment(collect())
-        state["located"] = result if result.get("ok") else None
+        ok = bool(result.get("ok"))
+        state["located"] = result if ok else None
+        # 失败也要把报错留在结果区（toast 会消失，现场得能回看改哪个字段）
+        state["locate_error"] = None if ok else result
         state["result"] = None
-        if not result.get("ok"):
+        if not ok:
             ui.notify(result.get("error") or "定位失败", type="negative")
         else:
             ui.notify(result["verdict"], type="info")
@@ -908,8 +949,7 @@ def render() -> None:
             stage_label.set_text("完成")
             ui.notify("修复完成", type="positive")
         elif snapshot["state"] == "cancelled":
-            state["result"] = {"ok": False, "error": "任务已取消",
-                               "warnings": []}
+            state["result"] = cancelled_result()
             stage_label.set_text("已取消")
             ui.notify("任务已取消", type="warning")
         else:
@@ -928,6 +968,7 @@ def render() -> None:
         params = collect()
         state["log_cursor"] = 0
         state["result"] = None
+        state["locate_error"] = None    # 新任务的结果会盖掉上一次的定位报错
         state["color_by"] = "order"
         log_view.clear()
         bar.set_value(0.0)

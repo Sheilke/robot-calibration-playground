@@ -149,7 +149,7 @@ class RunScanTest(unittest.TestCase):
                 self.assertAlmostEqual(float(part), expected, places=3)
 
     def test_progress_stages(self):
-        """进度回调按阶段上报，且同一阶段内 index 不减。"""
+        """进度回调按阶段上报，阶段不倒退，同一阶段内 index 不减。"""
         stages = [stage for stage, _index, _total in self.stages]
         for name in core.STAGES:
             if name in ("采样姿态", "段内检查"):
@@ -161,6 +161,10 @@ class RunScanTest(unittest.TestCase):
         self.assertEqual(ik[-1], (8, 8))
         self.assertTrue(all(index <= total
                             for _stage, index, total in self.stages))
+        # 阶段顺序单调：设计条件数虽然在 IK 之前算（跟 CLI 一致），但它的
+        # 阶段名（``STAGES[4]``）排在"段内检查"之后，不能先报一次再倒退。
+        ranks = [core.STAGES.index(stage) for stage in stages]
+        self.assertEqual(ranks, sorted(ranks), f"阶段倒退了：{stages}")
 
     def test_warnings_carry_cli_hints(self):
         """校验阶段的 CLI 提示（自动凑数）要透传到 warnings。"""
