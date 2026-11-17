@@ -16,3 +16,6 @@ scan_path.png
 # （公司内部 schema，绝不入库）
 build/
 runs/
+
+# nohup 启动服务的副产物
+nohup.out

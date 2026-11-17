@@ -1,2 +1,0 @@
-usage: python -m laser_web [-h] [--port PORT] [--host ADDR]
-python -m laser_web: error: argument --port: expected one argument
