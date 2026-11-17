@@ -109,22 +109,28 @@ PYTHONPATH=python python3 -m excitation_trajectory.aabb_snake_scan \
 - `--cond-max`：姿态设计条件数上限，默认 9（等价 `cond(XᵀX)=81`）。门禁取**设计值**（与 seed 无关），实测值只作诊断；
 - `--j5-min` / `--j3-min` / `--seg-min`：J5、J3 与相邻点之间的安全裕度;
 - `--z-insert N`：在每层竖直过渡处插入 N 个点（不是额外整层）；
-- `--skip-ik` 只看网格不求解；`--euler xyz-extrinsic|xyz-intrinsic` 指定欧拉约定，默认外旋。
+- `--skip-ik` 只看网格不求解；`--euler xyz-intrinsic|zyx-intrinsic|zyz-intrinsic` 指定欧拉约定，
+  默认 `xyz-intrinsic`。
 
-### 姿态表达（欧拉约定）：轴序与定/动轴都可选
+### 姿态表达（欧拉约定）：只保留内旋，三种轴序
 
-`--euler <轴序>-<定轴|动轴>`，轴序支持 **xyz** 与 **zyx**，共四种组合，大小写不敏感：
+`--euler <轴序>-intrinsic`，轴序支持 **xyz** / **zyx** / **zyz**，大小写不敏感：
 
-| 约定 | 逆解出的旋转矩阵 | 典型用法 |
+| 约定 | 旋转矩阵 | 说明 |
 | --- | --- | --- |
-| `xyz-extrinsic` | `R = Rz·Ry·Rx` | 定轴 RPY（**默认**，本仓历史行为） |
-| `xyz-intrinsic` | `R = Rx·Ry·Rz` | 动轴 XYZ（Nexbot 控制器 `kXyzIntrinsic`） |
-| `zyx-extrinsic` | `R = Rx·Ry·Rz` | 定轴 ZYX |
+| `xyz-intrinsic` | `R = Rx·Ry·Rz` | 动轴 XYZ（**默认**，Nexbot 控制器 `kXyzIntrinsic`） |
 | `zyx-intrinsic` | `R = Rz·Ry·Rx` | 动轴 ZYX |
+| `zyz-intrinsic` | `R = Rz·Ry·Rz` | 真欧拉角 ZYZ（proper Euler） |
 
-同一组 `--rpy` 数值在不同约定下代表**不同的姿态**，所以「参考姿态怎么读」和「轴序」必须与
-控制器一致。`--euler` 会写进输出 JSON 的 `meta.euler_convention`；`export_gp --cartesian fk`
-有自己的 `--euler`（默认 `xyz-intrinsic`），需与扫描时用的一致。
+**定轴（extrinsic / RPY）已从命令行移除**：现场数据全部是控制器内旋读数，两套并存只会让
+"这组 rpy 到底怎么读"变成猜。旧命令里写 `--euler xyz-extrinsic` 会直接报错（不会静默按内旋
+处理）。底层数学函数（`euler_to_rot` / `rot_to_euler`）仍保留 `extrinsic` 参数，供历史数据与
+第三方工具使用。
+
+同一组 `--rpy` 数值在不同轴序下代表**不同的姿态**，所以轴序必须与控制器一致。`--euler` 会写进
+输出 JSON 的 `meta.euler_convention`；`export_gp --cartesian fk` 有自己的 `--euler`
+（默认 `xyz-intrinsic`），需与扫描时用的一致。`zyz` 在 `b = 0 / ±180°` 有万向锁，代码里走
+专门分支（`A = 0` 的代表解），矩阵重建仍精确。
 
 条件数的语义、门禁规则与单位换算细节，见脚本 docstring 与 `--help`。
 

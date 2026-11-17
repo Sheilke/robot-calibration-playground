@@ -36,15 +36,15 @@ EULER_ORDER = "XYZ"
 EXTRINSIC = False
 
 #: 支持的轴序（与 :func:`robot_model.nexbot_ik.euler_to_rot` 一致）。
-EULER_ORDERS = ("xyz", "zyx")
+EULER_ORDERS = ("xyz", "zyx", "zyz")
 
 #: 支持的欧拉约定（对外统一命名，供 CLI / 会话 JSON 使用），``<轴序>-<定/动轴>``。
 #: 定轴（extrinsic）= 固定坐标系、逆序相乘；动轴（intrinsic）= 随体、顺序相乘。
 #: 例：``xyz-intrinsic`` = ``R = Rx·Ry·Rz``（C++ ``kXyzIntrinsic``，Nexbot 链路）；
 #: ``xyz-extrinsic`` = ``R = Rz·Ry·Rx``（RPY 定轴，本仓其他工具默认）；
 #: ``zyx-intrinsic`` = ``R = Rz·Ry·Rx``（外旋 ZYX）；``zyx-extrinsic`` = ``R = Rx·Ry·Rz``。
-EULER_CONVENTIONS = tuple(f"{order}-{sense}" for order in EULER_ORDERS
-                          for sense in ("extrinsic", "intrinsic"))
+#: **只保留内旋**：定轴（extrinsic）已从对外接口移除。
+EULER_CONVENTIONS = tuple(f"{order}-intrinsic" for order in EULER_ORDERS)
 
 #: 默认约定：与控制器链路一致（XYZ 内旋）。
 DEFAULT_EULER_CONVENTION = "xyz-intrinsic"
@@ -179,9 +179,9 @@ def normalize_convention(value, where: str = "euler_convention") -> str:
 
 
 def convention_extrinsic(convention) -> bool:
-    """约定名 -> ``extrinsic`` 旗标（``*-extrinsic`` -> True，``*-intrinsic`` -> False）。"""
-    normalized = normalize_convention(convention)
-    return normalized.endswith("extrinsic")
+    """``extrinsic`` 旗标：**恒为 False**（只保留内旋；保留函数是为了接口稳定）。"""
+    normalize_convention(convention)        # 名字仍然要合法
+    return False
 
 
 def convention_order(convention) -> str:

@@ -376,8 +376,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rpy", nargs=3, type=float, default=[180.0, 0.0, -90.0],
                         metavar=("A", "B", "C"), help="五点统一姿态（deg）")
     parser.add_argument("--euler", choices=EULER_CONVENTIONS, type=str.lower,
-                        default="xyz-extrinsic", metavar="CONVENTION",
-                        help="欧拉约定 <轴序>-<定轴|动轴>，默认 xyz-extrinsic")
+                        default="xyz-intrinsic", metavar="CONVENTION",
+                        help="欧拉约定（**只支持内旋**）：xyz / zyx / zyz，"
+                             "默认 xyz-intrinsic")
     parser.add_argument("--q-seed", default="0,20,-20,0,40,0",
                         help="IK 种子关节角，逗号分隔 6 个 deg")
     parser.add_argument("--j5-min", type=float, default=0.0, metavar="DEG",

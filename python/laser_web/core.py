@@ -247,7 +247,7 @@ def preview_domain(params: dict) -> dict:
         "volume_m3": float, "grid": {"xs": int, "ys": int, "zs": int,
         "z_insert": int}, "point_count": int, "design_condition": float,
         "convention": str, "warnings": [str, ...]}``；
-        ``convention`` 是本次实际使用的欧拉约定名（如 ``xyz-extrinsic``），
+        ``convention`` 是本次实际使用的欧拉约定名（如 ``xyz-intrinsic``），
         ``warnings`` 是校验阶段 CLI 的提示行。
         校验失败返回 ``{"ok": False, "error": 报错原文, "warnings": []}``，
         不抛异常。
@@ -510,7 +510,7 @@ def _scan_payload(args: argparse.Namespace, waypoints, guard_report, segment_rep
             "aabb_source": getattr(args, "aabb_source", "axes"),
             "seed": int(args.seed),
             "euler_convention": getattr(args, "euler_convention",
-                                        "xyz-extrinsic"),
+                                        "xyz-intrinsic"),
             "skip_ik": skip_ik,
             "no_perturb": bool(args.no_perturb),
             "perturbed": (not bool(args.no_perturb)) and not skip_ik,

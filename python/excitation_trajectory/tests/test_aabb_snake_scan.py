@@ -456,7 +456,7 @@ if __name__ == "__main__":
 
 
 class EulerConventionOptionTest(unittest.TestCase):
-    """--euler 选项：与 --intrinsic 等价、与默认（xyz-extrinsic）可区分。"""
+    """--euler 选项：**只保留内旋**的三种轴序（xyz / zyx / zyz）。"""
 
     @staticmethod
     def _run(extra, out, plot):
@@ -468,59 +468,61 @@ class EulerConventionOptionTest(unittest.TestCase):
         assert code == 0
         return json.loads(Path(out).read_text(encoding="utf-8"))
 
-    def test_euler_option_and_intrinsic_alias(self):
+    def test_default_is_xyz_intrinsic_and_alias_matches(self):
+        """默认就是 xyz-intrinsic（定轴已移除），--intrinsic 别名与显式给值一致。"""
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
             root = Path(tmp)
             default = self._run([], root / "a.json", root / "a.png")
-            extrinsic = self._run(["--euler", "xyz-extrinsic"],
-                                  root / "b.json", root / "b.png")
             intrinsic_flag = self._run(["--intrinsic"], root / "c.json",
                                        root / "c.png")
             intrinsic_opt = self._run(["--euler", "xyz-intrinsic"],
                                       root / "d.json", root / "d.png")
             self.assertEqual(default["meta"]["euler_convention"],
-                             "xyz-extrinsic")
-            self.assertEqual(default, extrinsic)
-            self.assertEqual(intrinsic_flag, intrinsic_opt)
-            self.assertEqual(intrinsic_opt["meta"]["euler_convention"],
                              "xyz-intrinsic")
-            # 两约定对同一扰动序列给出不同的 IK 解（rpy 数值本身与约定无关，
-            # 约定只在 rpy -> 旋转矩阵时生效，因此差异体现在 perturbed_ik 的 q 上）
-            self.assertNotEqual(default["perturbed_ik"],
-                                intrinsic_opt["perturbed_ik"])
+            self.assertEqual(intrinsic_flag, intrinsic_opt)
+            self.assertEqual(default["perturbed_ik"], intrinsic_opt["perturbed_ik"])
 
-    def test_invalid_euler_choice_rejected(self):
+    def test_extrinsic_convention_is_gone(self):
+        """定轴（extrinsic）已从接口移除：旧命令必须直接报错，不能悄悄当成内旋。"""
         parser = build_arg_parser()
-        # 轴序只支持 xyz / zyx；zxy、xyz 以外的拼写均应拒绝
-        for bad in ("zxy-extrinsic", "xyz-wrong", "zyx"):
+        for bad in ("xyz-extrinsic", "zyx-extrinsic", "zyz-extrinsic",
+                    "XYZ-Extrinsic"):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["0", "200", "0", "200", "0", "200",
                                    "--euler", bad])
 
-    def test_zyx_conventions_are_accepted(self):
-        """ZYX 轴序必须可选（与 XYZ 同为合法取值）。"""
+    def test_invalid_euler_choice_rejected(self):
         parser = build_arg_parser()
-        for good in ("zyx-extrinsic", "zyx-intrinsic",
-                     "xyz-extrinsic", "xyz-intrinsic",
-                     "ZYX-Intrinsic"):
+        # 轴序只支持 xyz / zyx / zyz；zxy 等拼写均应拒绝
+        for bad in ("zxy-intrinsic", "xyz-wrong", "zyx"):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["0", "200", "0", "200", "0", "200",
+                                   "--euler", bad])
+
+    def test_all_three_intrinsic_orders_are_accepted(self):
+        """xyz / zyx / zyz 三种内旋轴序都必须可选，大小写不敏感。"""
+        parser = build_arg_parser()
+        for good in ("xyz-intrinsic", "zyx-intrinsic", "zyz-intrinsic",
+                     "ZYZ-Intrinsic", "Zyx-INTRINSIC"):
             args = parser.parse_args(["0", "200", "0", "200", "0", "200",
                                       "--euler", good])
             self.assertEqual(args.euler, good.lower())
 
-    def test_order_and_sense_are_both_honoured(self):
-        """同一组 rpy 在不同轴序下得到不同位姿（轴序真的生效，不仅是个参数）。"""
-        args_xyz = build_arg_parser().parse_args(
-            ["0", "200", "0", "200", "0", "200",
-             "--euler", "xyz-intrinsic"])
-        args_zyx = build_arg_parser().parse_args(
-            ["0", "200", "0", "200", "0", "200",
-             "--euler", "zyx-intrinsic"])
-        _validate_args(build_arg_parser(), args_xyz)
-        _validate_args(build_arg_parser(), args_zyx)
+    def test_each_order_produces_a_different_pose(self):
+        """同一组 rpy 在三种轴序下必须是三个不同姿态（轴序真的生效）。"""
         rpy = (12.0, 37.0, -58.0)
-        R_xyz = _reference_rotation(args_xyz, rpy)
-        R_zyx = _reference_rotation(args_zyx, rpy)
-        self.assertGreater(float(np.max(np.abs(R_xyz - R_zyx))), 0.05)
+        rotations = {}
+        for order in ("xyz", "zyx", "zyz"):
+            args = build_arg_parser().parse_args(
+                ["0", "200", "0", "200", "0", "200",
+                 "--euler", f"{order}-intrinsic"])
+            _validate_args(build_arg_parser(), args)
+            rotations[order] = _reference_rotation(args, rpy)
+        pairs = (("xyz", "zyx"), ("xyz", "zyz"), ("zyx", "zyz"))
+        for first, second in pairs:
+            with self.subTest(pair=(first, second)):
+                self.assertGreater(float(np.max(np.abs(
+                    rotations[first] - rotations[second]))), 0.05)
 
 
 class ConfigTagTest(unittest.TestCase):

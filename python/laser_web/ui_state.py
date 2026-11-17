@@ -35,7 +35,7 @@ def default_robot() -> str:
 
 
 def euler_conventions() -> list[str]:
-    """欧拉约定下拉框的选项（``xyz-extrinsic`` 等 4 种），来自算法模块。"""
+    """欧拉约定下拉框的选项（``xyz-intrinsic`` 等 3 种内旋），来自算法模块。"""
     return list(scan.EULER_CONVENTIONS)
 
 

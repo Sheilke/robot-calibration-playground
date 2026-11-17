@@ -147,16 +147,18 @@ class ChainStep:
 #: 默认网格份数：``--xs 1 --ys 4 --zs 4`` -> 2x5x5 = 50 个路点（无插点）。
 DEFAULT_GRID = (1, 4, 4)
 
-#: 支持的欧拉约定：轴序（xyz / zyx） × 定轴/动轴，共 4 种。
-EULER_ORDERS = ("xyz", "zyx")
-EULER_CONVENTIONS = tuple(f"{order}-{sense}" for order in EULER_ORDERS
-                          for sense in ("extrinsic", "intrinsic"))
+#: 支持的轴序：XYZ / ZYX（Tait-Bryan）+ ZYZ（真欧拉角）。
+EULER_ORDERS = ("xyz", "zyx", "zyz")
+#: 用户可见的欧拉约定：**只保留内旋（动轴）**，共 3 种。
+#: 定轴（extrinsic/RPY，``R = Rz·Ry·Rx``）已从对外接口移除——现场数据全是
+#: 控制器内旋读数，两套并存只会让“这组 rpy 到底怎么读”变成猜。
+EULER_CONVENTIONS = tuple(f"{order}-intrinsic" for order in EULER_ORDERS)
 
 #: 路点遍历的轴优先级：行内 Y 快轴 -> 行间 X -> 整层走完后才动 Z。
 MOTION_ORDER = "Y->X->Z"
 
-#: 默认欧拉约定（与历史行为一致）。
-DEFAULT_EULER_CONVENTION = "xyz-extrinsic"
+#: 默认欧拉约定（控制器链路：``R = Rx·Ry·Rz``）。
+DEFAULT_EULER_CONVENTION = "xyz-intrinsic"
 
 #: ``--target-count`` 自动凑数时各轴份数的上限。
 COUNT_GRID_MAX_PER_AXIS = 12
@@ -1167,17 +1169,22 @@ def design_condition_number(amplitudes_deg, reference_rpy,
 
 
 def _extrinsic_of(args: argparse.Namespace) -> bool:
-    """解析后的欧拉约定 -> ``extrinsic`` 旗标（``--validate-args`` 已归一化）。"""
-    return _split_convention(args)[1]
+    """``extrinsic`` 旗标：**恒为 False**（对外只保留内旋）。
+
+    底层 ``euler_to_rot`` / ``rot_to_euler`` 仍支持 extrinsic（历史数据与
+    第三方工具需要），但命令行不再暴露这个维度。
+    """
+    return False
 
 
 def _split_convention(args: argparse.Namespace):
     """欧拉约定名 -> ``(order, extrinsic)``，如 ``"zyx-intrinsic"`` -> ``("ZYX", False)``。
 
     ``--euler`` 的取值形如 ``<轴序>-<定/动轴>``；未设置时按旧的
-    ``--intrinsic`` 旗标回退到 ``xyz-intrinsic`` / ``xyz-extrinsic``。
+    不传时用 :data:`DEFAULT_EULER_CONVENTION`（``xyz-intrinsic``）。
     """
-    convention = getattr(args, "euler_convention", None) or "xyz-extrinsic"
+    convention = getattr(args, "euler_convention", None) \
+        or DEFAULT_EULER_CONVENTION
     order, _, sense = convention.partition("-")
     return order.upper(), sense != "intrinsic"
 
@@ -1431,13 +1438,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "预览图与 JSON")
     parser.add_argument("--euler", choices=EULER_CONVENTIONS, type=str.lower,
                         default=None, metavar="CONVENTION",
-                        help="欧拉角约定 <轴序>-<定轴|动轴>：轴序可选 "
-                             "xyz / zyx；定轴（extrinsic）=固定坐标系、逆序相乘，"
-                             "动轴（intrinsic）=随体坐标系、顺序相乘。"
-                             f"默认 {DEFAULT_EULER_CONVENTION}。"
-                             "例：xyz-extrinsic（=Rz·Ry·Rx，定轴 RPY，默认）、"
-                             "xyz-intrinsic（=Rx·Ry·Rz，Nexbot 控制器链路）、"
-                             "zyx-intrinsic（=Rz·Ry·Rx 动轴）、zyx-extrinsic")
+                        help="欧拉角约定，**只支持内旋**（随体坐标系、顺序相乘）："
+                             "xyz-intrinsic（=Rx·Ry·Rz，默认，Nexbot 控制器链路）、"
+                             "zyx-intrinsic（=Rz·Ry·Rx）、"
+                             "zyz-intrinsic（=Rz·Ry·Rz，真欧拉角）。"
+                             "定轴 RPY（Rz·Ry·Rx 固定轴）已移除")
     parser.add_argument("--intrinsic", action="store_true",
                         help="[已废弃] 等价于 --euler xyz-intrinsic；为保持"
                              "兼容保留，显式 --euler 优先")
@@ -1467,8 +1472,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     if args.euler is not None:
         args.euler_convention = args.euler
     else:
-        args.euler_convention = ("xyz-intrinsic" if args.intrinsic
-                                 else "xyz-extrinsic")
+        # --intrinsic 是历史别名；不传时用默认（只保留内旋）
+        args.euler_convention = DEFAULT_EULER_CONVENTION
     # AABB 与网格：支持 6 个交错值或两个对角点；支持 --target-count 自动凑数。
     _resolve_aabb(parser, args)
     for axis, lo, hi in (("X", args.x_min, args.x_max),
@@ -1629,7 +1634,8 @@ def _run_skip_ik(args: argparse.Namespace) -> int:
             "target_count": getattr(args, "target_count", None),
             "aabb_source": getattr(args, "aabb_source", "axes"),
             "seed": int(args.seed),
-            "euler_convention": getattr(args, "euler_convention", "xyz-extrinsic"),
+            "euler_convention": getattr(args, "euler_convention",
+                                         DEFAULT_EULER_CONVENTION),
             "skip_ik": bool(args.skip_ik),
             "no_perturb": bool(args.no_perturb),
             "perturbed": False,          # 预览模式不采样扰动
@@ -1831,7 +1837,8 @@ def _run_ik_chain(args: argparse.Namespace,
             "target_count": getattr(args, "target_count", None),
             "aabb_source": getattr(args, "aabb_source", "axes"),
             "seed": int(args.seed),
-            "euler_convention": getattr(args, "euler_convention", "xyz-extrinsic"),
+            "euler_convention": getattr(args, "euler_convention",
+                                         DEFAULT_EULER_CONVENTION),
             "skip_ik": bool(args.skip_ik),
             "no_perturb": bool(args.no_perturb),
             "perturbed": not bool(args.no_perturb),

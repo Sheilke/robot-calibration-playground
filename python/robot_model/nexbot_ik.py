@@ -203,9 +203,25 @@ def rot_to_euler(R: np.ndarray, order: str = "XYZ", extrinsic: bool = True):
         # 对比得 A = Ce, B = Be, C = Ae。
         ae, be, ce = _rot_to_euler_xyz_extrinsic(R)
         return [ce, be, ae]
+    if order == "ZYZ" and not extrinsic:
+        # 真欧拉角（proper Euler）：R = Rz(A) Ry(B) Rz(C)。
+        # 展开后 R[2,2]=cosB、R[0,2]=cA·sB、R[1,2]=sA·sB、
+        # R[2,0]=-sB·cC、R[2,1]=sB·sC。B 取 [0, 180]，故 sB >= 0。
+        sB = math.hypot(R[0, 2], R[1, 2])
+        B = math.atan2(sB, _clamp_unit(R[2, 2]))
+        if sB < _GIMBAL_EPS:
+            # 万向锁：B=0 -> 只有 A+C；B=180 -> 只有 A-C。取 A=0。
+            A = 0.0
+            C = math.atan2(R[1, 0], R[0, 0]) if R[2, 2] > 0.0 \
+                else math.atan2(R[0, 1], R[1, 1])
+        else:
+            A = math.atan2(R[1, 2], R[0, 2])
+            C = math.atan2(R[2, 1], -R[2, 0])
+        return [math.degrees(A), math.degrees(B), math.degrees(C)]
     raise NotImplementedError(
-        f"欧拉角提取只实现了 XYZ / ZYX 两种轴序（当前 order={order}，"
-        f"extrinsic={extrinsic}）；前向 euler_to_rot 本身支持任意轴序")
+        f"欧拉角提取只实现了 XYZ / ZYX / ZYZ 三种轴序的相应旋向"
+        f"（当前 order={order}，extrinsic={extrinsic}）；"
+        f"前向 euler_to_rot 本身支持任意轴序")
 
 
 # ---------------------------------------------------------------------------
