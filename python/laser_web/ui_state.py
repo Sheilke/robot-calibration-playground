@@ -34,9 +34,29 @@ def default_robot() -> str:
     return scan.DEFAULT_URDF.relative_to(repo_root()).as_posix()
 
 
+#: 欧拉约定的**显示文案**：界面上不出现 "intrinsic" 字样，一律写"内旋"。
+#: 值仍然是算法模块的约定名（``xyz-intrinsic``…），只换给人看的字。
+EULER_LABELS = {
+    "xyz-intrinsic": "XYZ 内旋（Rx·Ry·Rz）",
+    "zyx-intrinsic": "ZYX 内旋（Rz·Ry·Rx）",
+    "zyz-intrinsic": "ZYZ 内旋（Rz·Ry·Rz）",
+}
+
+
 def euler_conventions() -> list[str]:
-    """欧拉约定下拉框的选项（``xyz-intrinsic`` 等 3 种内旋），来自算法模块。"""
+    """欧拉约定的**取值**（``xyz-intrinsic`` 等 3 种内旋），来自算法模块。"""
     return list(scan.EULER_CONVENTIONS)
+
+
+def euler_convention_options() -> dict:
+    """下拉框选项：``{值: 中文文案}``（值给后端，文案给人看）。"""
+    return {value: EULER_LABELS.get(value, value)
+            for value in euler_conventions()}
+
+
+def euler_label(value) -> str:
+    """约定值 -> 显示文案（未知值原样返回，不吞信息）。"""
+    return EULER_LABELS.get(value, value)
 
 
 def default_form_values() -> dict:

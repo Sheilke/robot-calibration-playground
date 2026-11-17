@@ -24,7 +24,7 @@ from datetime import datetime
 
 from nicegui import ui
 
-from .. import core, jobs
+from .. import core, jobs, ui_state
 from . import download_button
 
 #: GP 导出表单的默认值（与 ``export_gp`` 的 CLI 同源，见 ``core.gp_defaults``）。
@@ -190,9 +190,11 @@ def render() -> None:
                                      label="姿态单位 --cart-units",
                                      value=_GP_DEFAULTS["cart_units"]
                                      ).classes("w-40")
-            euler_select = ui.select(core.gp_euler_conventions(),
-                                     label="欧拉约定 --euler",
-                                     value=_GP_DEFAULTS["euler"]).classes("w-48")
+            euler_select = ui.select(
+                {value: ui_state.euler_label(value)
+                 for value in core.gp_euler_conventions()},
+                label="欧拉约定（内旋）",
+                value=_GP_DEFAULTS["euler"]).classes("w-48")
         build_button = ui.button("生成 GP", icon="playlist_add").props("unelevated")
         gp_result_area()
 

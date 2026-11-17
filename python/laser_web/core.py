@@ -1894,7 +1894,7 @@ def _safe_filename(name, default: str) -> tuple[str, bool]:
 
 
 def gp_euler_conventions() -> list[str]:
-    """``--euler`` 下拉框的选项（算法模块里的 4 种约定，页面不另抄一份）。"""
+    """``--euler`` 的取值（算法模块里的 3 种内旋约定，页面不另抄一份）。"""
     from handeye.pose_encoder import EULER_CONVENTIONS
 
     return list(EULER_CONVENTIONS)

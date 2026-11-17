@@ -28,6 +28,44 @@ class PagesImportTest(unittest.TestCase):
         self.assertLessEqual(POINT_COUNT_WARN, 20000)
 
 
+class EulerLabelTest(unittest.TestCase):
+    """界面上不出现 "intrinsic" 字样，一律写"内旋"，但提交的值仍是算法约定名。"""
+
+    def test_labels_are_chinese_and_values_are_canonical(self):
+        from laser_web.ui_state import (EULER_LABELS, euler_convention_options,
+                                        euler_conventions)
+
+        options = euler_convention_options()
+        self.assertEqual(list(options), euler_conventions())
+        for value, label in options.items():
+            with self.subTest(value=value):
+                self.assertIn("内旋", label)
+                self.assertNotIn("intrinsic", label.lower())
+                self.assertNotIn("extrinsic", label.lower())
+                # 值必须保持算法模块里的规范名，后端与 CLI 才对得上
+                self.assertTrue(value.endswith("-intrinsic"))
+                self.assertEqual(EULER_LABELS[value], label)
+
+    def test_three_orders_only(self):
+        from laser_web.ui_state import euler_conventions
+
+        self.assertEqual(euler_conventions(),
+                         ["xyz-intrinsic", "zyx-intrinsic", "zyz-intrinsic"])
+
+    def test_unknown_value_falls_back_verbatim(self):
+        from laser_web.ui_state import euler_label
+
+        self.assertEqual(euler_label("zyz-extrinsic"), "zyz-extrinsic")
+
+    def test_gp_dropdown_uses_the_same_labels(self):
+        from laser_web import core, ui_state
+
+        for value in core.gp_euler_conventions():
+            label = ui_state.euler_label(value)
+            self.assertIn("内旋", label)
+            self.assertNotIn("intrinsic", label.lower())
+
+
 class AdoptRunningJobTest(unittest.TestCase):
     """页面重建后要能接管在跑的任务（否则不可见、不可取消）。"""
 

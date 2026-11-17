@@ -26,7 +26,8 @@ from excitation_trajectory import aabb_snake_scan as scan
 from .. import core, figures, jobs
 from . import (POINT_COUNT_WARN, adopt_running_job, cancelled_result,
                download_button)
-from ..ui_state import default_form_values, euler_conventions
+from ..ui_state import (default_form_values, euler_convention_options,
+                        euler_label)
 
 #: M2 新增字段的默认值——**不抄数字**，全部问 CLI 的参数解析器要。
 _CLI_DEFAULTS = scan.build_arg_parser().parse_args([])
@@ -298,7 +299,8 @@ def render() -> None:
                         "text-negative text-caption whitespace-pre-wrap")
                 ui.label("设计条件数").classes("text-grey-7")
                 ui.label(_fmt(result["design_condition"]))
-            ui.label(f"欧拉约定 {result['convention']}").classes("text-caption")
+            ui.label(f"欧拉约定 {euler_label(result['convention'])}"
+                     ).classes("text-caption")
             for line in result["warnings"]:
                 ui.label(line).classes(
                     "text-warning text-caption whitespace-pre-wrap")
@@ -369,8 +371,8 @@ def render() -> None:
                         fields[key] = _number(label, defaults["rpy"][index],
                                               preview_card.refresh)
                 fields["euler"] = ui.select(
-                    euler_conventions(), value=defaults["euler"],
-                    label="欧拉约定",
+                    euler_convention_options(), value=defaults["euler"],
+                    label="欧拉约定（内旋）",
                     on_change=preview_card.refresh).classes("w-full")
                 with ui.row().classes("w-full no-wrap gap-2"):
                     for index, (key, label) in enumerate(

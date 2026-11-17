@@ -27,7 +27,8 @@ from nicegui import ui
 from excitation_trajectory import aabb_snake_scan as scan
 
 from .. import core, jobs
-from ..ui_state import default_form_values, euler_conventions
+from ..ui_state import (default_form_values, euler_convention_options,
+                        euler_label)
 from . import adopt_running_job, cancelled_result, download_button, generate
 
 #: 扫描页 CLI 的默认值（采样域/守卫那部分两页同源）。
@@ -340,7 +341,8 @@ def render() -> None:
                 ui.label(f"{result['point_count']} 点")
                 ui.label("设计条件数").classes("text-grey-7")
                 ui.label(_fmt(result["design_condition"]))
-            ui.label(f"欧拉约定 {result['convention']}").classes("text-caption")
+            ui.label(f"欧拉约定 {euler_label(result['convention'])}"
+                     ).classes("text-caption")
 
     with ui.row().classes("w-full no-wrap items-start gap-4"):
         # ---------------- 左：表单 ----------------
@@ -463,8 +465,8 @@ def render() -> None:
                         fields[key] = _number(label, defaults["rpy"][index],
                                               preview_card.refresh)
                 fields["euler"] = ui.select(
-                    euler_conventions(), value=defaults["euler"],
-                    label="欧拉约定",
+                    euler_convention_options(), value=defaults["euler"],
+                    label="欧拉约定（内旋）",
                     on_change=preview_card.refresh).classes("w-full")
                 with ui.row().classes("w-full no-wrap gap-2"):
                     for index, (key, label) in enumerate(
