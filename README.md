@@ -278,6 +278,52 @@ PYTHONPATH=python python3 -m excitation_trajectory.export_gp \
 - `--flag` 的取值需与现场已创建的样例一致，默认 0；
 - 输出前会校验关节角是否在 URDF 限位内，越界即报错退出。
 
+## 功能四：ISO 9283 P1～P5 五点
+
+从测试立方体生成 ISO 9283 定位精度测试的五个点（同一姿态，现场按 MOVL 依次走）。
+
+```bash
+# 直接给立方体范围（取各轴中点为中心、最小跨度为边长）
+PYTHONPATH=python python3 -m excitation_trajectory.iso9283_cube \
+  --robot data/configs/hyundai_general6s.urdf \
+  --cube 750 1300 -600 600 270 940 \
+  --rpy 3 73 -167 --euler xyz-intrinsic \
+  --q-seed 43,-30,-36,42,-89,-1 --j5-min 20 \
+  --out iso5.json --plot iso5.png
+
+# 或直接给中心 + 边长
+PYTHONPATH=python python3 -m excitation_trajectory.iso9283_cube \
+  --robot data/configs/hyundai_general6s.urdf --center 1025 0 605 --side 550
+
+# 或让程序搜最大内接立方体（按 8 个顶点都可解来判可行，二分求边长）
+PYTHONPATH=python python3 -m excitation_trajectory.iso9283_cube \
+  --robot data/configs/hyundai_general6s.urdf \
+  --auto-cube --search-box 700 1400 -600 600 200 1300 --resolution 100
+```
+
+输出 JSON 与 `aabb_snake_scan` 同构，可直接接 `export_gp` 写 GP。
+
+### 三种布点（`--layout`）
+
+| 值 | P1 | P2～P5 | X/Y/Z 覆盖（边长 L、h=L/2） |
+| --- | --- | --- | --- |
+| `vertices`（默认） | 立方体中心 | **对角截面 `x = z`** 的四个角＝立方体四个顶点 | 全 `L`（三轴用满） |
+| `circle` | 中心 | 同一对角截面的内切圆（半径 `h`） | `L` / `0.71L` / `L` |
+| `center-square` | 中心 | `z = -0.4h` 平面上边长 `0.8h` 的正方形四角 | `0.4L` / `0.4L` / **0** |
+
+`vertices` 是 ISO 9283 的取法：截面从 XZ 最小角倾斜到 XZ 最大角，四点在截面的四个角上，
+空间利用率最大。`center-square` 只为复现历史脚本（`~/Downloads/iso9283_cube_generator.py`）
+的布点，它只用到一个高度，**Z 方向没有任何覆盖**，不建议用于正式测试。
+
+### 与原脚本的差异
+
+| 原脚本 | 本模块 | 原因 |
+| --- | --- | --- |
+| 硬编码 CH2000 DH | 读 `--robot`（URDF / 控制器 JSON） | 换机型不必改代码 |
+| scipy 数值 IK + 20 万点采样 | 仓库解析 IK `Nexbot6R` | 少一个依赖，更快更准 |
+| `plt.show()` 阻塞 | `--plot` 存 PNG（Agg） | 现场无显示环境 |
+| 参数写死在 `main()` | argparse + 三种布点 | 可复现、可切换 |
+
 ## 网页界面（laser_web）
 
 上面这些工具都能点鼠标跑，本质是同一套算法的壳：**界面与 CLI 用同一个校验函数
