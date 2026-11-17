@@ -11,6 +11,7 @@ import numpy as np
 
 from excitation_trajectory.iso9283_cube import (
     LAYOUTS,
+    PLANES,
     POINT_NAMES,
     build_arg_parser,
     cube_points,
@@ -96,6 +97,74 @@ class CubePointsGeometryTest(unittest.TestCase):
             cube_points(self.CENTER, self.SIDE, "nope")
         with self.assertRaises(ValueError):
             cube_points(self.CENTER, self.SIDE, "center-square", 0.0)
+
+
+class DiagonalPlaneTest(unittest.TestCase):
+    """对角截面可选（xz / yz / xy），且两种布点都必须真的落在该平面上。
+
+    这里钉的是一个真实错误：circle 布点一度把对角两轴取了**相反符号**
+    （P3 = (-h/2, -h/√2, +h/2)），半径对但不在 x=z 平面上，几何与 vertices 不一致。
+    """
+
+    CENTER = (1000.0, 0.0, 600.0)
+    SIDE = 400.0
+    H = SIDE / 2.0
+
+    def test_every_plane_and_layout_stays_on_the_diagonal_section(self):
+        for plane, (first, second, third) in PLANES.items():
+            for layout in ("vertices", "circle"):
+                with self.subTest(plane=plane, layout=layout):
+                    points = cube_points(self.CENTER, self.SIDE, layout,
+                                         plane=plane)
+                    offsets = np.array([np.asarray(points[name]) -
+                                        np.asarray(self.CENTER)
+                                        for name in POINT_NAMES[1:]])
+                    # 对角两轴同号且相等 -> 真的在 coord[a] == coord[b] 上
+                    np.testing.assert_allclose(offsets[:, first],
+                                               offsets[:, second], atol=1e-9)
+                    # 四点共面
+                    centered = offsets - offsets.mean(axis=0)
+                    self.assertLessEqual(
+                        int(np.linalg.matrix_rank(centered, tol=1e-9)), 2)
+
+    def test_vertices_span_full_side_on_all_axes(self):
+        for plane in PLANES:
+            with self.subTest(plane=plane):
+                points = cube_points(self.CENTER, self.SIDE, "vertices",
+                                     plane=plane)
+                offsets = np.array([np.asarray(points[name]) -
+                                    np.asarray(self.CENTER)
+                                    for name in POINT_NAMES[1:]])
+                np.testing.assert_allclose(np.ptp(offsets, axis=0),
+                                           [self.SIDE] * 3, atol=1e-9)
+                for name in POINT_NAMES[1:]:
+                    self.assertAlmostEqual(
+                        float(np.linalg.norm(np.asarray(points[name]) -
+                                             np.asarray(self.CENTER))),
+                        self.H * math.sqrt(3), places=9)
+
+    def test_circle_radius_is_side_over_two_on_every_plane(self):
+        for plane in PLANES:
+            with self.subTest(plane=plane):
+                points = cube_points(self.CENTER, self.SIDE, "circle",
+                                     plane=plane)
+                for name in POINT_NAMES[1:]:
+                    self.assertAlmostEqual(
+                        float(np.linalg.norm(np.asarray(points[name]) -
+                                             np.asarray(self.CENTER))),
+                        self.H, places=9)
+
+    def test_center_square_ignores_plane(self):
+        base = cube_points(self.CENTER, self.SIDE, "center-square")
+        for plane in PLANES:
+            other = cube_points(self.CENTER, self.SIDE, "center-square",
+                                plane=plane)
+            for name in POINT_NAMES:
+                np.testing.assert_allclose(base[name], other[name])
+
+    def test_rejects_unknown_plane(self):
+        with self.assertRaises(Exception):
+            cube_points(self.CENTER, self.SIDE, "vertices", plane="zx")
 
 
 class SolvePointsTest(unittest.TestCase):
@@ -242,6 +311,19 @@ class CliTest(unittest.TestCase):
         # 校验在 main 里做（parser 本身只负责解析），所以这里调 main
         with self.assertRaises(SystemExit):
             main(["--robot", str(ROBOT), "--center", "1000", "0", "600"])
+
+    def test_plane_option_recorded_in_meta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "iso.json"
+            code = main(["--robot", str(ROBOT), "--center", "1000", "0", "600",
+                         "--side", "300", "--rpy", "3", "73", "-167",
+                         "--euler", "xyz-intrinsic",
+                         "--q-seed", "43,-30,-36,42,-89,-1",
+                         "--plane", "yz",
+                         "--out", str(out)])
+            self.assertEqual(code, 0)
+            payload = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(payload["meta"]["plane"], "yz")
 
     def test_unreachable_cube_exits_with_2(self):
         with tempfile.TemporaryDirectory() as tmp:

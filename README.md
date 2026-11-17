@@ -299,6 +299,11 @@ PYTHONPATH=python python3 -m excitation_trajectory.iso9283_cube \
 PYTHONPATH=python python3 -m excitation_trajectory.iso9283_cube \
   --robot data/configs/hyundai_general6s.urdf \
   --auto-cube --search-box 700 1400 -600 600 200 1300 --resolution 100
+
+# 换对角截面（默认 xz；yz 适合窄 Y 的工作区，xy 适合竖直方向受限的场景）
+PYTHONPATH=python python3 -m excitation_trajectory.iso9283_cube \
+  --robot data/configs/hyundai_general6s.urdf --center 1025 0 605 --side 550 \
+  --plane yz
 ```
 
 输出 JSON 与 `aabb_snake_scan` 同构，可直接接 `export_gp` 写 GP。
@@ -307,12 +312,13 @@ PYTHONPATH=python python3 -m excitation_trajectory.iso9283_cube \
 
 | 值 | P1 | P2～P5 | X/Y/Z 覆盖（边长 L、h=L/2） |
 | --- | --- | --- | --- |
-| `vertices`（默认） | 立方体中心 | **对角截面 `x = z`** 的四个角＝立方体四个顶点 | 全 `L`（三轴用满） |
+| `vertices`（默认） | 立方体中心 | **对角截面**的四个角＝立方体四个顶点 | 全 `L`（三轴用满） |
 | `circle` | 中心 | 同一对角截面的内切圆（半径 `h`） | `L` / `0.71L` / `L` |
 | `center-square` | 中心 | `z = -0.4h` 平面上边长 `0.8h` 的正方形四角 | `0.4L` / `0.4L` / **0** |
 
-`vertices` 是 ISO 9283 的取法：截面从 XZ 最小角倾斜到 XZ 最大角，四点在截面的四个角上，
-空间利用率最大。`center-square` 只为复现历史脚本（`~/Downloads/iso9283_cube_generator.py`）
+截面用 `--plane` 选：`xz`（默认，`x = z`，从 XZ 最小角倾斜到 XZ 最大角）、`yz`、`xy`。
+
+`vertices` 是 ISO 9283 的取法：四点在截面的四个角上，空间利用率最大。`center-square` 只为复现历史脚本（`~/Downloads/iso9283_cube_generator.py`）
 的布点，它只用到一个高度，**Z 方向没有任何覆盖**，不建议用于正式测试。
 
 ### 与原脚本的差异

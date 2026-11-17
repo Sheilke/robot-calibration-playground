@@ -74,6 +74,10 @@ from robot_model.nexbot_ik import Nexbot6R
 #: 布点方式（见模块 docstring）。
 LAYOUTS = ("vertices", "circle", "center-square")
 
+#: 可选的对角截面：键 -> (对角轴 a, 对角轴 b, 第三轴) 的下标。
+#: 截面是 ``coord[a] == coord[b]`` 的平面，第三轴在截面内自由。
+PLANES = {"xz": (0, 2, 1), "yz": (1, 2, 0), "xy": (0, 1, 2)}
+
 #: 五个点的名字，顺序即现场执行顺序。
 POINT_NAMES = ("P1", "P2", "P3", "P4", "P5")
 
@@ -82,7 +86,7 @@ _SEARCH_BISECT_STEPS = 8
 
 
 def cube_points(center, side: float, layout: str = "vertices",
-                square_frac: float = 0.4) -> dict:
+                square_frac: float = 0.4, plane: str = "xz") -> dict:
     """按指定布点方式算出 P1～P5 的位置（mm）。
 
     Args:
@@ -90,12 +94,13 @@ def cube_points(center, side: float, layout: str = "vertices",
         side: 立方体边长 L（mm）。
         layout: ``"vertices"`` / ``"circle"`` / ``"center-square"``。
         square_frac: ``center-square`` 布点的 k（相对半边长 h 的比例）。
+        plane: 对角截面 ``xz`` / ``yz`` / ``xy``（只影响 vertices 与 circle）。
 
     Returns:
         ``{"P1": ndarray(3), ..., "P5": ndarray(3)}``。
 
     Raises:
-        ValueError: 边长非正，或 layout 不认识。
+        ValueError: 边长非正，layout / plane 不认识。
     """
     cube_center = np.asarray(center, dtype=float).reshape(3)
     side = float(side)
@@ -106,29 +111,24 @@ def cube_points(center, side: float, layout: str = "vertices",
 
     h = side / 2.0
 
-    if layout == "vertices":
-        # ISO 9283 的**对角截面**：XZ 平面的对角面 x = z（从 XZ 最小角倾斜到最大角）。
-        # 该截面是 u=(x+z)/√2 ∈ ±h√2、y ∈ ±h 的矩形，四个角正是下面四个顶点：
-        # 它们两两共面（x - z = 0）、且 X/Y/Z 三轴都用满 ±h。
-        offsets = {
-            "P2": (+h, +h, +h),
-            "P3": (+h, -h, +h),
-            "P4": (-h, +h, -h),
-            "P5": (-h, -h, -h),
-        }
-    elif layout == "circle":
-        # 同一对角截面上的**内切圆**（半径 h，受截面短边 y 限制），四点互成 90°。
-        # 截面坐标 u=(x+z)/√2 ∈ ±h√2、y ∈ ±h；圆上 45° 处 u=h/√2、y=h/√2，
-        # 回到直角坐标就是 x = z = u/√2 = h/2，y = h/√2。
-        xz = h / 2.0
-        yy = h / math.sqrt(2.0)
-        offsets = {
-            "P2": (+xz, +yy, +xz),
-            "P3": (-xz, -yy, +xz),
-            "P4": (-xz, -yy, -xz),
-            "P5": (+xz, +yy, -xz),
-        }
-    else:                                   # center-square（原脚本布点）
+    if layout in ("vertices", "circle"):
+        # ISO 9283 的**对角截面**：``coord[a] == coord[b]``，第三轴在截面内自由。
+        # 截面是 u∈±h√2（对角方向）× h 的矩形，四个角 = 立方体四个间隔顶点。
+        first, second, third = PLANES[plane]
+        sign_pairs = ((+1, +1), (+1, -1), (-1, +1), (-1, -1))
+        # 对角方向分 h（vertices，取到截面四角）或 h/√2（circle，内切圆 45° 处）
+        diagonal = h if layout == "vertices" else h * math.cos(math.pi / 4.0)
+        # 直角坐标里对角两轴各占 u/√2；circle 时即 h/2，vertices 时即 h
+        along = diagonal / math.sqrt(2.0) if layout == "circle" else h
+        across = (h * math.sin(math.pi / 4.0) if layout == "circle" else h)
+        offsets = {}
+        for name, (sign_diag, sign_third) in zip(POINT_NAMES[1:], sign_pairs):
+            offset = [0.0, 0.0, 0.0]
+            offset[first] = sign_diag * along
+            offset[second] = sign_diag * along
+            offset[third] = sign_third * across
+            offsets[name] = tuple(offset)
+    else:                                   # center-square（原脚本布点，与 --plane 无关）
         k = float(square_frac)
         if not 0.0 < k <= 1.0:
             raise ValueError(f"--square-frac 需在 (0, 1]，当前 {k}")
@@ -284,7 +284,8 @@ def find_largest_cube(rbt: Nexbot6R, box, rpy, *, order: str,
 
 
 def scan_payload(points: dict, results: dict, *, cube, layout: str,
-                 side: float, rpy, convention: str, motion_hint: str) -> dict:
+                 side: float, rpy, convention: str, motion_hint: str,
+                 plane: str = "xz") -> dict:
     """组装与 ``aabb_snake_scan`` 同构的 JSON，好让 ``export_gp`` 直接吃。"""
     waypoints = []
     chain = []
@@ -312,6 +313,7 @@ def scan_payload(points: dict, results: dict, *, cube, layout: str,
         "meta": {
             "source": "iso9283_cube",
             "layout": layout,
+            "plane": plane,
             "cube_center": [round(float(v), 6) for v in cube["center"]],
             "cube_side": round(float(side), 6),
             "aabb": [round(float(v), 6) for v in cube["bounds"]],
@@ -366,6 +368,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="自动搜索时只接受中心 X >= 该值（避开机身后方）")
     parser.add_argument("--layout", choices=LAYOUTS, default="vertices",
                         help="布点方式，默认 vertices（ISO 9283 对角截面四角）")
+    parser.add_argument("--plane", choices=tuple(PLANES), default="xz",
+                        help="对角截面：xz（x=z，默认）/ yz（y=z）/ xy（x=y）；"
+                             "只影响 --layout vertices 与 circle")
     parser.add_argument("--square-frac", type=float, default=0.4, metavar="K",
                         help="center-square 布点的方形比例 k，默认 0.4（同原脚本）")
     parser.add_argument("--rpy", nargs=3, type=float, default=[180.0, 0.0, -90.0],
@@ -483,7 +488,8 @@ def main(argv=None) -> int:
 
     # ---- 2. 出点 + 解 IK ----
     try:
-        points = cube_points(center, side, args.layout, args.square_frac)
+        points = cube_points(center, side, args.layout, args.square_frac,
+                             args.plane)
     except ValueError as error:
         parser.error(str(error))
 
@@ -525,7 +531,7 @@ def main(argv=None) -> int:
             "bounds": _cube_bounds(center, side)}
     payload = scan_payload(points, results, cube=cube, layout=args.layout,
                            side=side, rpy=rpy, convention=args.euler,
-                           motion_hint="MOVL")
+                           motion_hint="MOVL", plane=args.plane)
     Path(args.out).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
         encoding="utf-8")
