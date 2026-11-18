@@ -304,3 +304,59 @@ def _scan_json(run_dir: Path) -> dict:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ManualPointsModeTest(unittest.TestCase):
+    """「人工指定五点」：逐点给坐标，不要立方体。
+
+    现场经常已经有一组坐标（来自旧 JOB 或别的表），要求能直接填进来算关节角，
+    而不是被迫先反推一个立方体。
+    """
+
+    BASE = {"robot": "data/configs/hyundai_general6s.urdf",
+            "cube_mode": "points", "rpy": [3, 73, -167],
+            "euler": "xyz-intrinsic",
+            "q_seed": [43, -30, -36, 42, -89, -1], "j5_min": 20}
+    POINTS = [[1025, 0, 605], [1300, 275, 880], [1300, -275, 880],
+              [750, 275, 330], [750, -275, 330]]
+
+    def test_manual_points_solve_without_a_cube(self):
+        result = core.run_iso9283(dict(self.BASE, points=self.POINTS))
+        self.assertTrue(result["ok"], result.get("error"))
+        stats = result["stats"]
+        self.assertEqual(stats["solved"], 5)
+        self.assertEqual(stats["total"], 5)
+        self.assertIsNone(stats["cube_side"])       # 没有立方体，不造假数字
+        self.assertIsNone(stats["cube_center"])
+        self.assertEqual(result["meta"]["points_source"], "manual")
+        self.assertIsNone(result["meta"]["cube_center"])
+        # 坐标必须原样回显（人工填什么就算什么）
+        for row, expected in zip(result["points"], self.POINTS):
+            self.assertEqual(row["pos"], [float(v) for v in expected])
+
+    def test_manual_matches_cube_mode_on_the_same_coordinates(self):
+        """同一批坐标：人工指定 与 立方体模式 解出的关节角必须完全一致。"""
+        manual = core.run_iso9283(dict(self.BASE, points=self.POINTS))
+        cube = core.run_iso9283({"robot": self.BASE["robot"],
+                                 "cube_mode": "bounds",
+                                 "cube": [750, 1300, -600, 600, 270, 940],
+                                 "rpy": self.BASE["rpy"],
+                                 "euler": self.BASE["euler"],
+                                 "q_seed": self.BASE["q_seed"],
+                                 "j5_min": self.BASE["j5_min"]})
+        self.assertTrue(manual["ok"] and cube["ok"])
+        for got, want in zip(manual["points"], cube["points"]):
+            self.assertEqual(got["q"], want["q"], got["name"])
+
+    def test_rejects_wrong_point_count(self):
+        result = core.run_iso9283(dict(self.BASE, points=self.POINTS[:4]))
+        self.assertFalse(result["ok"])
+        self.assertIn("5", result["error"])
+
+    def test_rejects_missing_points(self):
+        params = dict(self.BASE)
+        params.pop("cube_mode")
+        params["cube_mode"] = "points"
+        result = core.run_iso9283(params)
+        self.assertFalse(result["ok"])
+        self.assertIn("points", result["error"])

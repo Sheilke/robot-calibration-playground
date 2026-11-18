@@ -226,3 +226,36 @@ class PageRenderSmokeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GridVertexConversionTest(unittest.TestCase):
+    """界面填「格点数（行列数）」，算法要「份数」（= 格点数 − 1）。
+
+    现场同事按"这一方向有几个点"来估，而 CLI 历史上用"份数"，两者差 1。
+    换算只允许在这一个地方做，避免两个页面各写一遍、有人写成 +1 或漏减。
+    """
+
+    def test_conversion_is_off_by_one(self):
+        from laser_web.ui_state import segments_to_vertices, vertices_to_segments
+
+        for vertices in (1, 2, 3, 5, 5, 6, 21):
+            with self.subTest(vertices=vertices):
+                self.assertEqual(vertices_to_segments(vertices), vertices - 1)
+                self.assertEqual(
+                    segments_to_vertices(vertices_to_segments(vertices)), vertices)
+
+    def test_defaults_are_vertex_counts(self):
+        """默认值必须是「格点数」：CLI 默认份数 (1,4,4) → 界面显示 (2,5,5)。"""
+        from excitation_trajectory.aabb_snake_scan import DEFAULT_GRID
+        from laser_web.ui_state import default_form_values
+
+        values = default_form_values()
+        self.assertEqual((values["xs"], values["ys"], values["zs"]),
+                         tuple(segments + 1 for segments in DEFAULT_GRID))
+
+    def test_guards_never_go_negative(self):
+        from laser_web.ui_state import segments_to_vertices, vertices_to_segments
+
+        self.assertEqual(vertices_to_segments(0), 0)     # 0 格点按 0 份数处理
+        self.assertEqual(vertices_to_segments(-3), 0)
+        self.assertEqual(segments_to_vertices(-3), 1)    # 至少 1 个格点

@@ -16,13 +16,16 @@ from pathlib import Path
 
 from nicegui import ui
 
+from excitation_trajectory import iso9283_cube as iso
+
 from .. import core, figures, jobs, ui_state
 from . import adopt_running_job, cancelled_result, download_button
 from .generate import (POLL_INTERVAL, _FAILED_ROW_SLOT, _STATE_TEXT, _columns,
                        _fmt, _number, _result_mode, _round)
 
 #: 立方体来源 toggle（值给 ``core``，文案给人看）。
-_CUBE_MODES = {"bounds": "人工指定范围", "auto": "自动搜索内接"}
+_CUBE_MODES = {"bounds": "人工指定范围", "auto": "自动搜索内接",
+               "points": "人工指定五点"}
 #: 布点方式（值来自 ``iso9283_cube.LAYOUTS``，这里只给中文文案）。
 _LAYOUTS = {"vertices": "对角截面四角（ISO 标准）",
             "circle": "内切圆（旧实现）",
@@ -30,6 +33,19 @@ _LAYOUTS = {"vertices": "对角截面四角（ISO 标准）",
 #: 对角截面（值来自 ``iso9283_cube.PLANES``）。
 _PLANES = {"xz": "XZ 对角面（x=z）", "yz": "YZ 对角面（y=z）",
            "xy": "XY 对角面（x=y）"}
+#: 「人工指定五点」的示例默认值：示例域的立方体中心 + 对角截面四角，
+#: 只是让输入框不至于空着；现场按实际需求改。
+_SAMPLE_POINTS = [[
+    (ui_state.SAMPLE_POINT_MIN[axis] + ui_state.SAMPLE_POINT_MAX[axis]) / 2.0
+    for axis in range(3)]]
+_SAMPLE_HALF = min(hi - lo for lo, hi
+                   in zip(ui_state.SAMPLE_POINT_MIN, ui_state.SAMPLE_POINT_MAX)) / 2.0
+for _sx, _sy, _sz in ((1, 1, 1), (1, -1, 1), (-1, 1, -1), (-1, -1, -1)):
+    _SAMPLE_POINTS.append([
+        _SAMPLE_POINTS[0][0] + _sx * _SAMPLE_HALF,
+        _SAMPLE_POINTS[0][1] + _sy * _SAMPLE_HALF,
+        _SAMPLE_POINTS[0][2] + _sz * _SAMPLE_HALF])
+
 #: 「人工指定范围」的示例值：与「生成」页的示例采样域同源
 #: （``ui_state.SAMPLE_POINT_*``）；立方体取各轴中点、最小跨度为边长。
 #: 自动搜索的示例搜索箱（README「功能四」里跑过的那一组，x 朝机身外侧留开）。
@@ -124,13 +140,14 @@ def render() -> None:
                   "j5_min": fields["j5_min"].value}
         mode = fields["cube_mode"].value
         if mode == "bounds":
-            params["cube"] = [fields[f"cube_{axis}"].value
-                              for axis in ("x0", "x1", "y0", "y1", "z0", "z1")]
-            params["side"] = fields["side"].value
-        elif mode == "bounds":
             params["cube"] = [fields["x0"].value, fields["x1"].value,
                               fields["y0"].value, fields["y1"].value,
                               fields["z0"].value, fields["z1"].value]
+        elif mode == "points":
+            # 人工逐点指定：5 组 X/Y/Z
+            params["points"] = [[fields[f"p_{index}_{axis}"].value
+                                 for axis in ("x", "y", "z")]
+                                for index in range(len(iso.POINT_NAMES))]
         else:
             params["search_box"] = [fields["box_x0"].value,
                                     fields["box_x1"].value,
@@ -189,6 +206,19 @@ def render() -> None:
                             fields[high_key] = _number(
                                 f"{axis} 上界", values[1], None, step=1.0)
                     ui.label("取各轴中点为中心、最小跨度为边长（需近似各向等长）。"
+                             ).classes("text-caption text-grey-7")
+                boxes["points"] = ui.column().classes("w-full gap-1")
+                with boxes["points"]:
+                    for index, name in enumerate(iso.POINT_NAMES):
+                        with ui.row().classes("w-full no-wrap gap-2"):
+                            ui.label(name).classes("w-8 text-grey-7")
+                            for axis, label in (("x", "X"), ("y", "Y"), ("z", "Z")):
+                                fields[f"p_{index}_{axis}"] = _number(
+                                    label, _SAMPLE_POINTS[index][
+                                        ("x", "y", "z").index(axis)],
+                                    None, step=1.0)
+                    ui.label("逐点填 P1～P5 的法兰位置（mm）；"
+                             "五点姿态仍用下面那一个参考姿态。"
                              ).classes("text-caption text-grey-7")
                 boxes["auto"] = ui.column().classes("w-full gap-1")
                 with boxes["auto"]:
@@ -290,11 +320,13 @@ def render() -> None:
                             ui.label("|J5|min").classes("text-grey-7")
                             ui.label(f"{_fmt(stats['j5_abs_min'])}°")
                             ui.label("边长").classes("text-grey-7")
-                            ui.label(f"{stats['cube_side']:.0f} mm")
+                            ui.label("—" if stats["cube_side"] is None
+                                     else f"{stats['cube_side']:.0f} mm")
                             ui.label("中心").classes("text-grey-7")
-                            ui.label("(" + ", ".join(
-                                f"{float(value):.0f}"
-                                for value in stats["cube_center"]) + ") mm")
+                            ui.label("—" if not stats["cube_center"] else
+                                     "(" + ", ".join(
+                                         f"{float(value):.0f}"
+                                         for value in stats["cube_center"]) + ") mm")
                             ui.label("布点").classes("text-grey-7")
                             ui.label(_layout_label(stats["layout"]))
                             ui.label("截面").classes("text-grey-7")
@@ -368,7 +400,8 @@ def render() -> None:
 
         with ui.card().classes("w-full gap-1"):
             ui.label("3D 五点").classes("text-subtitle1")
-            ui.label("灰线是立方体 12 条棱；绿圆 = 有解，红叉 = 无解。"
+            ui.label("灰线是立方体 12 条棱（人工指定五点时不画）；"
+                     "绿圆 = 有解，红叉 = 无解。"
                      "hover 看点名 / XYZ / |J3| / |J5| / cfg / ok。").classes(
                 "text-caption text-grey-7")
             ui.plotly(figures.iso_cube_figure(

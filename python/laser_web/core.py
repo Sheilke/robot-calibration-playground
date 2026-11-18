@@ -1829,8 +1829,8 @@ def run_repair(params: dict, job=None, on_progress=None) -> dict:
 # ---------------------------------------------------------------------------
 #: ISO 页面的进度阶段名（顺序即执行顺序，页面进度条直接用这些中文短语）。
 ISO_STAGES = ("定立方体", "生成五点", "解算 IK", "出图", "写文件")
-#: 立方体来源（与页面 toggle 的取值一致）：中心+边长 / 范围 / 自动搜索。
-CUBE_MODES = ("center", "bounds", "auto")
+#: 五点来源（与页面 toggle 的取值一致）：范围 / 自动搜索 / 人工指定五点。
+CUBE_MODES = ("center", "bounds", "auto", "points")
 #: 产物文件名（写进 ``runs/<id>/``，也是 ``result["artifacts"]`` 的值）。
 ARTIFACT_ISO_JSON = "iso.json"
 ARTIFACT_ISO_PLOT = "iso.png"
@@ -1965,7 +1965,18 @@ def _iso_options(params: dict) -> dict:
               else float(params["j5_min"]))
 
     cube: dict = {"mode": cube_mode}
-    if cube_mode == "center":
+    if cube_mode == "points":
+        raw_points = params.get("points")
+        if raw_points is None:
+            raise _FormError("来源为「人工指定五点」时需要 points"
+                             "（5 组 X Y Z，mm）")
+        rows = list(raw_points)
+        if len(rows) != len(iso.POINT_NAMES):
+            raise _FormError(f"人工指定需要恰好 {len(iso.POINT_NAMES)} 个点，"
+                             f"当前 {len(rows)} 个")
+        cube["points"] = [_iso_numbers(row, 3, f"{iso.POINT_NAMES[index]} 坐标")
+                          for index, row in enumerate(rows)]
+    elif cube_mode == "center":
         if params.get("center") is None:
             raise _FormError("立方体来源为「中心+边长」时需要 center（X Y Z，mm）")
         if params.get("side") is None:
@@ -2031,6 +2042,8 @@ def _iso_cube(options: dict, rbt, *, order: str, extrinsic: bool,
         _FormError: 搜索范围内找不到可解立方体。
     """
     cube = options["cube"]
+    if cube["mode"] == "points":
+        return None, None               # 人工逐点指定：没有立方体
     if cube["mode"] == "center":
         return [float(value) for value in cube["center"]], float(cube["side"])
     if cube["mode"] == "bounds":
@@ -2079,12 +2092,12 @@ def _iso_row(name: str, solved: dict) -> dict:
                        else round(float(solved["j5_abs"]), 6))}
 
 
-def _iso_stats(rows, *, side: float, center, layout: str, plane: str) -> dict:
+def _iso_stats(rows, *, side, center, layout: str, plane: str) -> dict:
     """五点行 -> 页面统计卡字段。
 
     Args:
         rows: :func:`_iso_row` 的行（按 ``POINT_NAMES`` 顺序）。
-        side / center: 实际使用的立方体边长与中心。
+        side / center: 实际使用的立方体边长与中心；人工逐点指定时为 ``None``。
         layout / plane: 布点方式与对角截面（回显给现场核对）。
 
     Returns:
@@ -2105,8 +2118,10 @@ def _iso_stats(rows, *, side: float, center, layout: str, plane: str) -> dict:
                               default=None),
             "configs": [list(tag) for tag in configs],
             "config_consistent": len(configs) <= 1,
-            "cube_side": float(side),
-            "cube_center": [float(value) for value in center],
+            # 人工逐点指定时没有立方体：这两个字段写 None，不造假数字
+            "cube_side": None if side is None else float(side),
+            "cube_center": (None if center is None
+                            else [float(value) for value in center]),
             "layout": str(layout), "plane": str(plane)}
 
 
@@ -2131,17 +2146,22 @@ def _execute_iso(options: dict, job, progress: _StageReporter,
     except Exception as error:          # noqa: BLE001 - 模型读不了就是参数错
         return _failure(f"机器人模型无法加载：{type(error).__name__}: {error}")
 
-    # ---- 1. 定立方体 ----
+    # ---- 1. 定立方体（人工指定五点则跳过） ----
     _check_cancel(job)
     progress(ISO_STAGES[0], 0, 1)
+    manual = options["cube"]["mode"] == "points"
     try:
         center, side = _iso_cube(options, rbt, order=order,
                                  extrinsic=extrinsic, q_seed=options["q_seed"])
     except _FormError as error:
         return _failure(str(error))
-    print(f"立方体：边长 {side:g} mm，中心 ({center[0]:.1f}, {center[1]:.1f}, "
-          f"{center[2]:.1f}) mm，布点 {options['layout']}，"
-          f"截面 {options['plane']}")
+    if manual:
+        print(f"五点：人工逐个指定（无立方体），布点说明 {options['layout']}，"
+              f"截面 {options['plane']}")
+    else:
+        print(f"立方体：边长 {side:g} mm，中心 ({center[0]:.1f}, {center[1]:.1f}, "
+              f"{center[2]:.1f}) mm，布点 {options['layout']}，"
+              f"截面 {options['plane']}")
     print(f"姿态  ：{options['rpy']} deg（{options['euler']}），五点一致")
     progress(ISO_STAGES[0], 1, 1)
 
@@ -2149,8 +2169,12 @@ def _execute_iso(options: dict, job, progress: _StageReporter,
     _check_cancel(job)
     progress(ISO_STAGES[1], 0, 1)
     try:
-        points = iso.cube_points(center, side, options["layout"],
-                                 options["square_frac"], options["plane"])
+        if manual:
+            points = {name: [float(v) for v in options["cube"]["points"][index]]
+                      for index, name in enumerate(iso.POINT_NAMES)}
+        else:
+            points = iso.cube_points(center, side, options["layout"],
+                                     options["square_frac"], options["plane"])
     except ValueError as error:         # layout / square_frac 语义错
         return _failure(str(error))
     progress(ISO_STAGES[1], 1, 1)
@@ -2189,17 +2213,20 @@ def _execute_iso(options: dict, job, progress: _StageReporter,
     # ---- 4. 出图（matplotlib Agg；plot_points 内部已经 close） ----
     _check_cancel(job)
     progress(ISO_STAGES[3], 0, 1)
+    title = ("ISO 9283 P1~P5 [manual points]" if manual else
+             f"ISO 9283 P1~P5 ({options['layout']}, L={side:g} mm)")
     iso.plot_points(points, center, side, str(run_dir / ARTIFACT_ISO_PLOT),
-                    f"ISO 9283 P1~P5 ({options['layout']}, L={side:g} mm)")
+                    title)
     progress(ISO_STAGES[3], 1, 1)
 
     # ---- 5. 落盘：iso.json（与 aabb_snake_scan 同构，export_gp 可直接吃） ----
     _check_cancel(job)
     progress(ISO_STAGES[4], 0, 1)
+    cube_info = None if manual else {
+        "center": [float(value) for value in center],
+        "bounds": iso._cube_bounds(center, side)}
     payload = iso.scan_payload(
-        points, results,
-        cube={"center": [float(value) for value in center],
-              "bounds": iso._cube_bounds(center, side)},
+        points, results, cube=cube_info,
         layout=options["layout"], side=side, rpy=options["rpy"],
         convention=options["euler"], motion_hint="MOVL",
         plane=options["plane"])

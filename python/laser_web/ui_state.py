@@ -29,6 +29,16 @@ def repo_root() -> Path:
     return scan.DEFAULT_URDF.parents[2]
 
 
+def vertices_to_segments(vertices) -> int:
+    """界面上的「格点数」-> 算法要的「份数」（顶点数 = 份数 + 1）。"""
+    return max(0, int(vertices) - 1)
+
+
+def segments_to_vertices(segments) -> int:
+    """算法里的「份数」-> 界面显示的「格点数」。"""
+    return max(1, int(segments) + 1)
+
+
 def default_robot() -> str:
     """CLI 默认模型的仓库相对路径（与 ``core.list_robots`` 的 ``path`` 同格式）。"""
     return scan.DEFAULT_URDF.relative_to(repo_root()).as_posix()
@@ -83,9 +93,10 @@ def default_form_values() -> dict:
         "perturb_deg": [float(v) for v in scan.PERTURB_AMPLITUDE_DEG],
         "grid_mode": GRID_MODES[1],
         "target_count": 50,
-        "xs": int(scan.DEFAULT_GRID[0]),
-        "ys": int(scan.DEFAULT_GRID[1]),
-        "zs": int(scan.DEFAULT_GRID[2]),
+        # 界面按「格点数（= 份数+1）」输入，这里把 CLI 的份数换算过来
+        "xs": segments_to_vertices(scan.DEFAULT_GRID[0]),
+        "ys": segments_to_vertices(scan.DEFAULT_GRID[1]),
+        "zs": segments_to_vertices(scan.DEFAULT_GRID[2]),
         "z_insert": 0,
         "cond_max": float(scan.DEFAULT_COND_MAX),
     }

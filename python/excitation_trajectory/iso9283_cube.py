@@ -284,9 +284,13 @@ def find_largest_cube(rbt: Nexbot6R, box, rpy, *, order: str,
 
 
 def scan_payload(points: dict, results: dict, *, cube, layout: str,
-                 side: float, rpy, convention: str, motion_hint: str,
+                 side, rpy, convention: str, motion_hint: str,
                  plane: str = "xz") -> dict:
-    """组装与 ``aabb_snake_scan`` 同构的 JSON，好让 ``export_gp`` 直接吃。"""
+    """组装与 ``aabb_snake_scan`` 同构的 JSON，好让 ``export_gp`` 直接吃。
+
+    ``cube`` 为 ``None`` 时表示五点由人工逐个给出（没有立方体），
+    ``meta`` 里对应字段写 ``None`` 并记 ``points_source="manual"``。
+    """
     waypoints = []
     chain = []
     for index, name in enumerate(POINT_NAMES):
@@ -312,11 +316,14 @@ def scan_payload(points: dict, results: dict, *, cube, layout: str,
     return {
         "meta": {
             "source": "iso9283_cube",
+            "points_source": "cube" if cube is not None else "manual",
             "layout": layout,
             "plane": plane,
-            "cube_center": [round(float(v), 6) for v in cube["center"]],
-            "cube_side": round(float(side), 6),
-            "aabb": [round(float(v), 6) for v in cube["bounds"]],
+            "cube_center": (None if cube is None
+                            else [round(float(v), 6) for v in cube["center"]]),
+            "cube_side": None if side is None else round(float(side), 6),
+            "aabb": (None if cube is None
+                     else [round(float(v), 6) for v in cube["bounds"]]),
             "rpy": [round(float(v), 6) for v in rpy],
             "euler_convention": convention,
             "point_count": len(POINT_NAMES),
@@ -390,23 +397,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def plot_points(points: dict, cube_center, side: float, out_png: str,
+def plot_points(points: dict, cube_center, side, out_png: str,
                 title: str) -> None:
-    """画立方体 + 五个点（Agg，写完即 close；无显示环境安全）。"""
+    """画立方体 + 五个点（Agg，写完即 close；无显示环境安全）。
+
+    ``cube_center`` / ``side`` 为 ``None`` 时不画立方体线框——人工逐点指定
+    五个位置时并没有立方体。
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     figure = plt.figure(figsize=(8, 6))
     axis = figure.add_subplot(111, projection="3d")
-    c = np.asarray(cube_center, dtype=float)
-    # 立方体 12 条棱
-    corners = cube_vertices(c, side)
-    edges = [(0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
-             (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7)]
-    for first, second in edges:
-        a, b = corners[first], corners[second]
-        axis.plot(*zip(a, b), color="0.6", linewidth=1.0)
+    if cube_center is not None and side is not None:
+        c = np.asarray(cube_center, dtype=float)
+        corners = cube_vertices(c, side)
+        edges = [(0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
+                 (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7)]
+        for first, second in edges:
+            a, b = corners[first], corners[second]
+            axis.plot(*zip(a, b), color="0.6", linewidth=1.0)
     for name in POINT_NAMES:
         position = points[name]
         axis.scatter(*position, s=60, depthshade=False,

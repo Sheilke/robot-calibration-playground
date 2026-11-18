@@ -27,7 +27,7 @@ from .. import core, figures, jobs
 from . import (POINT_COUNT_WARN, adopt_running_job, cancelled_result,
                download_button)
 from ..ui_state import (default_form_values, euler_convention_options,
-                        euler_label)
+                        euler_label, vertices_to_segments)
 
 #: M2 新增字段的默认值——**不抄数字**，全部问 CLI 的参数解析器要。
 _CLI_DEFAULTS = scan.build_arg_parser().parse_args([])
@@ -237,11 +237,40 @@ def render() -> None:
         if fields["grid_mode"].value == "count":
             params["target_count"] = fields["target_count"].value
         else:
-            params["xs"] = fields["xs"].value
-            params["ys"] = fields["ys"].value
-            params["zs"] = fields["zs"].value
+            # 界面填的是**格点数**（行列数），算法要的是份数（= 格点数 - 1）
+            params["xs"] = vertices_to_segments(fields["xs"].value)
+            params["ys"] = vertices_to_segments(fields["ys"].value)
+            params["zs"] = vertices_to_segments(fields["zs"].value)
             params["z_insert"] = fields["z_insert"].value
         return params
+
+    def _total_points_text() -> tuple:
+        """当前表单会生成多少点：(显示文本, 是否超上限)。
+
+        手填模式下**不调 core**，直接按 ``X×Y×Z 格点 + 层间插点`` 算——
+        这里要的是"边填边看"，不能为了显示一行数字去跑一遍校验。
+        """
+        if fields["grid_mode"].value == "count":
+            preview = _preview()
+            if not preview.get("ok"):
+                return ("—", False)
+            count = int(preview["point_count"])
+            return (f"{count} 点（{preview['grid']['xs'] + 1}×"
+                    f"{preview['grid']['ys'] + 1}×"
+                    f"{preview['grid']['zs'] + 1} 格点）",
+                    count > POINT_COUNT_WARN)
+        try:
+            vertices = [max(1, int(fields[key].value or 1))
+                        for key in ("xs", "ys", "zs")]
+            insert = max(0, int(fields["z_insert"].value or 0))
+        except (TypeError, ValueError):
+            return ("—", False)
+        segments = [value - 1 for value in vertices]
+        count = ((segments[0] + 1) * (segments[1] + 1) * (segments[2] + 1)
+                 + segments[2] * insert)
+        text = (f"{count} 点（{'×'.join(str(v) for v in vertices)} 格点"
+                + (f" + {segments[2] * insert} 插点" if insert else "") + "）")
+        return (text, count > POINT_COUNT_WARN)
 
     def switch_domain(mode: str) -> None:
         """切换“两点 / 六数”输入，并立刻刷新预览。"""
@@ -286,7 +315,7 @@ def render() -> None:
             with ui.grid(columns=2).classes("w-full gap-x-4"):
                 ui.label("体积").classes("text-grey-7")
                 ui.label(f"{result['volume_m3']:.3f} m³")
-                ui.label("网格").classes("text-grey-7")
+                ui.label("格点 X×Y×Z").classes("text-grey-7")
                 ui.label(f"{cells}{insert}")
                 ui.label("点数").classes("text-grey-7")
                 over = result["point_count"] > POINT_COUNT_WARN
@@ -390,23 +419,31 @@ def render() -> None:
                 fields["grid_mode"] = ui.toggle(
                     {"count": "目标点数", "explicit": "手填份数"},
                     value=defaults["grid_mode"],
-                    on_change=lambda event: switch_grid(event.value)).props(
+                    on_change=lambda event: (switch_grid(event.value),
+                                             total_points.refresh())).props(
                         "spread")
                 boxes["count"] = ui.column().classes("w-full gap-1")
                 with boxes["count"]:
                     fields["target_count"] = _number(
                         "目标点数（自动凑网格，与手填份数互斥）",
-                        defaults["target_count"], lambda _event=None: preview_card.refresh(),
+                        defaults["target_count"],
+                        lambda _event=None: (preview_card.refresh(),
+                                             total_points.refresh()),
                         min=1, step=1)
                 boxes["explicit"] = ui.column().classes("w-full gap-1")
                 with boxes["explicit"]:
                     with ui.row().classes("w-full no-wrap gap-2"):
-                        for key, label in (("xs", "X 份数"), ("ys", "Y 份数"),
-                                           ("zs", "Z 份数"),
+                        for key, label in (("xs", "X 格点数"),
+                                           ("ys", "Y 格点数"),
+                                           ("zs", "Z 格点数"),
                                            ("z_insert", "换层插点")):
                             fields[key] = _number(label, defaults[key],
-                                                  lambda _event=None: preview_card.refresh(),
+                                                  lambda _event=None: (preview_card.refresh(),
+                                                                       total_points.refresh()),
                                                   min=0, step=1)
+                    ui.label("格点数 = 该方向的点数（旧的“份数” + 1）；"
+                             "总点数 = X×Y×Z 格点 + 层间插点。"
+                             ).classes("text-caption text-grey-7")
                 with ui.row().classes("w-full no-wrap gap-2"):
                     fields["j5_min"] = _number(
                         "|J5| 下限（度）", defaults["j5_min"], None,
@@ -417,6 +454,21 @@ def render() -> None:
                 fields["cond_max"] = _number(
                     "条件数上限 cond_max", defaults["cond_max"],
                     lambda _event=None: preview_card.refresh(), min=1.0, step=0.5)
+
+                # 总点数就地显示（不再只靠右侧预览卡）：填格点/份数时当场能看到
+                @ui.refreshable
+                def total_points() -> None:
+                    """本卡内的总点数行：手填按公式直算，凑数模式读预览结果。"""
+                    with ui.row().classes("w-full items-baseline gap-2"):
+                        ui.label("总点数").classes("text-grey-7")
+                        text, bad = _total_points_text()
+                        ui.label(text).classes(
+                            "text-subtitle2 text-negative" if bad
+                            else "text-subtitle2")
+                        if bad:
+                            ui.label("（超过上限，无法生成）").classes(
+                                "text-negative text-caption")
+                total_points()
 
             with ui.card().classes("w-full"):
                 ui.label("段内检查与 IK 种子").classes("text-subtitle1")

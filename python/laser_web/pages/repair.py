@@ -28,7 +28,7 @@ from excitation_trajectory import aabb_snake_scan as scan
 
 from .. import core, jobs
 from ..ui_state import (default_form_values, euler_convention_options,
-                        euler_label)
+                        euler_label, vertices_to_segments)
 from . import adopt_running_job, cancelled_result, download_button, generate
 
 #: 扫描页 CLI 的默认值（采样域/守卫那部分两页同源）。
@@ -303,9 +303,10 @@ def render() -> None:
         if fields["grid_mode"].value == "count":
             params["target_count"] = fields["target_count"].value
         else:
-            params["xs"] = fields["xs"].value
-            params["ys"] = fields["ys"].value
-            params["zs"] = fields["zs"].value
+            # 界面填格点数（行列数），算法要份数
+            params["xs"] = vertices_to_segments(fields["xs"].value)
+            params["ys"] = vertices_to_segments(fields["ys"].value)
+            params["zs"] = vertices_to_segments(fields["zs"].value)
             params["z_insert"] = fields["z_insert"].value
         return params
 
@@ -335,7 +336,7 @@ def render() -> None:
             with ui.grid(columns=2).classes("w-full gap-x-4"):
                 ui.label("体积").classes("text-grey-7")
                 ui.label(f"{result['volume_m3']:.3f} m³")
-                ui.label("网格").classes("text-grey-7")
+                ui.label("格点 X×Y×Z").classes("text-grey-7")
                 ui.label(f"{grid['xs'] + 1}×{grid['ys'] + 1}×{grid['zs'] + 1}")
                 ui.label("点数").classes("text-grey-7")
                 ui.label(f"{result['point_count']} 点")
@@ -451,8 +452,9 @@ def render() -> None:
                 boxes["explicit"] = ui.column().classes("w-full gap-1")
                 with boxes["explicit"]:
                     with ui.row().classes("w-full no-wrap gap-2"):
-                        for key, label in (("xs", "X 份数"), ("ys", "Y 份数"),
-                                           ("zs", "Z 份数"),
+                        for key, label in (("xs", "X 格点数"),
+                                           ("ys", "Y 格点数"),
+                                           ("zs", "Z 格点数"),
                                            ("z_insert", "换层插点")):
                             fields[key] = _number(label, defaults[key],
                                                   lambda _event=None: preview_card.refresh(),
