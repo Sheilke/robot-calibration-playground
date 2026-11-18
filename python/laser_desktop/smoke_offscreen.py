@@ -15,6 +15,18 @@ S4 起再补一段**修复页**检查：切到「奇异修复」页 → 填 8 �
 读数 → 真跑一次「定位段」（``core.locate_segment``），断言判定徽标与段定位表
 有内容、切页（共用同一个 PlotView）耗时远低于 200 ms，并截图存到
 ``/tmp/desktop_s4.png``。
+S5 起最后补两段：
+
+* **ISO 五点页**：切到该页 → 立方体来源两种模式各切 2 次（可见组必须恰好 1 个，
+  钉死网页版 32136c6 那类“两组都隐藏”的坑）→ 填 200 mm 立方体（站点位置）→
+  真跑一次（``core.run_iso9283``，实测 < 1 s），断言终态 ``done``、路点表 5 行、
+  ``|J5|min`` 有值，截图存 ``/tmp/desktop_s5_iso.png``；
+* **工具页**：运行表非空、模板文件的摘要块说清楚自己看到的是什么（找到了就
+  是 64 位十六进制 sha256；找不到就明说「—」并列出搜索路径 + 环境变量名，
+  绝不允许“两眼一抹黑但显示一个 sha256”），截图存 ``/tmp/desktop_s5_tools.png``。
+
+S5 评审后补的一条回归（T1）：**切立方体来源必须同时换预览**——切到「自动搜索」
+后预览卡必须是搜索箱（不是上一种来源的边长 550 mm）。
 
 S4 评审后的三条回归（都是“界面状态与盘子里的文件自相矛盾”那类问题）：
 
@@ -47,11 +59,15 @@ configure_webengine_environment()
 app = QtWidgets.QApplication(sys.argv)
 from laser_desktop.main_window import MainWindow, build_preview_figure
 from laser_desktop import paths
+from laser_desktop import tools_page
 
 #: 截图落盘位置（每次覆盖）。
 SHOT = "/tmp/desktop_s3.png"
 #: S4（奇异修复页）截图落盘位置。
 SHOT_S4 = "/tmp/desktop_s4.png"
+#: S5（ISO 五点页 / 工具页）截图落盘位置。
+SHOT_S5_ISO = "/tmp/desktop_s5_iso.png"
+SHOT_S5_TOOLS = "/tmp/desktop_s5_tools.png"
 #: 真解算的超时（秒）：8 点小案子实测 < 1 s，给足余量。
 RUN_TIMEOUT = 180
 #: 切页耗时的上限（毫秒）：两张图共用一个 PlotView，切页不该重建 WebEngine。
@@ -423,6 +439,174 @@ def after_infeasible():
          "所有候选都不可行" in repair.status_label.text()
          and "color:#c0392b" in repair.status_label.styleSheet(),
          repair.status_label.text()[:40].replace("\n", " "))
+    QtCore.QTimer.singleShot(200, start_iso_page)
+
+
+# ---------------------------------------------------------------------------
+# S5：ISO 五点页（切两次来源 + 真跑 200 mm 立方体）
+# ---------------------------------------------------------------------------
+def configure_iso_case(iso) -> None:
+    """把 ISO 页改成 200 mm 立方体（站点位置，5 点全可解）。"""
+    fields = iso.fields
+    fields["cube_bounds"].setChecked(True)
+    for key, value in (("x0", 925.0), ("x1", 1125.0), ("y0", -100.0),
+                       ("y1", 100.0), ("z0", 505.0), ("z1", 705.0)):
+        fields[key].setValue(value)
+    fields["layout"].setCurrentIndex(fields["layout"].findData("vertices"))
+    fields["plane"].setCurrentIndex(fields["plane"].findData("xz"))
+    fields["rpy_a"].setValue(3.0)
+    fields["rpy_b"].setValue(73.0)
+    fields["rpy_c"].setValue(-167.0)
+    fields["euler"].setCurrentIndex(fields["euler"].findData("xyz-intrinsic"))
+    fields["q_seed"].setText("43,-30,-36,42,-89,-1")
+    fields["j5_min"].setValue(20.0)
+    iso.refresh_preview()
+
+
+def visible_iso_panels(iso) -> list[int]:
+    """当前可见的立方体来源面板下标（``isVisible``；窗口已显示）。"""
+    stack = iso.mode_stack
+    return [index for index in range(stack.count())
+            if stack.widget(index).isVisible()]
+
+
+def start_iso_page():
+    """S5：切到「ISO 五点」页 → 切两次立方体来源 → 真跑一次 → 截图。"""
+    window.nav.setCurrentRow(2)
+    iso = window.iso
+    step("切到 ISO 五点页", window.stack.currentWidget() is iso,
+         type(window.stack.currentWidget()).__name__)
+
+    seen = []
+    for _round in range(2):
+        iso.fields["cube_auto"].setChecked(True)
+        seen.append(len(visible_iso_panels(iso)))
+        iso.fields["cube_bounds"].setChecked(True)
+        seen.append(len(visible_iso_panels(iso)))
+    step("立方体来源切两次仍恰好 1 组可见",
+         seen == [1, 1, 1, 1], f"每次可见组数={seen}")
+
+    # T1：切来源必须**同时换预览**（预览卡 / 预览页签 / 提示全跟着走）
+    iso.fields["cube_auto"].setChecked(True)
+    auto = iso.preview or {}
+    step("切到自动搜索后预览卡是搜索箱",
+         auto.get("mode") == "auto"
+         and iso.preview_labels["cube"].text() == "待真跑（自动搜索）"
+         and "边长" not in iso.preview_labels["cube"].text()
+         and "搜索范围" in iso.preview_hint.text()
+         and iso.preview_table.rowCount() == 0,
+         f"mode={auto.get('mode')} 卡片={iso.preview_labels['cube'].text()} "
+         f"提示={iso.preview_hint.text()[:36]}… "
+         f"五点行={iso.preview_table.rowCount()}")
+    iso.fields["cube_bounds"].setChecked(True)
+    bounds = iso.preview or {}
+    step("切回两点输入后预览卡是立方体",
+         bounds.get("mode") == "bounds"
+         and iso.preview_labels["cube"].text().startswith("边长")
+         and iso.preview_table.rowCount() == 5,
+         f"mode={bounds.get('mode')} 卡片={iso.preview_labels['cube'].text()} "
+         f"五点行={iso.preview_table.rowCount()}")
+
+    configure_iso_case(iso)
+    preview = iso.preview or {}
+    step("ISO 预览算出 200 mm 立方体",
+         preview.get("ok") is True and preview.get("side") == 200.0
+         and len(preview.get("candidates") or []) == 9,
+         f"边长={preview.get('side')} 面心={len(preview.get('faces') or [])} "
+         f"候选点={len(preview.get('candidates') or [])} "
+         f"五点={len(preview.get('points') or [])}")
+    job_id = iso.start_iso()
+    step("起 ISO 五点任务", bool(job_id),
+         f"job={job_id} 进度={iso.progress_bar.format()}")
+    if not job_id:
+        finish(); return
+    state["deadline"] = time.time() + RUN_TIMEOUT
+    QtCore.QTimer.singleShot(100, poll_iso_run)
+
+
+def poll_iso_run():
+    iso = window.iso
+    if iso.run_state in ("done", "failed", "cancelled"):
+        after_iso_run(); return
+    if time.time() > state.get("deadline", 0):
+        step("ISO 五点跑完", False, f"超时 {RUN_TIMEOUT} s")
+        after_iso_run(); return
+    QtCore.QTimer.singleShot(100, poll_iso_run)
+
+
+def after_iso_run():
+    """ISO 真跑：5 行路点、|J5|min 有值、产物按钮全开。"""
+    iso = window.iso
+    result = iso.last_result or {}
+    stats = result.get("stats") or {}
+    step("ISO 终态 done", iso.run_state == "done" and result.get("ok") is True,
+         f"state={iso.run_state} ok={result.get('ok')} "
+         f"err={str(result.get('error') or '')[:32]}")
+    step("ISO 路点表 5 行", iso.point_table.rowCount() == 5,
+         f"{stats.get('solved')}/{stats.get('total')} 行={iso.point_table.rowCount()}")
+    step("ISO |J5|min 有值",
+         stats.get("j5_abs_min") is not None
+         and iso.stat_labels["j5"].text() != "|J5|min —",
+         f"{iso.stat_labels['j5'].text()} · {iso.stat_labels['solved'].text()}")
+    step("ISO 导出按钮全开",
+         all(button.isEnabled() for button in iso.export_buttons.values()),
+         ",".join(f"{key}={button.isEnabled()}"
+                  for key, button in iso.export_buttons.items()))
+    step("ISO 进度条到 100%", iso.progress_bar.value() == 1000,
+         iso.progress_bar.format())
+    iso.result_tabs.setCurrentWidget(iso.points_page)
+    QtCore.QTimer.singleShot(400, grab_s5_iso)
+
+
+def grab_s5_iso():
+    ok = window.grab().save(SHOT_S5_ISO)
+    size = os.path.getsize(SHOT_S5_ISO) if os.path.exists(SHOT_S5_ISO) else 0
+    step("截图（ISO 五点页）", bool(ok) and size > 5000,
+         f"{size} 字节 > 5000 → {SHOT_S5_ISO}")
+    QtCore.QTimer.singleShot(200, start_tools_page)
+
+
+# ---------------------------------------------------------------------------
+# S5：工具页（运行表 + 模板 sha256）
+# ---------------------------------------------------------------------------
+def start_tools_page():
+    """S5：切到「工具」页 → 运行表非空、模板 sha256 显示 → 截图。"""
+    window.nav.setCurrentRow(3)
+    tools = window.tools
+    step("切到工具页", window.stack.currentWidget() is tools,
+         type(window.stack.currentWidget()).__name__)
+    step("工具页运行表非空",
+         len(tools.runs) > 0 and tools.runs_table.rowCount() == len(tools.runs),
+         f"{len(tools.runs)} 个运行目录 · {tools.runs_count_label.text()}")
+    info = tools.template_file or {}
+    summary = (tools.template_path_label.text() + " · "
+               + tools.template_size_label.text() + " · "
+               + tools.template_sha_label.text())
+    if info.get("exists"):
+        digest = tools.template_sha_label.text().replace("sha256", "").strip()
+        step("工具页显示模板 sha256",
+             len(digest) == 64
+             and all(char in "0123456789abcdef" for char in digest),
+             summary)
+    else:
+        # 模板不入库（也不再有 ~/Documents/backup 兜底）：这时界面必须明说「—」
+        # 并把搜索路径与环境变量名列出来——这正是 T1 之外另一条评审意见。
+        step("工具页明说找不到模板（不谎报 sha256）",
+             "—" in tools.template_sha_label.text()
+             and "—" in tools.template_size_label.text()
+             and tools_page.TEMPLATE_ENV in tools.template_path_label.text(),
+             summary)
+    # 截图要能看见被检查的两块（运行目录 + 模板文件），所以先滚到底
+    bar = tools.scroll.verticalScrollBar()
+    bar.setValue(bar.maximum())
+    QtCore.QTimer.singleShot(400, grab_s5_tools)
+
+
+def grab_s5_tools():
+    ok = window.grab().save(SHOT_S5_TOOLS)
+    size = os.path.getsize(SHOT_S5_TOOLS) if os.path.exists(SHOT_S5_TOOLS) else 0
+    step("截图（工具页）", bool(ok) and size > 5000,
+         f"{size} 字节 > 5000 → {SHOT_S5_TOOLS}")
     finish()
 
 
