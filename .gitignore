@@ -19,3 +19,6 @@ runs/
 
 # nohup 启动服务的副产物
 nohup.out
+
+# 桌面版/网页版的运行时缓存（plotly.min.js 等，可删可重建）
+.cache/

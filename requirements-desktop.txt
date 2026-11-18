@@ -1,0 +1,22 @@
+# 桌面版依赖（与网页版 requirements-web.txt 并列，互不依赖）
+#
+# 交付用 PySide6（LGPL）。**Windows 上必须装 Addons** —— QtWebEngine 在 Addons 里；
+# 而 Linux 的 PySide6 wheel 不含 QtWebEngine（实测 55 个 Qt 模块里没有），
+# 所以 Linux 上验证桌面壳改用系统的 PyQt5（GPL，不进交付）：
+#
+#     # Windows（交付形态）
+#     pip install -r requirements-desktop.txt
+#
+#     # Linux（仅本机验证桌面壳 + 嵌 Plotly）
+#     sudo apt install python3-pyqt5.qtwebengine
+
+numpy>=1.26
+matplotlib>=3.6
+plotly>=7.1,<8
+
+# 授权校验（启动时离线验签）
+cryptography>=42
+
+# 交付形态的 Qt 绑定：Essentials 提供 QtWidgets，Addons 提供 QtWebEngine
+PySide6-Essentials>=6.8,<7; sys_platform == "win32"
+PySide6-Addons>=6.8,<7; sys_platform == "win32"
