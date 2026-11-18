@@ -177,17 +177,17 @@ def render() -> None:
         ).props("accept=.json flat bordered").classes("w-full")
         template_hint = ui.label("尚未上传模板。").classes("text-caption text-grey-7")
         with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-            first_input = ui.number("起始 GP 号 --first",
+            first_input = ui.number("起始 GP 号",
                                     value=_GP_DEFAULTS["first"], format="%d",
                                     min=0, step=1).classes("w-32")
-            flag_input = ui.number("标志位 --flag", value=_GP_DEFAULTS["flag"],
+            flag_input = ui.number("标志位", value=_GP_DEFAULTS["flag"],
                                    format="%d", step=1).classes("w-32")
             cartesian_select = ui.select(list(core.GP_CARTESIAN_MODES),
-                                         label="笛卡尔 --cartesian",
+                                         label="笛卡尔部分",
                                          value=_GP_DEFAULTS["cartesian"]
                                          ).classes("w-40")
             units_select = ui.select(list(core.GP_CART_UNITS),
-                                     label="姿态单位 --cart-units",
+                                     label="笛卡尔姿态单位",
                                      value=_GP_DEFAULTS["cart_units"]
                                      ).classes("w-40")
             euler_select = ui.select(
