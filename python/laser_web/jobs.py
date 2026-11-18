@@ -42,11 +42,15 @@ from typing import Any
 _LOGGER = logging.getLogger(__name__)
 
 #: 单任务日志环形缓冲上限（行）。
-LOG_LIMIT = 200
+#: 与桌面版日志控件（``laser_desktop.generate_page.LOG_WIDGET_LIMIT``）一致。
+#: S6 之前是 200：界面说明写的是"控件最多留 500 行"，而源头只留 200，
+#: 用户会以为"中间那段只是没显示"，其实源头就已经丢了。两边相等时，
+#: 能显示多少就是源头留了多少。
+LOG_LIMIT = 500
 #: ``runs/`` 下保留的运行目录个数（含最新创建的那个）。
 KEEP_RUNS = 50
 #: 登记表里最多保留多少条**已结束**的任务（未结束的永不淘汰）。
-#: 每条任务带着 200 行日志与完整 result（几十 KB~几百 KB），不设上限的话
+#: 每条任务带着 LOG_LIMIT 行日志与完整 result（几十 KB~几百 KB），不设上限的话
 #: 挂机一整天就是在漏内存。超过时在 :meth:`JobRegistry.submit` 里丢最旧的。
 MAX_FINISHED = 50
 #: 判定“运行目录已经有成果”的产物名（与 ``core.ARTIFACT_SCAN_JSON`` 同名）。

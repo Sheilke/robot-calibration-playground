@@ -26,6 +26,18 @@
 * 两页的差异用**参数**表达、不用复制：修复页不给「段模型」与「重采上限」
   （见 :func:`build_guard_group`），生成页把网格组的说明小字挂在
   :func:`build_grid_group` 返回值的 ``caption`` 上。
+
+# SYNC: 与别处必须一致的东西（S6 L3 的自动化检查在
+# ``tests/test_s6_common.py::FormConsistencyTest``，改下面任何一项都会红）
+
+* ``GRID_VERTICES_MAX`` / ``Z_INSERT_MAX`` —— 手填格点数 / 换层插点的输入上限；
+  实际控件由 :func:`build_grid_group` 建，测试比对控件的 ``maximum()``；
+* ``target_count`` 的上限 = :data:`laser_desktop.generate_page.TARGET_COUNT_MAX`
+  （由 ``scan.COUNT_GRID_MAX_PER_AXIS`` / ``COUNT_GRID_MAX_INSERT`` 算出，不手抄）；
+* 所有默认值 = :func:`laser_desktop.generate_page.form_defaults`
+  （它再问 ``ui_state`` 与两个 CLI 的解析器）；修复页的 ``seg_samples`` 例外——
+  它跟随修复 CLI 的 11，扫描 CLI 是 21，两边都写在自己的 ``defaults()`` 里；
+* 生成页与修复页的六组字段：同名、同默认值、同上下限（测试逐项比）。
 """
 
 from __future__ import annotations
@@ -61,6 +73,24 @@ GRID_VERTICES_MAX = 200
 #: 换层插点的输入上限（同上；一次插这么多点已经远超 CLI 的
 #: ``COUNT_GRID_MAX_INSERT``，只是输入框的护栏）。
 Z_INSERT_MAX = 20
+
+
+def _compact_group(group):
+    """分组高度 = 内容高度（``sizeHint``）：不允许被外层布局拉伸。
+
+    不设的话，表单内容比窗口矮时 ``QVBoxLayout`` 会把多出来的高度均摊给各组
+    （``Preferred`` 可以长），组里的 ``QFormLayout`` 再把这点高度摊到行距上：
+    现场看到的就是"模型 / 路径 / 提示"之间的大段空白（S6b 截图）。
+
+    Args:
+        group: ``QGroupBox``。
+
+    Returns:
+        同一个分组。
+    """
+    group.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
+                        QtWidgets.QSizePolicy.Maximum)
+    return group
 
 
 def clear_layout(layout) -> None:
@@ -129,7 +159,11 @@ def build_robot_group(fields, robots, on_change, default_path=None):
     else:
         note = _caption("data/configs 下的文件全部可以当模型用")
     form.addRow(note)
-    return {"group": group, "path_label": path_label, "skipped_label": note}
+    # 三行之间不留空行：说明文字自己只有一行高（HintLabel 按文字实际行数算），
+    # 分组也不许被拉伸——否则截图里就是"排版坏了"（见 _compact_group）
+    form.setVerticalSpacing(4)
+    return {"group": _compact_group(group), "path_label": path_label,
+            "skipped_label": note}
 
 
 def build_domain_group(fields, defaults, on_change):
@@ -199,7 +233,8 @@ def build_domain_group(fields, defaults, on_change):
     points.setChecked(defaults["domain_mode"] == DOMAIN_MODES[0])
     axes.setChecked(defaults["domain_mode"] == DOMAIN_MODES[1])
     stack.setCurrentIndex(0 if points.isChecked() else 1)
-    return {"group": group, "stack": stack, "points": points, "axes": axes}
+    return {"group": _compact_group(group), "stack": stack, "points": points,
+            "axes": axes}
 
 
 def build_grid_group(fields, defaults, on_change):
@@ -272,7 +307,7 @@ def build_grid_group(fields, defaults, on_change):
     count.setChecked(defaults["grid_mode"] == GRID_MODES[0])
     explicit.setChecked(defaults["grid_mode"] == GRID_MODES[1])
     stack.setCurrentIndex(0 if count.isChecked() else 1)
-    return {"group": group, "stack": stack, "count": count,
+    return {"group": _compact_group(group), "stack": stack, "count": count,
             "explicit": explicit, "total_value": total_value,
             "total_hint": total_hint, "caption": caption}
 
@@ -299,7 +334,7 @@ def build_pose_group(fields, defaults, on_change):
     combo.currentIndexChanged.connect(on_change)
     fields["euler"] = combo
     form.addRow("欧拉约定", combo)
-    return group
+    return _compact_group(group)
 
 
 def build_perturb_group(fields, defaults, on_change):
@@ -320,7 +355,7 @@ def build_perturb_group(fields, defaults, on_change):
     seed.valueChanged.connect(on_change)
     fields["seed"] = seed
     form.addRow("随机种子", seed)
-    return group
+    return _compact_group(group)
 
 
 def build_guard_group(fields, defaults, on_change, with_attempts: bool = True,
@@ -386,4 +421,4 @@ def build_guard_group(fields, defaults, on_change, with_attempts: bool = True,
     q_seed.textChanged.connect(on_change)
     fields["q_seed"] = q_seed
     form.addRow("q-seed（6 个角）", q_seed)
-    return group
+    return _compact_group(group)

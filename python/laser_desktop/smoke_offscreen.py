@@ -38,6 +38,21 @@ S4 评审后的三条回归（都是“界面状态与盘子里的文件自相�
   ``max_candidates=1``）→ 断言 ``last_result`` 非空、``run_label`` 显示真实
   run_id、**只有** repair.json 的导出按钮亮着。
 
+S6c 最后一段（**三页 × 两种窗口尺寸，六张截图**）：主操作按钮必须在固定
+操作行里完整可见（``visibleRegion() == rect()``）、1600×950 下预览卡五项数值
+不用滚、图 ≥260 / 表 8 行（1280×800 是图 ≥200 / 表 ≥5 行）。截图存
+``/tmp/desktop_s6d_<page>_<1600|1280>.png``。
+
+S6 评审后的三处必改（S6d，全部用真 WebEngine 探针量，不是看代码）：
+
+* **R1**：图上高亮只增不减——``Plotly.restyle`` 就地改写 ``gd.data[t].marker
+  .size``，上次的 12 会变成新基准。这里直接读回 ``marker.size`` 数组：选 3 →
+  只有第 3 个 12；改选 7 → 只有第 7 个 12；``__select([])`` → 全部回基准 5；
+* **R2**：状态栏跨页残留——切页后临时区的原文必须带页面前缀，且常驻信息
+  （绑定/数据目录/WebGL）在临时消息 10 s 超时之后仍在（那条消息故意等 12 s 再读）；
+* **R3**：``RightSplitter`` 用户拖过之后，``protect_plot`` 不许再把图区抳回
+  260（探针：置 ``_user_moved`` → ``setSizes`` → 图区与预览卡保持用户比例）。
+
 “图进了 WebEngine”的判据是 **trace 名 + 标题**，不是点数量：预览图同样是 8 个
 点，只看点数量区分不了“结果图被残留的预览去抖盖掉”（S3 评审 P1 就是这么溜过去
 的）。结果图 trace 名是 ``成功 8 点 · 按路径顺序``，预览图无名、标题以“路点预览”
@@ -51,13 +66,16 @@ S4 评审后的三条回归（都是“界面状态与盘子里的文件自相�
 """
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 
 from laser_desktop.qt_compat import configure_webengine_environment, QtWidgets, QtCore, BINDING
 configure_webengine_environment()
 app = QtWidgets.QApplication(sys.argv)
 from laser_desktop.main_window import MainWindow, build_preview_figure
+from laser_desktop import page_layout
 from laser_desktop import paths
 from laser_desktop import tools_page
 
@@ -68,6 +86,24 @@ SHOT_S4 = "/tmp/desktop_s4.png"
 #: S5（ISO 五点页 / 工具页）截图落盘位置。
 SHOT_S5_ISO = "/tmp/desktop_s5_iso.png"
 SHOT_S5_TOOLS = "/tmp/desktop_s5_tools.png"
+#: S6b（默认窗口下的三页）截图落盘位置。
+SHOT_S6 = {"generate": "/tmp/desktop_s6b_generate.png",
+           "iso": "/tmp/desktop_s6b_iso.png",
+           "repair": "/tmp/desktop_s6b_repair.png"}
+#: S6b 的最小窗口（现场老笔记本）截图：证明左侧表单不被横向裁掉。
+SHOT_S6_SMALL = "/tmp/desktop_s6b_small.png"
+#: S6d（S6 评审后）的六张截图：三页 × 两种窗口尺寸（文件名里带尺寸）。
+SHOT_S6C = {(kind, size_label): f"/tmp/desktop_s6d_{kind}_{size_label}.png"
+            for kind in ("generate", "iso", "repair")
+            for size_label in ("1600", "1280")}
+#: S6b 的**默认**窗口（= MainWindow 的默认尺寸）：一屏 8 行的口径。
+S6_WIDTH, S6_HEIGHT = 1600, 950
+#: 最小窗口：允许纵向滚动，但 5 行仍要露出来。
+S6_SMALL_WIDTH, S6_SMALL_HEIGHT = 1280, 800
+#: 默认窗口下一屏至少要看到几行（生成页 8 点全见；ISO 只有 5 点）。
+S6_MIN_ROWS = 8
+#: 最小窗口下一屏至少要看到几行。
+S6_SMALL_MIN_ROWS = 5
 #: 真解算的超时（秒）：8 点小案子实测 < 1 s，给足余量。
 RUN_TIMEOUT = 180
 #: 切页耗时的上限（毫秒）：两张图共用一个 PlotView，切页不该重建 WebEngine。
@@ -97,12 +133,42 @@ def figure_state(raw) -> dict:
         return {}
 
 window = MainWindow()
-# 窗口尺寸按“现场笔记本最大化”取：结果区展开后图还能有 ~350 px 高
-# （默认窗口 1180×780 在 S3 之后会显得拘谨，但那是 MainWindow 的默认，不改）
-window.resize(1360, 900)
+# 窗口就用 MainWindow 的默认尺寸（1600×950，S6b）：三段（预览 / 图 / 结果）
+# 都够用，结果表一屏能露 8 行；1280×800 那档在 S6b 小节单独量。
+window.resize(page_layout.DEFAULT_WINDOW_SIZE[0], page_layout.DEFAULT_WINDOW_SIZE[1])
 window.show()
 
-state = {"steps": []}
+
+def qtwebengine_processes() -> int:
+    """当前 ``QtWebEngineProcess`` 个数（P4；没有 pgrep 时返回 -1）。"""
+    try:
+        result = subprocess.run(["pgrep", "-f", "QtWebEngineProcess"],
+                                capture_output=True, text=True, check=False)
+    except (FileNotFoundError, OSError):        # pragma: no cover - 平台差异
+        return -1
+    return len([line for line in result.stdout.splitlines() if line.strip()])
+
+
+def visible_rows(table) -> int:
+    """表格视口里**完整**可见的行数。
+
+    用 ``viewport().visibleRegion()`` 而不是只看视口高度：表格被父容器（页签、
+    分割器）裁掉时，视口自己的高度仍是 200，``visualItemRect`` 也在那 200 里，
+    可屏幕上只剩 1 行——S6 第一次"看起来改好了"就是这么骗过去的。
+    """
+    region = table.viewport().visibleRegion().boundingRect()
+    count = 0
+    for row in range(table.rowCount()):
+        item = table.item(row, 0)
+        if item is None:
+            continue
+        rect = table.visualItemRect(item)
+        if rect.top() >= region.top() and rect.bottom() < region.bottom():
+            count += 1
+    return count
+
+
+state = {"steps": [], "startup_procs": qtwebengine_processes()}
 def step(name, ok, detail=""):
     state["steps"].append((name, bool(ok), detail))
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}{(' — ' + detail) if detail else ''}")
@@ -117,6 +183,14 @@ step("四页注册", window.stack.count() == 4, f"count={window.stack.count()}")
 step("导航项", window.nav.count() == 4, "、".join(window.nav.item(i).text() for i in range(window.nav.count())))
 step("可写目录", (paths.cache_root() / "plot" / "plotly.min.js").is_file(),
      f"{paths.cache_root()}", )
+# P5：还没有图要看时不该建 WebEngineView（更不该拉 Chromium 子进程）。
+# 这一行在 app.exec() 之前跑：预览去抖（300 ms）还没到点。
+step("启动时不建图视图（P5 懒创建）",
+     window.plot.created is False and window.plot.load_count == 0,
+     f"created={window.plot.created} load_count={window.plot.load_count}")
+step("启动时 QtWebEngineProcess ≤ 1（P5/P4）",
+     state["startup_procs"] <= 1,
+     f"{state['startup_procs']} 个（没装 pgrep 时为 -1）")
 
 page = window.generate
 points_text = page.metric_labels["points"].text()
@@ -129,9 +203,9 @@ step("预览卡片体积/条件数", "m³" in page.metric_labels["volume"].text(
      f"条件数={page.metric_labels['design'].text()!r}")
 step("生成按钮可用（参数合法）", page.generate_button.isEnabled(),
      f"enable={page.generate_button.isEnabled()}")
-step("状态栏含绑定/数据目录", BINDING in window.statusBar().currentMessage()
-     and str(paths.data_root()) in window.statusBar().currentMessage(),
-     window.statusBar().currentMessage()[:80])
+step("状态栏含绑定/数据目录", BINDING in window._status_label.text()
+     and str(paths.data_root()) in window._status_label.toolTip(),
+     f"{window._status_label.text()[:60]}（tooltip 含完整数据目录）")
 
 def after_load(ok):
     step("壳页加载", ok)
@@ -607,10 +681,645 @@ def grab_s5_tools():
     size = os.path.getsize(SHOT_S5_TOOLS) if os.path.exists(SHOT_S5_TOOLS) else 0
     step("截图（工具页）", bool(ok) and size > 5000,
          f"{size} 字节 > 5000 → {SHOT_S5_TOOLS}")
+    QtCore.QTimer.singleShot(200, start_s6)
+
+
+# ---------------------------------------------------------------------------
+# S6b：默认 200×950 一屏 8 行 / 1280×800 表单不横向裁 / P1 双向 / P2 不重载 /
+#       P3 三组耗时 / P4 子进程
+# ---------------------------------------------------------------------------
+def wait_events(seconds: float = 0.3) -> None:
+    """跑一小段事件循环（布局要两轮才量得准）。"""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+
+
+def start_s6():
+    """S6b：先把窗口拉回默认的 1600×950，再逐页量“一屏几行”并截图。"""
+    window.nav.setCurrentRow(0)
+    window.resize(S6_WIDTH, S6_HEIGHT)
+    QtCore.QTimer.singleShot(500, s6_generate)
+
+
+def s6_report_rows(name, page, table, want_rows=None, size=None):
+    """量结果表：高度、可见行数、分割器分配（三页同一口径）。
+
+    ``want_rows`` 不传就按"默认窗口 8 行"算，但不超过表里实际行数（ISO 只有
+    5 个点，不能要求 8 行）。``size`` 是期望的窗口尺寸（默认取 1600×950）。
+    """
+    want_rows = S6_MIN_ROWS if want_rows is None else int(want_rows)
+    want_rows = min(want_rows, max(1, table.rowCount()))
+    width, height = (S6_WIDTH, S6_HEIGHT) if size is None else size
+    wait_events(0.35)                    # 刚切过页签/刚出结果：等布局落定
+    rows = visible_rows(table)
+    sizes = page._viewer_splitter.sizes()
+    ok = (rows >= want_rows
+          and table.height() >= 180
+          and window.width() == width and window.height() == height)
+    step(f"{name}一屏可见 ≥{want_rows} 行", ok,
+         f"表高={table.height()} viewport={table.viewport().height()} "
+         f"可视={table.viewport().visibleRegion().boundingRect().height()} "
+         f"行数={table.rowCount()} 可见={rows} 分割={sizes} "
+         f"窗口={window.width()}×{window.height()} "
+         f"窗口最小={window.minimumSizeHint().width()}×"
+         f"{window.minimumSizeHint().height()}")
+    # P2：三段高度（预览 / 图 / 结果）一起报出来
+    step(f"{name}三段高度（预览/图/结果）", len(sizes) == 3,
+         f"{sizes}（图 ≥{page_layout.PLOT_MIN_HEIGHT}、"
+         f"结果 ≥{page_layout.RESULT_MIN_HEIGHT} 是默认窗口的验收线）")
+    return rows
+
+
+def s6_grab(name):
+    shot = SHOT_S6[name]
+    ok = window.grab().save(shot)
+    size = os.path.getsize(shot) if os.path.exists(shot) else 0
+    step(f"截图（S6b {name}，默认 1600×950）",
+         bool(ok) and size > 5000, f"{size} 字节 → {shot}")
+
+
+def s6_generate():
+    page = window.generate
+    page.result_tabs.setCurrentWidget(page.waypoints_page)
+    s6_report_rows("生成页", page, page.waypoint_table)
+    s6_grab("generate")
+    QtCore.QTimer.singleShot(150, s6_iso)
+
+
+def s6_iso():
+    window.nav.setCurrentRow(2)
+    QtCore.QTimer.singleShot(300, lambda: s6_iso_check(window.iso))
+
+
+def s6_iso_check(iso):
+    iso.result_tabs.setCurrentWidget(iso.points_page)
+    s6_report_rows("ISO 页", iso, iso.point_table)
+    s6_grab("iso")
+    QtCore.QTimer.singleShot(150, s6_repair)
+
+
+def s6_repair():
+    """修复页：Q1 那次“所有候选都不可行”之后计划表是空的，再真跑一次。
+
+    这里不用构造数据：截图要能对着真结果看（否则"运行 …/tmp/s6-smoke" 一眼就是假的）。
+    """
+    window.nav.setCurrentRow(1)
+    repair = window.repair
+    configure_repair_case(repair, stopped_at=0)
+    job_id = repair.start_repair()
+    step("S6 再跑一次修复（出 8 行计划）", bool(job_id), f"job={job_id}")
+    if not job_id:
+        s6_repair_check(); return
+    state["deadline"] = time.time() + RUN_TIMEOUT
+    QtCore.QTimer.singleShot(100, poll_s6_repair)
+
+
+def poll_s6_repair():
+    if window.repair.run_state in ("done", "failed", "cancelled"):
+        QtCore.QTimer.singleShot(300, s6_repair_check)
+        return
+    if time.time() > state.get("deadline", 0):
+        step("S6 修复跑完", False, f"超时 {RUN_TIMEOUT} s")
+        s6_repair_check(); return
+    QtCore.QTimer.singleShot(100, poll_s6_repair)
+
+
+def s6_repair_check():
+    repair = window.repair
+    repair.result_tabs.setCurrentWidget(repair.plan_page)
+    step("S6b 修复结果表有 8 行", repair.waypoint_table.rowCount() == 8,
+         f"行数={repair.waypoint_table.rowCount()} 状态={repair.run_state}")
+    s6_report_rows("修复页", repair, repair.waypoint_table)
+    s6_grab("repair")
+    QtCore.QTimer.singleShot(150, s6_small_window)
+
+
+def s6_small_window():
+    """P1/P4/P6：把窗口缩到最小的 1280×800，证明表单不被横向裁、5 行仍在。"""
+    window.resize(S6_SMALL_WIDTH, S6_SMALL_HEIGHT)
+    window.nav.setCurrentRow(1)                  # 修复页：旧版裁得最厉害的
+    wait_events(0.4)
+    repair = window.repair
+    repair.result_tabs.setCurrentWidget(repair.plan_page)
+    wait_events(0.4)
+    # P4-①：表单没有横向滚动条
+    scroll = repair.form_scroll
+    bar = scroll.horizontalScrollBar()
+    step("1280×800 表单无横向滚动条（P4）", bar.maximum() == 0,
+         f"maximum={bar.maximum()} 视口={scroll.viewport().width()} "
+         f"内容最小={scroll.widget().minimumSizeHint().width()}")
+    # P4-②：数值框宽度 ≥ sizeHint（"500.0 mr"那种切字不会再出现）
+    repair.fields["domain_axes"].setChecked(True)     # 「六个轴边界」面板
+    wait_events(0.3)
+    detail = []
+    ok = True
+    for key in ("y_min", "z_min"):
+        box = repair.fields[key]
+        good = box.width() >= box.sizeHint().width()
+        ok = ok and good
+        detail.append(f"{key}={box.width()}≥{box.sizeHint().width()}" if good
+                      else f"{key}={box.width()}<{box.sizeHint().width()}(切字)")
+    step("1280×800 修复页 Y/Z 下界数值框完整可见（P4）", ok, "；".join(detail))
+    # P4-③：「删除本组」按钮完整可见
+    button = repair.q_rows[0]["remove_button"]
+    inside = (button.mapTo(scroll.widget(), button.rect().topLeft()).x() >= 0
+              and button.width() >= button.sizeHint().width())
+    step("1280×800「删除本组」按钮完整可见（P4）", inside,
+         f"按钮 {button.width()}≥{button.sizeHint().width()}，"
+         f"视口={scroll.viewport().width()}")
+    # P6：最小窗口下 5 行
+    s6_report_rows("修复页（1280×800）", repair, repair.waypoint_table,
+                   want_rows=S6_SMALL_MIN_ROWS,
+                   size=(S6_SMALL_WIDTH, S6_SMALL_HEIGHT))
+    shot = SHOT_S6_SMALL
+    saved = window.grab().save(shot)
+    size = os.path.getsize(shot) if os.path.exists(shot) else 0
+    step("截图（1280×800 修复页，表单不裁）", bool(saved) and size > 5000,
+         f"{size} 字节 → {shot}")
+    window.resize(S6_WIDTH, S6_HEIGHT)
+    QtCore.QTimer.singleShot(400, s6_back_to_generate)
+
+
+def s6_back_to_generate():
+    window.nav.setCurrentRow(0)
+    QtCore.QTimer.singleShot(300, s6_p1_js_select)
+
+
+def js(script, callback):
+    window.plot.page().runJavaScript(script, 0, callback)
+
+
+def s6_p1_js_select():
+    """P1 正向：JS 侧调 ``__select(['5'])`` → 表格第 5 行被选中。"""
+    js("window.__select(['5'])", lambda _raw: QtCore.QTimer.singleShot(
+        500, s6_p1_js_select_check))
+
+
+def s6_p1_js_select_check():
+    page = window.generate
+    row = page.waypoint_table.currentRow()
+    step("图上选点 → 表格选中第 5 行（P1）",
+         row == 4 and "GP0005" in page.last_status,
+         f"currentRow={row} 状态={page.last_status!r}")
+    js("window.__keys()", s6_p1_keys)
+
+
+def s6_p1_keys(raw):
+    """每个 trace 的 ``customdata[0]`` 必须是 GP 号（失败点那条也要有）。"""
+    try:
+        keys = json.loads(str(raw or "[]"))
+    except (TypeError, ValueError):
+        keys = []
+    flat = []
+    for trace_keys in keys:
+        for key in trace_keys:
+            if key is not None and key != "":
+                flat.append(key)
+    step("图里每个点都带 GP（customdata[0]，P1）",
+         sorted(int(key) for key in flat) == list(range(1, 9)),
+         f"trace 数={len(keys)} 键={flat[:10]}")
+    # P1 反向：表格选第 3 行 → JS 侧 __select 收到 "3"
+    window.generate.waypoint_table.setCurrentCell(2, 0)
+    QtCore.QTimer.singleShot(400, s6_p1_table_select)
+
+
+def s6_p1_table_select():
+    js("window.__selectedKeys()", s6_p1_table_select_check)
+
+
+def s6_p1_table_select_check(raw):
+    try:
+        keys = json.loads(str(raw or "[]"))
+    except (TypeError, ValueError):
+        keys = []
+    page = window.generate
+    step("表格选行 → 图上高亮同一个 GP（P1）",
+         keys == ["3"] and "GP0003" in page.last_status,
+         f"JS selected={keys} 状态={page.last_status!r}")
+    QtCore.QTimer.singleShot(100, s6_p2_start)
+
+
+def s6_p2_start():
+    """P2：连续换 10 次图 —— 页不重载、相机不动（loadFinished 计数不变）。"""
+    js("Plotly.relayout(gd, {'scene.camera': {eye: {x: 1.7, y: 1.2, z: 0.9}}}); 'ok'",
+       lambda _raw: QtCore.QTimer.singleShot(400, s6_p2_push))
+
+
+def s6_p2_push():
+    page = window.generate
+    state["p2_count"] = state.get("p2_count", 0)
+    if state["p2_count"] >= 10:
+        QtCore.QTimer.singleShot(800, s6_p2_check)
+        return
+    state["p2_count"] += 1
+    values = page.values()
+    values["rpy"] = [3.0, 73.0 + state["p2_count"], -167.0]
+    window.plot.set_figure(build_preview_figure(values))
+    QtCore.QTimer.singleShot(120, s6_p2_push)
+
+
+CAMERA_JS = """(function () {
+  try {
+    var scene = gd._fullLayout.scene;
+    var cam = (scene && scene.camera) || (gd.layout.scene && gd.layout.scene.camera);
+    return JSON.stringify(cam || null);
+  } catch (error) { return '"err"'; }
+})()"""
+
+
+def s6_p2_check():
+    step("连续换图 10 次不重载壳页（P2）",
+         window.plot.load_count == 1,
+         f"load_count={window.plot.load_count}")
+    js(CAMERA_JS, s6_p2_camera)
+
+
+def s6_p2_camera(raw):
+    try:
+        camera = json.loads(str(raw or "null"))
+    except (TypeError, ValueError):
+        camera = None
+    eye = ((camera or {}).get("eye") or {}) if isinstance(camera, dict) else {}
+    ok = (abs(float(eye.get("x", 0)) - 1.7) < 1e-6
+          and abs(float(eye.get("y", 0)) - 1.2) < 1e-6
+          and abs(float(eye.get("z", 0)) - 0.9) < 1e-6)
+    step("换图后相机视角不动（P2）", ok, f"camera={camera}")
+    QtCore.QTimer.singleShot(100, s6_p3_start)
+
+
+def plan_figure(count: int):
+    """用 ``core`` 生成 ``count`` 点计划（``skip_ik=True``，不跑 IK）。"""
+    from laser_desktop import generate_page as gen
+    from laser_web import core, figures
+
+    previous = os.environ.get("LASER_WEB_RUNS")
+    os.environ["LASER_WEB_RUNS"] = tempfile.mkdtemp(prefix="s6-runs-")
+    try:
+        values = gen.form_defaults()
+        values["grid_mode"] = "count"
+        values["target_count"] = count
+        values["domain_axes"] = values["domain_mode"] = "axes"
+        params = gen.form_to_params(values)
+        params["skip_ik"] = True
+        result = core.run_scan(params)
+    finally:
+        if previous is None:
+            os.environ.pop("LASER_WEB_RUNS", None)
+        else:
+            os.environ["LASER_WEB_RUNS"] = previous
+    rows = result.get("waypoints") or []
+    return figures.waypoint_figure(rows, all_ok=True), len(rows)
+
+
+def s6_p3_start():
+    """P3：50 / 200 / 1000 点各测一次 ``Plotly.react`` 的 JS 侧耗时。"""
+    state["p3"] = []
+    state["p3_queue"] = [50, 200, 1000]
+    s6_p3_next()
+
+
+def s6_p3_next():
+    queue = state["p3_queue"]
+    if not queue:
+        s6_p3_report()
+        return
+    count = queue.pop(0)
+    started = time.time()
+    figure, points = plan_figure(count)
+    step(f"生成 {count} 点计划（skip_ik，P3）", points >= count * 0.9,
+         f"{points} 点，plan+建图 {1000 * (time.time() - started):.0f} ms")
+    state["p3_started"] = time.time()
+
+    def measured(ms):
+        state["p3"].append((count, points, ms))
+        QtCore.QTimer.singleShot(100, s6_p3_next)
+
+    window.plot.measure_react(figure, measured, timeout_s=30.0)
+
+
+def s6_p3_report():
+    lines = [f"{count} 点 → {ms:.1f} ms" for count, _points, ms in state["p3"]
+             if ms is not None]
+    thousand = [ms for count, _points, ms in state["p3"] if count == 1000]
+    slowest = max([ms for _c, _p, ms in state["p3"] if ms is not None] or [0.0])
+    step("1000 点 react < 1500 ms（P3）",
+         bool(thousand) and thousand[0] is not None and thousand[0] < 1500.0,
+         "；".join(lines) + f"（最慢 {slowest:.0f} ms）")
+    QtCore.QTimer.singleShot(200, s6_p4)
+
+
+def s6_p4():
+    count = qtwebengine_processes()
+    step("QtWebEngineProcess ≤ 2（P4）", 0 < count <= 2, f"{count} 个")
+    step("三页共用一个图视图（P5）",
+         window.plot.created and window.plot.view is not None,
+         f"created={window.plot.created} 视图={type(window.plot.view).__name__} "
+         f"load_count={window.plot.load_count}")
+    QtCore.QTimer.singleShot(200, s6c_start)
+
+
+# ---------------------------------------------------------------------------
+# S6c：主操作按钮的固定行 + 预览卡按内容拿高度（三页 × 两种窗口尺寸，六张截图）
+# ---------------------------------------------------------------------------
+def label_fully_visible(widget) -> bool:
+    """控件在屏幕上完整可见（可见区域 == 整个 rect）。"""
+    if not widget.isVisible():
+        return False
+    return widget.visibleRegion().boundingRect() == widget.rect()
+
+
+def buttons_of(page) -> dict:
+    """当前页的主操作按钮（S6c 只认这三个）。"""
+    if page is window.repair:
+        return {"定位段": page.locate_button, "修复": page.repair_button}
+    return {page.generate_button.text(): page.generate_button}
+
+
+def metric_labels_of(page) -> dict:
+    """预览卡里的五项数值（生成 / 修复 = 体积…欧拉约定；ISO = 立方体…截面）。"""
+    if page is window.iso:
+        keys = ("cube", "apothem", "center", "layout", "plane")
+        return {key: page.preview_labels[key] for key in keys}
+    keys = ("volume", "grid", "points", "design", "euler")
+    return {key: page.metric_labels[key] for key in keys}
+
+
+def s6c_start():
+    """先把三种尺寸×三页排成一队（1600 与 1280 各一遍）。"""
+    state["s6c_queue"] = [
+        (size_label, size, kind, row)
+        for size_label, size in (("1600", (S6_WIDTH, S6_HEIGHT)),
+                                 ("1280", (S6_SMALL_WIDTH, S6_SMALL_HEIGHT)))
+        for kind, row in (("generate", 0), ("iso", 2), ("repair", 1))]
+    s6c_next()
+
+
+def s6c_next():
+    queue = state.get("s6c_queue") or []
+    if not queue:
+        s6c_done()
+        return
+    size_label, size, kind, row = queue.pop(0)
+    window.resize(*size)
+    window.nav.setCurrentRow(row)
+    QtCore.QTimer.singleShot(600, lambda: s6c_check(size_label, size, kind))
+
+
+def s6c_check(size_label, size, kind):
+    """量一页的一档：预览卡 / 图 / 表 / 按钮 + 截图。"""
+    page = window.stack.currentWidget()
+    if kind == "generate":
+        tab = page.waypoints_page
+    elif kind == "iso":
+        tab = page.points_page
+    else:
+        tab = page.plan_page
+    page.result_tabs.setCurrentWidget(tab)
+    wait_events(0.5)
+    width, height = size
+    label = f"{kind} {width}×{height}"
+    splitter = page._viewer_splitter
+    preview, plot, results = splitter.sizes()
+    scroll = splitter.widget(0)
+    card = splitter.preview_card
+    table = page.point_table if kind == "iso" else page.waypoint_table
+    rows = visible_rows(table)
+    want_rows = (S6_MIN_ROWS if (size == (S6_WIDTH, S6_HEIGHT)) else
+                 S6_SMALL_MIN_ROWS)
+    want_rows = min(want_rows, max(1, table.rowCount()))
+    want_plot = (page_layout.PLOT_MIN_HEIGHT if size == (S6_WIDTH, S6_HEIGHT)
+                 else page_layout.PLOT_FLOOR_HEIGHT)
+
+    # ① 预览卡：1600 下内容不滚（五项数值一眼看到），1280 下允许滚
+    metrics = metric_labels_of(page)
+    hidden = [key for key, widget in metrics.items()
+              if not label_fully_visible(widget)]
+    bar = scroll.verticalScrollBar().maximum()
+    if size == (S6_WIDTH, S6_HEIGHT):
+        # 判据是"五项数值一眼全见"；卡片尾巴（core 打印的两行提示）可能还要
+        # 滚 8–11 px，那不影响判断可行/不可行，数字照实报出来。
+        ok = not hidden
+        step(f"S6c {label} 预览卡五项数值无滚动可见", ok,
+             f"预览卡={preview} px（内容 {card.sizeHint().height()}），"
+             f"还需滚 {bar} px，看不到的项={hidden or '无'}")
+    else:
+        step(f"S6c {label} 预览卡可滚动（允许）", preview >= page_layout.PREVIEW_MIN_HEIGHT,
+             f"预览卡={preview} px，滚动 {bar} px，看不到的项={hidden or '无'}")
+
+    # ② 图区
+    step(f"S6c {label} 图区 ≥{want_plot}", plot >= want_plot, f"图={plot} px")
+
+    # ③ 表的可见行数
+    step(f"S6c {label} 一屏 ≥{want_rows} 行", rows >= want_rows,
+         f"可见={rows} 行（表高 {table.height()}，结果区={results} px）")
+
+    # ④ 主操作按钮：可见区域 == 整块，且 height ≥ sizeHint
+    detail = []
+    ok = True
+    for text, button in buttons_of(page).items():
+        region = button.visibleRegion().boundingRect()
+        good = (button.isVisible() and region == button.rect()
+                and button.height() >= button.sizeHint().height())
+        ok = ok and good
+        if good:
+            detail.append(f"{text} {button.width()}×{button.height()}"
+                          f"（region={region.width()}×{region.height()}，"
+                          f"sizeHint 高={button.sizeHint().height()}）")
+        else:
+            detail.append(f"{text} 不完整：region={region}，"
+                          f"rect={button.rect()}")
+    step(f"S6c {label} 主操作按钮完整可见", ok, "；".join(detail))
+
+    # ⑤ 截图
+    shot = SHOT_S6C[(kind, size_label)]
+    saved = window.grab().save(shot)
+    size_bytes = os.path.getsize(shot) if os.path.exists(shot) else 0
+    step(f"截图（S6c {label}）", bool(saved) and size_bytes > 5000,
+         f"{size_bytes} 字节 → {shot}")
+    QtCore.QTimer.singleShot(150, s6c_next)
+
+
+def s6c_done():
+    """回到默认尺寸，接着跑 S6d（评审三处必改的探针）。"""
+    window.resize(S6_WIDTH, S6_HEIGHT)
+    window.nav.setCurrentRow(0)
+    wait_events(0.3)
+    s6d_start()
+
+
+# ---------------------------------------------------------------------------
+# S6d：S6 评审的三处必改（真 WebEngine 探针）
+# ---------------------------------------------------------------------------
+def marker_sizes_js(callback):
+    """读壳页里每个 trace 的 ``marker.size``（高亮只能靠这个数组证明）。"""
+    js("window.__markerSizes()", callback)
+
+
+def s6d_start():
+    """先在生成页把高亮清干净，读出基准尺寸。"""
+    window.nav.setCurrentRow(0)
+    wait_events(0.5)
+    page = window.generate
+    page.result_tabs.setCurrentWidget(page.waypoints_page)
+    wait_events(0.3)
+    js("window.__select([])", lambda _raw: QtCore.QTimer.singleShot(
+        350, lambda: marker_sizes_js(s6d_r1_base)))
+
+
+def s6d_r1_base(raw):
+    """R1-0：清空后每个点都回到基准（结果图的 marker.size=5）。"""
+    try:
+        sizes = json.loads(str(raw or "[]"))
+    except (TypeError, ValueError):
+        sizes = []
+    base = sizes[0] if sizes else []
+    rows = window.generate.waypoint_table.rowCount()
+    if isinstance(base, (int, float)):          # 还没 restyle 过：标量
+        base = [base] * rows
+    state["base"] = list(base)
+    step("R1 基准 marker.size（清空后全回 5）",
+         len(base) == 8 and all(value == 5 for value in base), f"{base}")
+    s6d_r1_select("3", 3, s6d_r1_after_3)
+
+
+def s6d_r1_select(key, index, next_step):
+    """选一个点，350 ms 后读回 marker.size 数组。"""
+    js("window.__select(['%s'])" % key, lambda _raw: QtCore.QTimer.singleShot(
+        350, lambda: marker_sizes_js(
+            lambda raw: s6d_r1_check(raw, index, next_step))))
+
+
+def s6d_r1_check(raw, index, next_step):
+    """断言“只有第 index 个点是 12”，并把数组原文打出来。"""
+    try:
+        sizes = json.loads(str(raw or "[]"))[0]
+    except (TypeError, ValueError, IndexError):
+        sizes = []
+    expected = list(state.get("base") or [])
+    if len(expected) >= index:
+        expected[index - 1] = 12
+    step(f"R1 选 {index} → 只有第 {index} 个点是 12", sizes == expected,
+         f"数组={sizes}")
+    next_step()
+
+
+def s6d_r1_after_3():
+    """R1-②：改选 7（上一次的 3 必须缩回去）。"""
+    s6d_r1_select("7", 7, s6d_r1_after_7)
+
+
+def s6d_r1_after_7():
+    """R1-③：清空 → 全部回基准 5，回显也回空。"""
+    js("window.__select([])", lambda _raw: QtCore.QTimer.singleShot(
+        350, lambda: marker_sizes_js(s6d_r1_after_clear)))
+
+
+def s6d_r1_after_clear(raw):
+    try:
+        sizes = json.loads(str(raw or "[]"))[0]
+    except (TypeError, ValueError, IndexError):
+        sizes = []
+    base = list(state.get("base") or [])
+    step("R1 清空 → 全部回到基准 5", sizes == base, f"数组={sizes}")
+    js("window.__selectedKeys()", s6d_r2)
+
+
+def s6d_r2(selected_raw):
+    """R2：切页后状态栏原文带页面前缀、不残留；切回来高亮要补回。"""
+    try:
+        shown = json.loads(str(selected_raw or "[]"))
+    except (TypeError, ValueError):
+        shown = None
+    step("R1 清空后回显也为空", shown == [], f"__selectedKeys={shown}")
+    page = window.generate
+    page.waypoint_table.setCurrentCell(4, 0)        # GP0005
+    wait_events(0.4)
+    message = window.statusBar().currentMessage()
+    step("R2 页面消息带页面前缀", message.startswith("生成："), f"状态栏={message!r}")
+    window.nav.setCurrentRow(2)                     # 切到 ISO 五点
+    wait_events(0.4)
+    iso_message = window.statusBar().currentMessage()
+    step("R2 切页后不残留上一页的话",
+         "GP0005" not in iso_message
+         and (not iso_message or iso_message.startswith("ISO：")),
+         f"状态栏={iso_message!r}（ISO 页）")
+    window.nav.setCurrentRow(0)                     # 切回来
+    wait_events(0.8)
+    step("R2 切回生成页状态栏", window.statusBar().currentMessage().startswith("生成："),
+         f"状态栏={window.statusBar().currentMessage()!r}")
+    state["r2_start"] = time.time()
+    marker_sizes_js(s6d_r2_highlight_back)
+
+
+def s6d_r2_highlight_back(raw):
+    """R2c：切回来之后图上的选中点必须重新是 12（react 会把它重置成 5）。"""
+    try:
+        sizes = json.loads(str(raw or "[]"))[0]
+    except (TypeError, ValueError, IndexError):
+        sizes = []
+    expected = list(state.get("base") or [])
+    if len(expected) >= 5:
+        expected[4] = 12                        # GP0005 是第 5 行
+    step("R2 切回后图上的选中点补回来了", sizes == expected, f"数组={sizes}")
+    QtCore.QTimer.singleShot(12000, s6d_r2_after_timeout)
+
+
+def s6d_r2_after_timeout():
+    """R2：临时消息 10 s 超时后，常驻信息（永久控件）必须还在。"""
+    message = window.statusBar().currentMessage()
+    label = window._status_label.text()
+    tooltip = window._status_label.toolTip()
+    elapsed = time.time() - state.get("r2_start", time.time())
+    step("R2 临时消息到点自己清掉", message == "",
+         f"{elapsed:.1f} s 后临时区={message!r}")
+    step("R2 12 s 后常驻信息仍在",
+         BINDING in label and str(paths.data_root()) in tooltip,
+         f"永久控件={label!r}")
+    s6d_r3()
+
+
+def s6d_r3():
+    """R3：``_user_moved`` 之后，``protect_plot`` 不许把图区抢回 260。"""
+    window.nav.setCurrentRow(1)
+    wait_events(0.5)
+    splitter = window.repair._viewer_splitter
+    total = sum(splitter.sizes())
+    results_min = max(page_layout.RESULT_MIN_HEIGHT,
+                      splitter.widget(2).minimumSizeHint().height())
+    target = [total - results_min - 210, 210, results_min]
+    splitter._user_moved = True
+    splitter.setSizes(target)
+    wait_events(0.6)
+    sizes = splitter.sizes()
+    step("R3 用户拖过后图区不被抢回 260",
+         sizes[1] < page_layout.PLOT_MIN_HEIGHT and sizes[0] >= target[0] - 8,
+         f"目标={target} → 实际={sizes}")
+    step("R3 plot_floor 走硬下限 200",
+         splitter.plot_floor() == page_layout.PLOT_FLOOR_HEIGHT,
+         f"plot_floor={splitter.plot_floor()}")
+    step("R3 protect_plot 不再抢高度", splitter.protect_plot() is False,
+         f"protect_plot 返回 False，分割={splitter.sizes()}")
+    QtCore.QTimer.singleShot(200, s6d_done)
+
+
+def s6d_done():
+    window.resize(S6_WIDTH, S6_HEIGHT)
+    window.nav.setCurrentRow(0)
+    wait_events(0.3)
     finish()
 
 
 def finish():
+    # P5：关窗前按"先删 page 再删 view"的顺序拆掉 WebEngine——不拆的话 Qt 在
+    # 进程退出时会打 "Release of profile requested but WebEnginePage still not
+    # deleted. Expect troubles !"（交付到 Windows 就是关窗报错）。
+    window.close()
+    app.processEvents()
+    step("关窗后图视图已拆（P5，stderr 无 not deleted）",
+         not window.plot.created,
+         f"created={window.plot.created} load_count={window.plot.load_count}")
     print("\n=== 结论 ===")
     bad = [name for name, ok, _ in state["steps"] if not ok]
     print("  全部通过" if not bad else "  未通过：" + "、".join(bad))

@@ -45,14 +45,17 @@ from pathlib import Path
 from excitation_trajectory import iso9283_cube as iso
 from laser_web import core, ui_state
 
-from . import form_widgets, generate_page, paths
+from . import form_widgets, generate_page, page_layout, paths
 from .generate_page import (
     LOG_WIDGET_LIMIT,
+    PROGRESS_BAR_HEIGHT,
+    PROGRESS_BAR_WIDTH,
     PROGRESS_STEPS,
     STATE_TEXT,
     UNIT_DEG,
     SortItem,
     _caption,
+    _compact_result_layout,
     _double_spin,
     _inline,
     _row,
@@ -84,6 +87,11 @@ PLANES = {"xz": "XZ 对角面（x=z）", "yz": "YZ 对角面（y=z）",
 #: 自动搜索的示例搜索箱（照抄网页版 ``_SAMPLE_SEARCH_BOX``：x 朝机身外侧留开）。
 SAMPLE_SEARCH_BOX = (700.0, 1400.0, -600.0, 600.0, 200.0, 1300.0)
 
+#: 预览卡片里的五项数值（键, 名称）：由 :class:`page_layout.MetricGrid` 按需换行。
+PREVIEW_METRICS = (("cube", "立方体"), ("apothem", "边心距 L/2"),
+                   ("center", "中心"), ("layout", "布点"),
+                   ("plane", "截面"))
+
 #: 五点的姿态完全相同，现场只能用直线运动连接（网页版同一句话）。
 MOVL_NOTE = "这 5 点的姿态完全相同，控制器用 MOVL 走直线（不要用 PTP）。"
 #: 网页版「工具」页的提示（``iso.json`` 与 ``scan.json`` 同构）。
@@ -105,8 +113,12 @@ FACE_LABELS = ("X− 面心", "X+ 面心", "Y− 面心", "Y+ 面心",
 #: ``iso.png``（``core`` 不给 ISO 写 ``joints.txt``，``iso5.json`` 也只是 CLI
 #: 的 ``--out`` 默认名）。所以这里导出的是真实存在的两个产物，文件名带
 #: ``<run_id>-`` 前缀（:func:`laser_desktop.generate_page.export_artifact`）。
-EXPORTS = (("iso_json", "导出 iso.json", "JSON (*.json);;所有文件 (*)"),
-           ("plot", "导出 iso.png", "PNG 图片 (*.png);;所有文件 (*)"))
+EXPORTS = (("iso_json", "iso.json", "JSON (*.json);;所有文件 (*)"),
+           ("plot", "iso.png", "PNG 图片 (*.png);;所有文件 (*)"))
+
+#: 结果页签的最小高度（px）：不许随"当前点开哪个页签"变（见 ``page_layout`` 的
+#: 说明）。260 ≈ 页签条 + 表 200 + 一行说明。
+TABS_MIN_HEIGHT = 262
 
 #: 三个页签（规格：路点 / 预览 / 日志）。
 TABS = ("路点", "预览", "日志")
@@ -121,9 +133,10 @@ _MONO_STYLE = "font-family: monospace;"
 #: 预览去抖间隔（毫秒）：与生成页同一个数量级，拖动 spinbox 时不必每格重算。
 DEBOUNCE_MS = 300
 
-#: 出结果后结果区至少占多高（像素）：5 行路点表 + 表头 + 状态/进度/统计/导出
-#: 都要露出来（生成页的 260 px 只够表头，S5 评审核对过截图）。
-RESULT_MIN_HEIGHT_ISO = 360
+#: 出结果后结果区至少占多高（像素）：三页统一走
+#: :func:`laser_desktop.generate_page.expand_result_area`（按"露 8 行"实测算），
+#: 这里保留一个显式下限常量只为文档/测试引用。
+RESULT_MIN_HEIGHT_ISO = generate_page.RESULT_MIN_HEIGHT
 
 #: 结果区状态行里运行目录的简写（``runs/<id>``）：完整路径放进 tooltip，
 #: 状态行只留一行——它每多一行，路点表就少露一行。
@@ -616,6 +629,7 @@ def preview_figure(preview: dict):
         marker={"size": 6, "color": "#1976d2",
                 "line": {"color": "#20232a", "width": 0.5}},
         text=[row["name"] for row in points],
+        customdata=[[str(row["name"])] for row in points],
         textposition="top center",
         textfont={"size": 11, "color": "#1976d2"},
         hovertext=[f"{row['name']} {_coordinate_text(row['pos'])}"
@@ -636,6 +650,32 @@ def preview_figure(preview: dict):
     return figure
 
 
+def attach_point_keys(figure, points):
+    """给 ISO 图的点 trace 补 ``customdata[0] = 点名``（P1 的联动键）。
+
+    ``laser_web.figures`` 是网页版共用资产（本片不改它），它没写 ``customdata``；
+    桌面版要“点图 → 选中表格行”，所以在桌面层按 trace 名补上。trace 只有三
+    种：立方体棱线（没有键，点它不联动）、可解点、无解点。
+
+    Args:
+        figure: :func:`laser_web.figures.iso_cube_figure` 的结果（就地改）。
+        points: ``core.run_iso9283()["points"]``。
+
+    Returns:
+        plotly ``Figure``: 同一个对象（便于链式调用）。
+    """
+    rows = [row for row in (points or []) if row.get("pos")]
+    good = [[str(row.get("name"))] for row in rows if row.get("ok")]
+    bad = [[str(row.get("name"))] for row in rows if not row.get("ok")]
+    for trace in figure.data or []:
+        name = str(getattr(trace, "name", "") or "")
+        if name.startswith("可解"):
+            trace.customdata = good
+        elif name.startswith("无解"):
+            trace.customdata = bad
+    return figure
+
+
 def result_figure(result: dict):
     """结果图：复用网页版 :func:`laser_web.figures.iso_cube_figure`（同一份代码）。
 
@@ -643,25 +683,26 @@ def result_figure(result: dict):
         result: ``core.run_iso9283`` 的返回值。
 
     Returns:
-        plotly ``Figure``。
+        plotly ``Figure``（点 trace 带 ``customdata[0] = P1..P5``）。
     """
     from laser_web import figures
 
     stats = (result or {}).get("stats") or {}
-    return figures.iso_cube_figure(
+    figure = figures.iso_cube_figure(
         result.get("points") or [],
         cube_center=stats.get("cube_center"),
         side=stats.get("cube_side"),
         layout=str(stats.get("layout") or ""),
         plane=str(stats.get("plane") or ""),
         height=520)
+    return attach_point_keys(figure, result.get("points") or [])
 
 
 # ---------------------------------------------------------------------------
 # 页面
 # ---------------------------------------------------------------------------
 class IsoPage(QtWidgets.QWidget):
-    """ISO 五点页：左侧表单 + 右上预览卡 + 右下（图 + 三页签结果区）。
+    """ISO 五点页：左侧表单 + 右侧三段（预览卡 / 图 / 三页签结果区）。
 
     Attributes:
         fields: ``{键: 控件}``，取值与 :func:`form_to_params` 的入参同名。
@@ -681,7 +722,11 @@ class IsoPage(QtWidgets.QWidget):
     #: 预览去抖间隔（毫秒）。
     DEBOUNCE_MS = DEBOUNCE_MS
 
-    def __init__(self, plot=None, robots=None, parent=None, bridge=None) -> None:
+    #: 状态栏里的页面前缀（三页共用一个状态栏）。
+    STATUS_PREFIX = "ISO"
+
+    def __init__(self, plot=None, robots=None, parent=None, bridge=None,
+                 settings=None) -> None:
         """建页面。
 
         Args:
@@ -691,9 +736,15 @@ class IsoPage(QtWidgets.QWidget):
             parent: 父控件。
             bridge: 现成的 :class:`JobBridge`（测试注入假登记表用）；``None``
                 时按 :func:`laser_desktop.paths.runs_root` 新建一个。
+            settings: ``QSettings``（右栏三段分割的比例）；``None`` 时用应用默认。
         """
         super().__init__(parent)
         self._plot = plot
+        #: 只有**当前页**才往共享的 PlotView 推图（主窗口切页时改这个）。
+        #: 三页共用一个视图，隐藏页的去抖/预览如果照推，会把当前页的
+        #: 结果图换成自己的预览图（S6 联调实测）。
+        self._active = True
+        self._settings = settings
         self._robots = (core.list_robots(paths.asset_root())
                         if robots is None else list(robots))
         self.fields = {}
@@ -717,32 +768,67 @@ class IsoPage(QtWidgets.QWidget):
         self._debounce.setInterval(self.DEBOUNCE_MS)
         self._debounce.timeout.connect(self.apply_preview)
 
-        page_layout = QtWidgets.QVBoxLayout(self)
-        page_layout.setContentsMargins(8, 8, 8, 8)
-        page_layout.setSpacing(6)
+        column = QtWidgets.QVBoxLayout(self)
+        column.setContentsMargins(8, 8, 8, 8)
+        column.setSpacing(6)
         self.banner = QtWidgets.QLabel("")
         self.banner.setWordWrap(True)
         self.banner.hide()
-        page_layout.addWidget(self.banner)
+        column.addWidget(self.banner)
 
         body = QtWidgets.QWidget()
         outer = QtWidgets.QHBoxLayout(body)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(8)
-        outer.addWidget(self._build_form(), 0)
-        right = QtWidgets.QVBoxLayout()
-        right.setSpacing(8)
-        right.addWidget(self._build_preview_card(), 0)
-        right.addWidget(self._build_viewer(), 1)
-        outer.addLayout(right, 1)
-        page_layout.addWidget(body, 1)
+        outer.addWidget(self._build_left_column(), 0)
+        outer.addWidget(self._build_right_column(), 1)
+        column.addWidget(body, 1)
 
         # 信号连在控件建完之后（槽里直接碰控件，都在 GUI 线程，见 job_bridge）
         self.bridge.progress.connect(self._on_progress)
         self.bridge.log_line.connect(self._on_log_line)
         self.bridge.finished.connect(self._on_finished)
+        self._connect_plot_link()
         self.refresh_preview()
         self._resume_running_job()
+
+    def _build_left_column(self) -> QtWidgets.QWidget:
+        """左栏：表单滚动区 + **主操作行**（S6c）。
+
+        「生成五点」原来在表单**最底下**（在滚动区里）：表单内容一多它就滚出
+        视野，离屏实测 ``visibleRegion()`` 是空的（看不见）。现在它跟在表单
+        滚动区外面，垂直策略 ``Fixed``，两种窗口尺寸下都按 ``sizeHint`` 拿到整高。
+        """
+        column = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(column)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self._build_form(), 1)
+        layout.addWidget(self._build_actions(), 0)
+        return column
+
+    def _build_actions(self) -> QtWidgets.QWidget:
+        """主操作行：「生成五点」。"""
+        self.generate_button = QtWidgets.QPushButton("生成五点")
+        self.generate_button.setToolTip(
+            "起一条后台任务：定立方体 → 生成五点 → 解算 IK → 出图 → 写 runs/<id>/")
+        self.generate_button.clicked.connect(self.start_iso)
+        self.action_row = page_layout.build_action_row(self.generate_button)
+        return self.action_row
+
+    def _build_right_column(self) -> QtWidgets.QWidget:
+        """右栏三段：预览卡 / 图 / 结果区（L1，与生成页同一份实现）。"""
+        self.plot_slot = page_layout.PlotSlot(
+            "ISO 五点图在这里（本环境未挂 WebEngine）")
+        if (self._plot is not None
+                and not getattr(self._plot, "SHARED_ACROSS_PAGES", False)):
+            self.plot_slot.adopt(self._plot)
+        splitter = page_layout.RightSplitter(
+            "iso", self._build_preview_card(), self.plot_slot,
+            self._build_result_area(), settings=self._settings)
+        self._viewer_splitter = splitter
+        self._right_splitter = splitter
+        return splitter
 
     # ------------------------------------------------------------------ 表单
     def _build_form(self) -> QtWidgets.QScrollArea:
@@ -756,24 +842,18 @@ class IsoPage(QtWidgets.QWidget):
             self.fields, self._robots, self._on_change, defaults["robot"])
         self.robot_path_label = robot["path_label"]
         self.skipped_label = robot["skipped_label"]
+        self.robot_group = robot["group"]     # 冒烟/单测要量它高没高（P3）
         layout.addWidget(robot["group"])
         layout.addWidget(self._build_cube_group(defaults))
         layout.addWidget(self._build_layout_group(defaults))
         layout.addWidget(form_widgets.build_pose_group(self.fields, defaults,
                                                       self._on_change))
         layout.addWidget(self._build_seed_group(defaults))
-        self.generate_button = QtWidgets.QPushButton("生成五点")
-        self.generate_button.setToolTip(
-            "起一条后台任务：定立方体 → 生成五点 → 解算 IK → 出图 → 写 runs/<id>/")
-        self.generate_button.clicked.connect(self.start_iso)
-        layout.addWidget(self.generate_button)
         layout.addStretch(1)
 
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidget(content)
-        scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(455)
-        scroll.setMaximumWidth(560)
+        scroll = generate_page._form_scroll(content,
+                                            generate_page.FORM_MAX_WIDTH)
+        self.form_scroll = scroll                # 冒烟/单测要查横滚条（P4）
         return scroll
 
     def _build_cube_group(self, defaults) -> QtWidgets.QGroupBox:
@@ -927,29 +1007,26 @@ class IsoPage(QtWidgets.QWidget):
 
     # ------------------------------------------------------------ 预览卡片
     def _build_preview_card(self) -> QtWidgets.QGroupBox:
-        """预览卡片：边长 / 边心距 / 中心 / 布点 / 截面 + 报错原文 + MOVL 提示。
+        """预览卡片：立方体 / 边心距 / 中心 / 布点 / 截面 + 报错原文 + 提示。
 
-        压在图上边，所以只占三行（``_inline`` 把两对短字段并排）；
-        「生成五点」按钮在左侧表单底部（与生成页 / 修复页同一个位置）。
+        五项用 :class:`laser_desktop.page_layout.MetricGrid`（按需换行，一行
+        放不下就换行）：1600×950 下两行、1280×800 下三行，**都不会横向裁字**。
+        S6b 是 ``QFormLayout`` + ``_inline``（一对占上下两行、一行 52 px），
+        卡片要 289 px——压在图上边，就是图被挤掉的那一截。
+
+        「生成五点」在左栏底部的操作行里（S6c：它原来在表单**滚动区**最底下，
+        内容一多就滚出视野——离屏实测 ``visibleRegion()`` 是空的）。说明文字走
+        tooltip：``MOVL_NOTE`` 在左侧「IK 种子与告警」组里已经完整写过一遍。
         """
         group = QtWidgets.QGroupBox("预览（不跑 IK）")
         layout = QtWidgets.QVBoxLayout(group)
-        layout.setSpacing(2)
+        layout.setSpacing(3)
+        layout.setContentsMargins(4, 2, 4, 2)
 
-        # 卡片压在图上边：行数越少、图越高，所以三行内排完
-        # （立方体/边心距一行、中心一行、布点/截面一行）。
-        form = QtWidgets.QFormLayout()
         self.preview_labels = {}
-        for key in ("cube", "apothem", "center", "layout", "plane"):
-            value = QtWidgets.QLabel("—")
-            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            self.preview_labels[key] = value
-        form.addRow(_inline([("立方体", self.preview_labels["cube"]),
-                             ("边心距 L/2", self.preview_labels["apothem"])]))
-        form.addRow("中心", self.preview_labels["center"])
-        form.addRow(_inline([("布点", self.preview_labels["layout"]),
-                             ("截面", self.preview_labels["plane"])]))
-        layout.addLayout(form)
+        self.metric_grid = page_layout.MetricGrid(
+            self.preview_labels, PREVIEW_METRICS)
+        layout.addWidget(self.metric_grid)
 
         self.error_label = QtWidgets.QLabel("")
         self.error_label.setWordWrap(True)
@@ -963,72 +1040,60 @@ class IsoPage(QtWidgets.QWidget):
         self.warning_label.hide()
         layout.addWidget(self.warning_label)
 
-        layout.addWidget(_caption(
+        # 说明走 tooltip（与生成页 / 修复页同一份做法）：1600×950 的真实窗口
+        # 里预览卡只有 ~148 px，而 core 的提示行（三轴跨度不等时）还要占两行；
+        # 再多一行说明就得滚一下才看得到「截面」。
+        # ``MOVL_NOTE`` 在左侧「IK 种子与告警」组里已经完整写过。
+        group.setToolTip(
             MOVL_NOTE + "改任何一项都会重算预览（面心 / 候选点 / 五点都在"
-            "下面的「预览」页签里）。"))
+            "下面的「预览」页签里）。")
         return group
-
-    def _build_viewer(self) -> QtWidgets.QWidget:
-        """图 + 结果区：上下可拖的 ``QSplitter``。"""
-        if self._plot is not None:
-            viewer = self._plot
-        else:                                            # 纯逻辑测试/无图环境
-            viewer = _caption("ISO 五点图在这里（本环境未挂 WebEngine）")
-        result_area = self._build_result_area()
-        splitter = QtWidgets.QSplitter(Qt.Vertical)
-        splitter.addWidget(viewer)
-        splitter.addWidget(result_area)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([400, 200])
-        splitter.setChildrenCollapsible(False)
-        self._viewer_splitter = splitter
-        return splitter
 
     def _build_result_area(self) -> QtWidgets.QGroupBox:
         """结果区：状态行 + 进度/取消 + 统计行 + 三页签（路点/预览/日志）+ 导出。"""
         group = QtWidgets.QGroupBox("结果")
+        self.result_area = group        # expand_result_area 要量"表以外占多高"
         layout = QtWidgets.QVBoxLayout(group)
-        layout.setSpacing(4)
+        _compact_result_layout(layout)
 
         self.status_label = QtWidgets.QLabel("")
         self.status_label.setWordWrap(True)
         self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.status_label.hide()
-        layout.addWidget(self.status_label)
-
+        self.status_label.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
+                                        QtWidgets.QSizePolicy.Ignored)
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, PROGRESS_STEPS)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("空闲")
+        # 进度条固定矮一点：它连同取消按钮占 33 px，而结果区的最小高度直接
+        # 决定窗口最小高度（1280×800 要装得下三段）。
+        self.progress_bar.setMaximumHeight(PROGRESS_BAR_HEIGHT)
+        self.progress_bar.setFixedWidth(PROGRESS_BAR_WIDTH)
         self.cancel_button = QtWidgets.QPushButton("取消")
         self.cancel_button.setToolTip(
             "只在阶段边界生效：当前阶段跑完就停，不会硬打断 IK")
         self.cancel_button.clicked.connect(self._on_cancel_clicked)
         self.cancel_button.hide()
-        progress_row = QtWidgets.QHBoxLayout()
-        progress_row.setContentsMargins(0, 0, 0, 0)
-        progress_row.addWidget(self.progress_bar, 1)
-        progress_row.addWidget(self.cancel_button, 0)
-        layout.addLayout(progress_row)
+        # 状态 + 进度 + 取消同占一行（S6c，与生成页 / 修复页同一份做法）。
+        status_row = QtWidgets.QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(6)
+        status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.progress_bar, 0)
+        status_row.addWidget(self.cancel_button, 0)
+        layout.addLayout(status_row)
+        self.status_label.hide()
 
-        stats_row = QtWidgets.QHBoxLayout()
-        stats_row.setContentsMargins(0, 0, 0, 0)
-        stats_row.setSpacing(12)
-        for key in STAT_KEYS:
-            label = QtWidgets.QLabel("—")
-            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            self.stat_labels[key] = label
-            stats_row.addWidget(label)
-        stats_row.addStretch(1)
         # 参数改完但没重跑：灰字点明“下表是上一次运行的”，就压在被提示的表上面
         self.stale_label = QtWidgets.QLabel("")
         self.stale_label.setWordWrap(True)
         self.stale_label.setStyleSheet(_STATUS_STYLES["muted"])
+        self.stale_label.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
+                                       QtWidgets.QSizePolicy.Ignored)
         self.stale_label.hide()
         layout.addWidget(self.stale_label)
-        self.stats_holder = QtWidgets.QWidget()
-        self.stats_holder.setLayout(stats_row)
+        # 统计卡：按需换行（1600×950 两行、1280×800 三行，都不切字）
+        self.stats_holder = page_layout.StatsGrid(self.stat_labels, STAT_KEYS)
         self.stats_holder.hide()        # 没结果时不占高度（预览时图可以高一点）
         layout.addWidget(self.stats_holder)
 
@@ -1036,16 +1101,22 @@ class IsoPage(QtWidgets.QWidget):
         self.points_page = self._build_points_page()
         self.preview_page = self._build_preview_page()
         self.log_page = self._build_log_page()
+        self.result_tabs.setMinimumHeight(TABS_MIN_HEIGHT)
         self.result_tabs.addTab(self.points_page, TABS[0])
         self.result_tabs.addTab(self.preview_page, TABS[1])
         self.result_tabs.addTab(self.log_page, TABS[2])
+        # 切页签后重新撑一次（口径见 generate_page.expand_result_area）
+        self.result_tabs.currentChanged.connect(
+            lambda _index: self._expand_result_area())
         layout.addWidget(self.result_tabs, 1)
 
         export_row = QtWidgets.QHBoxLayout()
         export_row.setContentsMargins(0, 0, 0, 0)
-        export_row.addWidget(_caption("导出（从 runs/<id>/ 复制，不移动）："))
+        self.export_caption = _caption("导出：", lines=1)
+        self.export_caption.setToolTip("从 runs/<id>/ 复制，原文件不动")
+        export_row.addWidget(self.export_caption)
         for key, title, _filters in EXPORTS:
-            button = QtWidgets.QPushButton(title)
+            button = generate_page._export_button(title)
             button.setEnabled(False)
             button.clicked.connect(
                 lambda _checked=False, export_key=key: self._on_export(export_key))
@@ -1063,8 +1134,9 @@ class IsoPage(QtWidgets.QWidget):
         layout.setSpacing(2)
         layout.addWidget(_caption(
             "P1 是立方体中心，P2~P5 是截面的四个角；无解的行整行标红，"
-            "关节角缺失显示「—」。"))
-        self.point_table = make_table(POINT_HEADERS)
+            "关节角缺失显示「—」。", lines=1))
+        self.point_table = page_layout.mark_result_table(
+            make_table(POINT_HEADERS))
         layout.addWidget(self.point_table, 1)
         return page
 
@@ -1122,7 +1194,12 @@ class IsoPage(QtWidgets.QWidget):
         layout.addWidget(_caption(
             f"等价终端输出。后台任务源缓冲只留最近 {JOB_LOG_LIMIT} 行"
             f"（丢一段会插一行「…已省略 N 行」），本控件最多保留 "
-            f"{LOG_WIDGET_LIMIT} 行。"))
+            f"{LOG_WIDGET_LIMIT} 行（省略提示另存上面一行，不会被删）。"))
+        self.log_omission_label = QtWidgets.QLabel("")
+        self.log_omission_label.setWordWrap(True)
+        self.log_omission_label.setStyleSheet(_STATUS_STYLES["muted"])
+        self.log_omission_label.hide()
+        layout.addWidget(self.log_omission_label)
         self.log_edit = QtWidgets.QPlainTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setFont(monospace_font())
@@ -1273,7 +1350,8 @@ class IsoPage(QtWidgets.QWidget):
         if not stale:
             self.stale_label.hide()
             return
-        self.stale_label.setText(
+        page_layout.fit_message(
+            self.stale_label,
             f"参数已改动，下表来自上一次运行（{result.get('run_id') or '—'}）；"
             "要更新请重新点「生成五点」。")
         self.stale_label.show()
@@ -1379,7 +1457,7 @@ class IsoPage(QtWidgets.QWidget):
             self._report_status(f"预览图渲染失败：{type(error).__name__}: {error}")
         self.last_figure = figure
         if self._plot is not None:
-            self._plot.set_figure(figure)
+            self._push_figure(figure)
         return figure
 
     # ------------------------------------------------------------ 起任务
@@ -1482,8 +1560,14 @@ class IsoPage(QtWidgets.QWidget):
         self.progress_bar.setFormat(text)
 
     def _on_log_line(self, line: str) -> None:
-        """增量日志：直接追加（上限由 ``setMaximumBlockCount`` 管）。"""
-        self.log_edit.appendPlainText(str(line))
+        """增量日志：直接追加；省略提示另存一份到固定标签（L4）。"""
+        text = str(line)
+        if text.startswith(generate_page.OMISSION_PREFIX):
+            self.log_omission_label.setText(
+                f"{text}（更早的行已不在源缓冲里；下面只剩最后"
+                f" {LOG_WIDGET_LIMIT} 行）")
+            self.log_omission_label.show()
+        self.log_edit.appendPlainText(text)
 
     def _on_finished(self, payload: dict) -> None:
         """终态：done → 渲染结果；cancelled → 灰字；failed → 红字。
@@ -1572,24 +1656,16 @@ class IsoPage(QtWidgets.QWidget):
             self._report_status(f"结果图渲染失败：{type(error).__name__}: {error}")
         self.last_figure = figure
         if self._plot is not None:
-            self._plot.set_figure(figure)
+            self._push_figure(figure)
         self.result_tabs.setCurrentWidget(self.points_page)
         self._expand_result_area()
 
     def _expand_result_area(self) -> None:
-        """出结果后把结果区撑到 :data:`RESULT_MIN_HEIGHT_ISO`（路点表要露几行）。
+        """出结果后把结果区撑到"够看 ``RESULT_ROW_TARGET`` 行"（三段版本）。
 
-        只在结果区比下限矮时才动尺寸：用户自己拖过分隔条就尊重他的选择；
-        图区让出空间但至少留 120 px（不然 3D 图就成了一条缝）。
+        与生成页同一口径（实现见 ``generate_page.expand_result_area``）。
         """
-        splitter = getattr(self, "_viewer_splitter", None)
-        if splitter is None:
-            return
-        sizes = splitter.sizes()
-        if len(sizes) != 2 or sizes[1] >= RESULT_MIN_HEIGHT_ISO:
-            return
-        viewer = max(sizes[0] - (RESULT_MIN_HEIGHT_ISO - sizes[1]), 120)
-        splitter.setSizes([viewer, RESULT_MIN_HEIGHT_ISO])
+        generate_page.expand_result_area(self)
 
     def _update_exports(self, result: dict) -> None:
         """按 ``result["artifacts"]`` 启用/禁用导出按钮（文件真的在才开）。"""
@@ -1622,6 +1698,8 @@ class IsoPage(QtWidgets.QWidget):
         self.last_result = None
         self.last_figure = None
         self.log_edit.clear()
+        self.log_omission_label.clear()
+        self.log_omission_label.hide()
         self.point_table.setSortingEnabled(False)
         self.point_table.clearContents()
         self.point_table.setRowCount(0)
@@ -1638,26 +1716,106 @@ class IsoPage(QtWidgets.QWidget):
         self.stale_label.clear()
         self.stale_label.hide()
         if self._plot is not None:
-            self._plot.set_figure(placeholder_figure("正在解算：新任务已提交"))
+            self._push_figure(placeholder_figure("正在解算：新任务已提交"))
 
     def _set_status(self, text: str, level: str = "info") -> None:
         """结果区状态行：``ok`` 绿 / ``error`` 红 / ``muted`` 灰 / ``info`` 正常。"""
         message = str(text or "")
-        self.status_label.setText(message)
+        page_layout.fit_message(self.status_label, message, max_height=26)
         self.status_label.setStyleSheet(_STATUS_STYLES.get(level, ""))
         self.status_label.setVisible(bool(message.strip()))
+
+    # ------------------------------------------------------------ 表格 ↔ 图
+    def _connect_plot_link(self) -> None:
+        """把五点表与图接起来（S6 P1）：两边都用点名（P1..P5）作键。"""
+        self.point_table.itemSelectionChanged.connect(
+            self._on_point_selected)
+        signal = getattr(self._plot, "pointClicked", None)
+        if signal is not None:
+            signal.connect(self._on_plot_clicked)
+
+    def _on_point_selected(self) -> None:
+        """表格选中变化 → 图上放大那个点，状态栏说出点名。"""
+        key = page_layout.table_key(self.point_table,
+                                    self.point_table.currentRow())
+        if key:
+            self.select_key(key)
+
+    def select_key(self, key, report: bool = True) -> None:
+        """选中一个点：图上放大、表格行选中、状态栏显示点名。
+
+        隐藏页不动作：三页都 ``connect`` 同一个 ``plot.pointClicked``，隐藏页
+        跟着“选中 + 上报”会改写可见页的状态栏（S6 评审建议 2）。
+        """
+        if not self._active:
+            return
+        label = page_layout.gp_label(key)
+        if report:
+            self._report_status(f"已选中 {label}（图上已放大）")
+        select = getattr(self._plot, "select_points", None)
+        if callable(select):
+            select([key])
+        row = page_layout.find_row(self.point_table, key)
+        if row >= 0 and row != self.point_table.currentRow():
+            self.point_table.blockSignals(True)
+            try:
+                self.point_table.setCurrentCell(row, 0)
+                self.point_table.scrollToItem(self.point_table.item(row, 0))
+            finally:
+                self.point_table.blockSignals(False)
+
+    def _on_plot_clicked(self, keys) -> None:
+        """图上点了点 → 表格选中它那一行（P1 的反向）。"""
+        for key in (keys or []):
+            if page_layout.find_row(self.point_table, key) >= 0:
+                self.select_key(key)
+                return
 
     def _report_status(self, message: str) -> None:
         """把一句话写到窗口状态栏（没有主窗口的纯逻辑测试里也能断言）。"""
         self.last_status = str(message)
+        self._show_status()
+
+    def _show_status(self) -> None:
+        """把 :attr:`last_status`（带页面前缀）写进状态栏临时区。"""
+        text = self.status_message()
+        if not text:
+            return
         status_bar = getattr(self.window(), "statusBar", None)
         if callable(status_bar):
-            status_bar().showMessage(self.last_status, 10_000)
+            status_bar().showMessage(text, 10_000)
+
+    def status_message(self) -> str:
+        """状态栏里该显示的本页最后一句（带页面前缀）；没说过话时空串。"""
+        text = str(getattr(self, "last_status", "") or "").strip()
+        if not text:
+            return ""
+        return f"{self.STATUS_PREFIX}：{text}"
+
+    def restore_plot_selection(self) -> None:
+        """切回本页时把表格当前行补回图上（S6 评审 R2c）。"""
+        table = self.point_table
+        row = table.currentRow()
+        if row < 0:
+            return
+        key = page_layout.table_key(table, row)
+        if key:
+            self.select_key(key, report=False)
 
     def shutdown(self) -> None:
         """窗口关闭时收尾：停去抖定时器并注销任务订阅（不取消任务）。"""
         self._debounce.stop()
         self.bridge.shutdown()
+
+    def set_active(self, active: bool) -> None:
+        """主窗口切页时告知本页是不是当前页（隐藏页不往共享视图推图）。"""
+        self._active = bool(active)
+
+    def _push_figure(self, figure) -> None:
+        """把图推给共享的 ``PlotView``：不是当前页就不推（免得盖掉别页的图）。"""
+        if self._plot is None or not self._active:
+            return
+        self._plot.set_figure(figure)
 
     def current_figure(self):
         """本页当前该展示的图（导航切回来时主窗口用它重推）。
@@ -1668,14 +1826,26 @@ class IsoPage(QtWidgets.QWidget):
         """
         if self.last_figure is not None:
             return self.last_figure
+        # 同一个状态下同一个对象：主窗口按**对象身份**判“这张图推过了”，
+        # 每次现建一个新 Figure 就永远命不中，切回本页就会白白 react 一遍
+        # （相机与高亮都跟着被重置）。状态一变（preview 换对象 / run_state 变）
+        # 才算新图。
+        cached = getattr(self, "_current_figure", None)
+        if (cached is not None and cached[0] is self.preview
+                and cached[1] == self.run_state):
+            return cached[2]
         if self.run_state == "running":
-            return placeholder_figure("正在解算：任务在跑，结果出来会显示在这里。",
-                                     title="ISO 五点图（进行中）")
-        try:
-            return preview_figure(self.preview or {})
-        except Exception:                   # noqa: BLE001 - 说明图也不该崩
-            return placeholder_figure("还没有 ISO 五点结果。",
-                                      title="ISO 五点图（未出图）")
+            figure = placeholder_figure(
+                "正在解算：任务在跑，结果出来会显示在这里。",
+                title="ISO 五点图（进行中）")
+        else:
+            try:
+                figure = preview_figure(self.preview or {})
+            except Exception:               # noqa: BLE001 - 说明图也不该崩
+                figure = placeholder_figure("还没有 ISO 五点结果。",
+                                            title="ISO 五点图（未出图）")
+        self._current_figure = (self.preview, self.run_state, figure)
+        return figure
 
     def show_webgl_warning(self) -> None:
         """WebGL 不可用时在页面顶部挂一条中文建议（与其它两页同一段文案）。"""

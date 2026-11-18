@@ -23,7 +23,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from laser_desktop import generate_page
+from laser_desktop import generate_page, page_layout
 from laser_desktop.job_bridge import JobBridge
 from laser_desktop.qt_compat import QtGui, QtWidgets
 from laser_web import jobs
@@ -267,20 +267,26 @@ class ResultRenderTest(unittest.TestCase):
         self.assertIn("color:#1e8449", self.page.status_label.styleSheet())
 
     def test_result_area_grows_so_the_table_is_visible(self):
-        """出结果后结果区至少 260 px（默认 120 px 只露表头），且回到表头。"""
+        """出结果后结果区撑到 ≥ RESULT_MIN_HEIGHT 且能看 8 行，表回到第一行。
+
+        S6 L1：右欄改成三段（预览卡 / 图 / 结果），所以这里看第 3 段。
+        """
         page = self.page
         page.resize(1000, 1000)          # 给足高度：现场笔记本最大化就这个量级
         page.show()
         app().processEvents()
         before = page._viewer_splitter.sizes()
-        self.assertEqual(len(before), 2)
-        self.assertLess(before[1], generate_page.RESULT_MIN_HEIGHT, before)
+        self.assertEqual(len(before), 3)
+        # S6c：预览卡按内容拿（150–220），图 ≥ 260——首开不再要求结果区 < 300
+        self.assertGreaterEqual(before[0], page_layout.PREVIEW_DEFAULT_MIN,
+                                before)
+        self.assertGreaterEqual(before[1], page_layout.PLOT_MIN_HEIGHT, before)
 
         page.render_result(make_result(self.run_dir))
         app().processEvents()
         sizes = page._viewer_splitter.sizes()
-        self.assertGreaterEqual(sizes[1], generate_page.RESULT_MIN_HEIGHT, sizes)
-        self.assertGreaterEqual(sizes[0], 120, sizes)   # 图区不能压成一条缝
+        self.assertGreaterEqual(sizes[2], generate_page.RESULT_MIN_HEIGHT, sizes)
+        self.assertGreaterEqual(sizes[1], 120, sizes)   # 图区不能压成一条缝
         self.assertEqual(page.waypoint_table.verticalScrollBar().value(), 0)
         page.hide()
 

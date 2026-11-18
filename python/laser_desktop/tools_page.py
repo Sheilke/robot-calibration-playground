@@ -377,6 +377,9 @@ class ToolsPage(QtWidgets.QWidget):
         last_status: 最近一次写到状态栏的文字（无主窗口时也能断言）。
     """
 
+    #: 状态栏里的页面前缀（四页共用一个状态栏）。
+    STATUS_PREFIX = "工具"
+
     def __init__(self, parent=None, runs_root=None, active_dirs=None) -> None:
         """建页面。
 
@@ -1110,6 +1113,16 @@ class ToolsPage(QtWidgets.QWidget):
     def _report_status(self, message: str) -> None:
         """把一句话写到窗口状态栏（没有主窗口的纯逻辑测试里也能断言）。"""
         self.last_status = str(message)
+        text = self.status_message()
+        if not text:
+            return
         status_bar = getattr(self.window(), "statusBar", None)
         if callable(status_bar):
-            status_bar().showMessage(self.last_status, 10_000)
+            status_bar().showMessage(text, 10_000)
+
+    def status_message(self) -> str:
+        """状态栏里该显示的本页最后一句（带页面前缀）；没说过话时空串。"""
+        text = str(getattr(self, "last_status", "") or "").strip()
+        if not text:
+            return ""
+        return f"{self.STATUS_PREFIX}：{text}"

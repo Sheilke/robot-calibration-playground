@@ -36,7 +36,7 @@ def _import_pyside6():
     from PySide6.QtWebEngineCore import QWebEngineSettings
     BINDING, DEV_ONLY_BINDING = "PySide6", False
     return (QtCore, QtGui, QtWidgets, QWebEngineView, QWebEngineSettings,
-            QtCore.Signal)
+            QtCore.Signal, QtCore.Slot, _webchannel("PySide6"))
 
 
 def _import_pyqt5():
@@ -46,16 +46,28 @@ def _import_pyqt5():
     from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineSettings
     BINDING, DEV_ONLY_BINDING = "PyQt5", True
     return (QtCore, QtGui, QtWidgets, QWebEngineView, QWebEngineSettings,
-            QtCore.pyqtSignal)
+            QtCore.pyqtSignal, QtCore.pyqtSlot, _webchannel("PyQt5"))
+
+
+def _webchannel(binding: str):
+    """``QWebChannel``（必须与当前绑定同一个：两套绑定的 Qt 对象不能混用）。"""
+    try:
+        if binding == "PySide6":
+            from PySide6.QtWebChannel import QWebChannel
+        else:
+            from PyQt5.QtWebChannel import QWebChannel
+        return QWebChannel
+    except ImportError:                          # pragma: no cover - 环境问题
+        return None
 
 
 try:
     (QtCore, QtGui, QtWidgets, QWebEngineView, QWebEngineSettings,
-     Signal) = _import_pyside6()
+     Signal, Slot, QWebChannel) = _import_pyside6()
 except ImportError:
     try:
         (QtCore, QtGui, QtWidgets, QWebEngineView, QWebEngineSettings,
-         Signal) = _import_pyqt5()
+         Signal, Slot, QWebChannel) = _import_pyqt5()
     except ImportError as error:            # pragma: no cover - 环境问题
         raise ImportError(
             "既没有 PySide6 也没有 PyQt5 + QtWebEngine。\n"
@@ -98,4 +110,38 @@ def configure_webengine_environment() -> None:
     """
     if os.environ.get("LASER_WEBENGINE_NO_SANDBOX", "1") == "1":
         os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
-    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox")
+    # Linux 上 Chromium 会额外拉起 **两个 zygote** 脚手架进程（``--no-sandbox``
+    # 下它们不再提供任何隔离价值），于是“只有一个图视图”却能看到 3 个
+    # ``QtWebEngineProcess``（P4 实测）。``--no-zygote`` 让渲染进程直接 fork：
+    # 进程数 3 → 1，WebGL 仍走硬件（实测 renderer=Mesa Intel(R) Graphics），
+    # 图照旧出来；Windows 没有 zygote，这个开关在那边是空操作。
+    flags = "--no-sandbox"
+    if os.name != "nt":
+        flags += " --no-zygote"
+    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", flags)
+
+
+def is_deleted(obj) -> bool:
+    """这个 Qt 对象的 C++ 部分是否已被删除（PyQt5 / PySide6 各自的判定）。
+
+    只给测试与排障用：``QWebEnginePage`` 是否真的先于 profile 析构，光看
+    Python 那边有没有引用是看不出来的（``deleteLater()`` 不跑事件循环就不生效）。
+
+    Args:
+        obj: 任意 Qt 对象（``None`` 也算"已没了"）。
+
+    Returns:
+        bool: 已删除（或本来就是 ``None``）为 ``True``。
+    """
+    if obj is None:
+        return True
+    try:                                        # PyQt5
+        import sip
+        return bool(sip.isdeleted(obj))
+    except ImportError:                         # pragma: no cover - PySide6
+        pass
+    try:                                        # PySide6
+        import shiboken6
+        return not bool(shiboken6.isValid(obj))
+    except ImportError:                         # pragma: no cover - 都没有
+        return False

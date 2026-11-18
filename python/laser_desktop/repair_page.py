@@ -10,9 +10,9 @@
 2. **修复**：``bridge.submit("repair", lambda job: core.run_repair(params,
    job=job, on_progress=job.set_progress))``，进度 / 日志 / 取消 / 终态全部走
    :class:`laser_desktop.job_bridge.JobBridge` 的三条信号（与 S3 同一套线程模型）；
-3. **结果区**：``QTabWidget`` 四页签——定位（判定徽标 + 段定位表）/ 修复
+3. **结果区**：``QTabWidget`` 五页签——定位（判定徽标 + 段定位表）/ 修复
    （模式、边界 before→after、体积损失、局部改动、前后指标、候选日志）/ 计划
-   （统计行 + 路点表 + 段诊断表，复用生成页的渲染器）/ 日志（任务 stdout）；
+   （统计行 + 路点表）/ 段诊断（修复后计划的段裕度，S6 从「计划」拆出来）/ 日志；
 4. **导出**：``scan.json`` / ``joints.txt`` / ``plot.png`` / ``repair.json`` 从
    ``run_dir`` **复制**（文件名带 ``<run_id>-`` 前缀），与生成页同一个实现
    （:func:`laser_desktop.generate_page.export_artifact`）。
@@ -35,17 +35,19 @@ from pathlib import Path
 
 from laser_web import core, ui_state
 
-from . import form_widgets, generate_page, paths
+from . import form_widgets, generate_page, page_layout, paths
 from .generate_page import (
     LOG_WIDGET_LIMIT,
     POINT_COUNT_WARN,
+    PROGRESS_BAR_HEIGHT,
+    PROGRESS_BAR_WIDTH,
     PROGRESS_STEPS,
-    RESULT_MIN_HEIGHT,
     STAT_KEYS,
     STATE_TEXT,
     UNIT_DEG,
     SortItem,
     _caption,
+    _compact_result_layout,
     _double_spin,
     _inline,
     _int_spin,
@@ -120,10 +122,18 @@ BOUND_UNCHANGED_TEXT = "边界未改动（需改参考姿态或收缩时才会�
 
 #: 导出按钮（**照抄**网页版 ``_EXPORTS`` 的四个键，多一个 ``repair.json`` 的
 #: 过滤串是为了文件对话框）。
-EXPORTS = (("scan_json", "导出 scan.json", "JSON (*.json);;所有文件 (*)"),
-           ("joints", "导出 joints.txt", "文本 (*.txt);;所有文件 (*)"),
-           ("plot", "导出 plot.png", "PNG 图片 (*.png);;所有文件 (*)"),
-           ("repair", "导出 repair.json", "JSON (*.json);;所有文件 (*)"))
+EXPORTS = (("scan_json", "scan.json", "JSON (*.json);;所有文件 (*)"),
+           ("joints", "joints.txt", "文本 (*.txt);;所有文件 (*)"),
+           ("plot", "plot.png", "PNG 图片 (*.png);;所有文件 (*)"),
+           ("repair", "repair.json", "JSON (*.json);;所有文件 (*)"))
+
+#: 结果页签的最小高度（px）：这一页的「计划」页签里有统计(3 行) + 运行目录 +
+#: 路点表，是四页里最高的；不定死的话切到它就裁表（见 ``page_layout`` 的说明）。
+TABS_MIN_HEIGHT = 315
+
+#: 左侧表单列的宽度上限（px）。这一页的「现场信息」有 6 个关节角 + 「删除本组」，
+#: 是四页里最宽的一行；下限同样不写死，由 ``generate_page._form_scroll`` 量。
+REPAIR_FORM_MAX_WIDTH = 640
 
 #: 现场那次退化读数（2026-11-05）：点一次就把整份现场参数填回来。
 #: **照抄**网页版 ``_FIELD_SAMPLE``（它是现场复盘的固定参数，不是界面默认值）。
@@ -402,7 +412,7 @@ def _badge(text: str, background: str, color: str = "#ffffff"):
 # 页面
 # ---------------------------------------------------------------------------
 class RepairPage(QtWidgets.QWidget):
-    """奇异修复页：左侧可滚动表单 + 右上预览卡片 + 右侧（图 + 四页签结果）。
+    """奇异修复页：左侧可滚动表单 + 右侧三段（预览卡 / 图 / 五页签结果区）。
 
     Attributes:
         fields: ``{键: 控件}``，取值与 :func:`form_to_params` 的入参同名。
@@ -430,7 +440,11 @@ class RepairPage(QtWidgets.QWidget):
         run_state: ``idle`` / ``running`` / ``done`` / ``failed`` / ``cancelled``。
     """
 
-    def __init__(self, plot=None, robots=None, parent=None, bridge=None) -> None:
+    #: 状态栏里的页面前缀（三页共用一个状态栏）。
+    STATUS_PREFIX = "修复"
+
+    def __init__(self, plot=None, robots=None, parent=None, bridge=None,
+                 settings=None) -> None:
         """建页面。
 
         Args:
@@ -440,9 +454,15 @@ class RepairPage(QtWidgets.QWidget):
             parent: 父控件。
             bridge: 现成的 :class:`JobBridge`（测试注入假登记表用）；``None`` 时
                 按 :func:`laser_desktop.paths.runs_root` 新建一个。
+            settings: ``QSettings``（右栏三段分割的比例）；``None`` 时用应用默认。
         """
         super().__init__(parent)
         self._plot = plot
+        #: 只有**当前页**才往共享的 PlotView 推图（主窗口切页时改这个）。
+        #: 三页共用一个视图，隐藏页的去抖/预览如果照推，会把当前页的
+        #: 结果图换成自己的预览图（S6 联调实测）。
+        self._active = True
+        self._settings = settings
         self._robots = (core.list_robots(paths.asset_root())
                         if robots is None else list(robots))
         self.fields = {}
@@ -470,32 +490,77 @@ class RepairPage(QtWidgets.QWidget):
         self._locating = False
         self.bridge = bridge if bridge is not None else JobBridge(parent=self)
 
-        page_layout = QtWidgets.QVBoxLayout(self)
-        page_layout.setContentsMargins(8, 8, 8, 8)
-        page_layout.setSpacing(6)
+        column = QtWidgets.QVBoxLayout(self)
+        column.setContentsMargins(8, 8, 8, 8)
+        column.setSpacing(6)
         self.banner = QtWidgets.QLabel("")
         self.banner.setWordWrap(True)
         self.banner.hide()
-        page_layout.addWidget(self.banner)
+        column.addWidget(self.banner)
 
         body = QtWidgets.QWidget()
         outer = QtWidgets.QHBoxLayout(body)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(8)
-        outer.addWidget(self._build_form(), 0)
-        right = QtWidgets.QVBoxLayout()
-        right.setSpacing(8)
-        right.addWidget(self._build_preview_card(), 0)
-        right.addWidget(self._build_viewer(), 1)
-        outer.addLayout(right, 1)
-        page_layout.addWidget(body, 1)
+        outer.addWidget(self._build_left_column(), 0)
+        outer.addWidget(self._build_right_column(), 1)
+        column.addWidget(body, 1)
 
         # 信号连在控件建完之后（槽里直接碰控件，都在 GUI 线程，见 job_bridge）
         self.bridge.progress.connect(self._on_progress)
         self.bridge.log_line.connect(self._on_log_line)
         self.bridge.finished.connect(self._on_finished)
+        self._connect_plot_link()
         self.refresh_preview()
         self._resume_running_job()
+
+    def _build_left_column(self) -> QtWidgets.QWidget:
+        """左栏：表单滚动区 + **主操作行**（S6c，与生成页同一份做法）。
+
+        「定位段」「修复」必须在滚动区之外：S6b 把它们放在预览卡片里，卡片
+        被压矮后按钮跟着滚出视野 / 被上边缘切掉半截（现场截图）。现在挂在左栏
+        底部，垂直策略 ``Fixed``，两种窗口尺寸下都按 ``sizeHint`` 拿到整高。
+        """
+        column = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(column)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self._build_form(), 1)
+        layout.addWidget(self._build_actions(), 0)
+        return column
+
+    def _build_actions(self) -> QtWidgets.QWidget:
+        """主操作行：「定位段」+「修复」（不设 ``maximumHeight``，否则 height < sizeHint）。"""
+        self.locate_button = QtWidgets.QPushButton("定位段")
+        self.locate_button.setToolTip(
+            "同步跑 core.locate_segment（约 0.3–0.5 s）：定位窗口内最危险的一段，"
+            "不改任何参数")
+        self.locate_button.clicked.connect(lambda: self.locate())
+        self.repair_button = QtWidgets.QPushButton("修复")
+        self.repair_button.setToolTip(
+            "起一条后台任务：局部换端点姿态 → 不行再整体挪采样域 → 复核 → 落盘")
+        self.repair_button.clicked.connect(self.start_repair)
+        self.action_row = page_layout.build_action_row(self.locate_button,
+                                                       self.repair_button)
+        return self.action_row
+
+    def _build_right_column(self) -> QtWidgets.QWidget:
+        """右栏三段：预览卡 / 图 / 结果区（L1，与生成页同一份实现）。
+
+        图由主窗口在切页时搬进 :attr:`plot_slot`：三页共用一个 ``PlotView``，
+        不能各自 ``addWidget``（Qt 会把它从上一页移走，实测只剩最后一页能看见）。
+        """
+        self.plot_slot = page_layout.PlotSlot(
+            "修复后的路点图在这里（本环境未挂 WebEngine）")
+        if (self._plot is not None
+                and not getattr(self._plot, "SHARED_ACROSS_PAGES", False)):
+            self.plot_slot.adopt(self._plot)
+        splitter = page_layout.RightSplitter(
+            "repair", self._build_preview_card(), self.plot_slot,
+            self._build_result_area(), settings=self._settings)
+        self._viewer_splitter = splitter
+        self._right_splitter = splitter
+        return splitter
 
     # ------------------------------------------------------------------ 表单
     def _build_form(self) -> QtWidgets.QScrollArea:
@@ -504,9 +569,12 @@ class RepairPage(QtWidgets.QWidget):
         content = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(content)
         layout.setSpacing(8)
-        layout.addWidget(form_widgets.build_robot_group(
-            self.fields, self._robots, self._on_change,
-            defaults["robot"])["group"])
+        robot = form_widgets.build_robot_group(
+            self.fields, self._robots, self._on_change, defaults["robot"])
+        self.robot_group = robot["group"]        # 冒烟/单测要量它高没高（P3）
+        self.robot_path_label = robot["path_label"]
+        self.skipped_label = robot["skipped_label"]
+        layout.addWidget(robot["group"])
         layout.addWidget(self._build_field_group(defaults))
 
         domain = form_widgets.build_domain_group(self.fields, defaults,
@@ -533,12 +601,9 @@ class RepairPage(QtWidgets.QWidget):
         layout.addWidget(self._build_strategy_group(defaults))
         layout.addStretch(1)
 
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidget(content)
-        scroll.setWidgetResizable(True)
-        # 比生成页宽一点：6 个关节角要排在一行里（带单位后缀会撑不下）
-        scroll.setMinimumWidth(520)
-        scroll.setMaximumWidth(640)
+        # 比生成页宽一点：6 个关节角 + 「删除本组」要排在一行里
+        scroll = generate_page._form_scroll(content, REPAIR_FORM_MAX_WIDTH)
+        self.form_scroll = scroll                # 冒烟/单测要查横滚条（P4）
         return scroll
 
     def _build_field_group(self, defaults) -> QtWidgets.QGroupBox:
@@ -728,19 +793,24 @@ class RepairPage(QtWidgets.QWidget):
 
     # -------------------------------------------------------- 右侧：预览 + 结果
     def _build_preview_card(self) -> QtWidgets.QGroupBox:
-        """预览卡片：体积 / 格点 / 总点数 / 设计条件数 / 欧拉约定 + 报错原文。"""
+        """预览卡片：体积 / 格点 / 总点数 / 设计条件数 / 欧拉约定 + 报错原文。
+
+        S6c 两处收口（与生成页同一份做法）：
+
+        * **「定位段」「修复」搬到了左栏底部的操作行**（见
+          :meth:`_build_left_column`）——放在卡片里时窗口一变卡片就被压矮，
+          两个按钮跟着滚出去 / 被上边缘切半截（现场截图）；
+        * 五项数值改成**按需换行**（:class:`page_layout.MetricGrid`），100 px
+          就装得下，不用滚就能看到「设计条件数」。
+        """
         group = QtWidgets.QGroupBox("预览（不跑 IK）")
         layout = QtWidgets.QVBoxLayout(group)
-        layout.setSpacing(2)
-        grid = QtWidgets.QFormLayout()
-        for key, title in (("volume", "体积"), ("grid", "格点 X×Y×Z"),
-                           ("points", "总点数"), ("design", "设计条件数"),
-                           ("euler", "欧拉约定")):
-            value = QtWidgets.QLabel("—")
-            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            self.preview_labels[key] = value
-            grid.addRow(title, value)
-        layout.addLayout(grid)
+        layout.setSpacing(3)
+        layout.setContentsMargins(4, 2, 4, 2)
+
+        self.metric_grid = page_layout.MetricGrid(
+            self.preview_labels, page_layout.PREVIEW_METRICS)
+        layout.addWidget(self.metric_grid)
 
         self.error_label = QtWidgets.QLabel("")
         self.error_label.setWordWrap(True)
@@ -754,85 +824,86 @@ class RepairPage(QtWidgets.QWidget):
         self.warning_label.hide()
         layout.addWidget(self.warning_label)
 
-        buttons = QtWidgets.QHBoxLayout()
-        buttons.setContentsMargins(0, 0, 0, 0)
-        self.locate_button = QtWidgets.QPushButton("定位段")
-        self.locate_button.setToolTip(
-            "同步跑 core.locate_segment（约 0.3–0.5 s）：定位窗口内最危险的一段，"
-            "不改任何参数")
-        self.locate_button.clicked.connect(lambda: self.locate())
-        self.repair_button = QtWidgets.QPushButton("修复")
-        self.repair_button.setToolTip(
-            "起一条后台任务：局部换端点姿态 → 不行再整体挪采样域 → 复核 → 落盘")
-        self.repair_button.clicked.connect(self.start_repair)
-        buttons.addWidget(self.locate_button)
-        buttons.addWidget(self.repair_button)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
-        layout.addWidget(_caption(
-            "「定位段」只读不落盘；「修复」在后台线程跑，可取消（阶段边界生效）。"))
+        # 说明走 tooltip（与生成页同一份做法）：修复页的结果区比生成页多一行
+        # 运行目录，8 行表 + 图 260 之后预览卡只剩 ~115 px（实测），多一行说明
+        # 就会把最后一项数值顶到滚动区外面。
+        group.setToolTip(
+            "「定位段」只读不落盘；「修复」在后台线程跑，可取消（阶段边界生效）。")
         return group
 
-    def _build_viewer(self) -> QtWidgets.QWidget:
-        """图 + 结果区：上下可拖的 ``QSplitter``（默认给图多一点高度）。"""
-        if self._plot is not None:
-            viewer = self._plot
-        else:                                            # 纯逻辑测试/无图环境
-            viewer = _caption("修复后的路点图在这里（本环境未挂 WebEngine）")
-        result_area = self._build_result_area()
-        splitter = QtWidgets.QSplitter(Qt.Vertical)
-        splitter.addWidget(viewer)
-        splitter.addWidget(result_area)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([420, 120])
-        splitter.setChildrenCollapsible(False)
-        self._viewer_splitter = splitter
-        return splitter
-
     def _build_result_area(self) -> QtWidgets.QGroupBox:
-        """结果区：状态行 + 进度/取消 + 四页签（定位/修复/计划/日志）+ 导出。"""
+        """结果区：状态行 + 运行目录 + 进度/取消 + 五页签 + 导出。"""
         group = QtWidgets.QGroupBox("结果")
+        self.result_area = group        # expand_result_area 要量"表以外占多高"
         layout = QtWidgets.QVBoxLayout(group)
-        layout.setSpacing(4)
+        _compact_result_layout(layout)
 
         self.status_label = QtWidgets.QLabel("")
         self.status_label.setWordWrap(True)
         self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.status_label.hide()
-        layout.addWidget(self.status_label)
-
+        # 与生成页同因：见 page_layout.fit_message 的说明
+        self.status_label.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
+                                        QtWidgets.QSizePolicy.Ignored)
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, PROGRESS_STEPS)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("空闲")
+        # 进度条固定矮一点：它连同取消按钮占 33 px，而结果区的最小高度直接
+        # 决定窗口最小高度（1280×800 要装得下三段）。
+        self.progress_bar.setMaximumHeight(PROGRESS_BAR_HEIGHT)
+        self.progress_bar.setFixedWidth(PROGRESS_BAR_WIDTH)
         self.cancel_button = QtWidgets.QPushButton("取消")
         self.cancel_button.setToolTip(
             "只在阶段边界生效：当前阶段跑完就停，不会硬打断 IK")
         self.cancel_button.clicked.connect(self._on_cancel_clicked)
         self.cancel_button.hide()
-        progress_row = QtWidgets.QHBoxLayout()
-        progress_row.setContentsMargins(0, 0, 0, 0)
-        progress_row.addWidget(self.progress_bar, 1)
-        progress_row.addWidget(self.cancel_button, 0)
-        layout.addLayout(progress_row)
+        # “这是哪一次运行”：与状态行同占一行（S6c）。它们都是“一句运行信息”，
+        # 各占一行就是白拿结果区 25 px——而这一页的结果区比生成页还多这一行，
+        # 8 行表 + 图 260 之后预览卡只剩 100 px（五项数值要 115 px，最后一项
+        # 「欧拉约定」就挂在滚动区外面）。
+        # 这里用 ``lines=1`` 而不是依赖 ``fit_message`` 的固定高度——``HintLabel``
+        # 会在 resize 时按文字重算高度，固定值会被它盖回去（实测 25 → 50）。
+        self.run_label = _caption("尚未修复（还没有运行目录）", lines=1)
+        # 一行显示、宽度不够时裁掉（全文始终在 tooltip 里）：不换行是为了让它
+        # 在状态行里只占 25 px；``Ignored`` 让布局能把它压窄，不会把窗口顶宽。
+        self.run_label.setWordWrap(False)
+        self.run_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                                     QtWidgets.QSizePolicy.Fixed)
+        # 状态 + 运行目录 + 进度 + 取消同占一行（S6c，与生成页同一份做法）。
+        status_row = QtWidgets.QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(6)
+        status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.run_label, 0)
+        status_row.addWidget(self.progress_bar, 0)
+        status_row.addWidget(self.cancel_button, 0)
+        layout.addLayout(status_row)
+        self.status_label.hide()
 
         self.result_tabs = QtWidgets.QTabWidget()
         self.locate_page = self._build_locate_page()
         self.compare_page = self._build_compare_page()
         self.plan_page = self._build_plan_page()
+        self.segment_page = self._build_segment_page()
         self.log_page = self._build_log_page()
+        self.result_tabs.setMinimumHeight(TABS_MIN_HEIGHT)
         self.result_tabs.addTab(self.locate_page, "定位")
         self.result_tabs.addTab(self.compare_page, "修复")
         self.result_tabs.addTab(self.plan_page, "计划")
+        self.result_tabs.addTab(self.segment_page, "段诊断")
         self.result_tabs.addTab(self.log_page, "日志")
+        # 切页签后重新撑一次（口径见 generate_page.expand_result_area）
+        self.result_tabs.currentChanged.connect(
+            lambda _index: self._expand_result_area())
         layout.addWidget(self.result_tabs, 1)
 
         export_row = QtWidgets.QHBoxLayout()
         export_row.setContentsMargins(0, 0, 0, 0)
-        export_row.addWidget(QtWidgets.QLabel("导出："))
+        self.export_caption = _caption("导出：", lines=1)
+        self.export_caption.setToolTip("从 runs/<id>/ 复制，原文件不动")
+        export_row.addWidget(self.export_caption)
         for key, title, _filters in EXPORTS:
-            button = QtWidgets.QPushButton(title)
+            button = generate_page._export_button(title)
             button.setEnabled(False)
             button.clicked.connect(
                 lambda _checked=False, export_key=key: self._on_export(export_key))
@@ -955,36 +1026,47 @@ class RepairPage(QtWidgets.QWidget):
         page = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(2)        # 「计划」页的行距也省着用（表要露 8 行）
 
-        stats_holder = QtWidgets.QWidget()
-        stats_row = QtWidgets.QHBoxLayout(stats_holder)
-        stats_row.setContentsMargins(0, 0, 0, 0)
-        stats_row.setSpacing(12)
-        for key in STAT_KEYS:
-            label = QtWidgets.QLabel("—")
-            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            self.stat_labels[key] = label
-            stats_row.addWidget(label)
-        stats_row.addStretch(1)
-        self.stats_holder = stats_holder
+        # 统计卡：按需换行（1600×950 两行、1280×800 三行，都不切字）。这一页
+        # 的统计在「计划」页签里，它直接吃路点表的高度——24 px 就是第 8 行。
+        self.stats_holder = page_layout.StatsGrid(self.stat_labels, STAT_KEYS)
         self.stats_holder.hide()
         layout.addWidget(self.stats_holder)
 
         self.plan_status_label = QtWidgets.QLabel("")
         self.plan_status_label.setWordWrap(True)
+        self.plan_status_label.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
+                                             QtWidgets.QSizePolicy.Ignored)
         self.plan_status_label.hide()
         layout.addWidget(self.plan_status_label)
 
-        self.run_label = _caption("尚未修复（还没有运行目录）")
-        layout.addWidget(self.run_label)
+        # 路点表的说明放进 tooltip：这一页要同时放两张表，再加一行说明，结果区
+        # 的最小高度就把窗口最小高度顶破了（实测 837）。
+        self.waypoint_table = page_layout.mark_result_table(
+            make_table(generate_page.WAYPOINT_HEADERS))
+        self.waypoint_table.setMinimumHeight(page_layout.RESULT_TABLE_MIN_HEIGHT)
+        self.waypoint_table.setToolTip(
+            "修复后的路点表：排序后失败行仍标红；选一行，图上的点会放大。")
+        layout.addWidget(self.waypoint_table, 1)
+        return page
 
-        layout.addWidget(_caption("路点表（排序后失败行仍标红）"))
-        self.waypoint_table = make_table(generate_page.WAYPOINT_HEADERS)
-        layout.addWidget(self.waypoint_table, 3)
-        layout.addWidget(_caption("段诊断表"))
-        self.segment_table = make_table(generate_page.SEGMENT_HEADERS)
-        layout.addWidget(self.segment_table, 2)
+    def _build_segment_page(self) -> QtWidgets.QWidget:
+        """「段诊断」页：修复后计划的段裕度（S6 L2 的 500 行上限也在这里）。
+
+        S6 之前它与路点表挤在「计划」页签里上下叠着：两个 200 px 的最小高度
+        一加，结果区的最小高度就把窗口的最小高度顶到 837。拆成独立页签后
+        与生成页同构（路点 / 段诊断 / 日志），两张表都有正常高度。
+        """
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.segment_caption = _caption("段诊断表", lines=1)
+        layout.addWidget(self.segment_caption)
+        self.segment_table = page_layout.mark_result_table(
+            make_table(generate_page.SEGMENT_HEADERS))
+        layout.addWidget(self.segment_table, 1)
         return page
 
     def _build_log_page(self) -> QtWidgets.QWidget:
@@ -996,7 +1078,12 @@ class RepairPage(QtWidgets.QWidget):
         layout.addWidget(_caption(
             f"等价终端输出。两层上限：后台任务源缓冲只留最近 {JOB_LOG_LIMIT} 行"
             f"（更早的在源头就丢了，丢一段会插一行「…已省略 N 行」），本控件最多"
-            f"保留 {LOG_WIDGET_LIMIT} 行（超出删头部）。"))
+            f"保留 {LOG_WIDGET_LIMIT} 行（超出删头部；省略提示另存上面一行，不会被删）。"))
+        self.log_omission_label = QtWidgets.QLabel("")
+        self.log_omission_label.setWordWrap(True)
+        self.log_omission_label.setStyleSheet(_STATUS_STYLES["muted"])
+        self.log_omission_label.hide()
+        layout.addWidget(self.log_omission_label)
         self.log_edit = QtWidgets.QPlainTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setFont(generate_page.monospace_font())
@@ -1184,7 +1271,7 @@ class RepairPage(QtWidgets.QWidget):
         self.last_status = str(message)
         status_bar = getattr(self.window(), "statusBar", None)
         if callable(status_bar):
-            status_bar().showMessage(self.last_status)
+            status_bar().showMessage(self.status_message())
         self._pump_events()
 
     def _end_wait(self) -> None:
@@ -1542,23 +1629,28 @@ class RepairPage(QtWidgets.QWidget):
         fill_stat_labels(self.stat_labels, stats)
         self.stats_holder.setVisible(bool(stats))
         fill_waypoint_table(self.waypoint_table, result.get("waypoints") or [])
-        fill_segment_table(self.segment_table, result.get("segments") or [])
+        fill_segment_table(self.segment_table, result.get("segments") or [],
+                           caption=getattr(self, "segment_caption", None),
+                           caption_text="段诊断表")
         self.waypoint_table.scrollToTop()
         warnings = [str(line) for line in (result.get("warnings") or [])]
         head = ""
         feasible = stats.get("feasible")
         if feasible is False:
             head = "修复后的计划不可行，原因："
-        self.plan_status_label.setText(
-            head + "\n".join(f"· {line}" for line in warnings))
+        page_layout.fit_message(
+            self.plan_status_label,
+            head + "\n".join(f"· {line}" for line in warnings),
+            max_height=26)
         self.plan_status_label.setStyleSheet(
             _STATUS_STYLES["error"] if feasible is False else _THRESHOLD_WARN)
         self.plan_status_label.setVisible(bool(head or warnings))
         run_id = result.get("run_id")
         run_dir = result.get("run_dir")
-        self.run_label.setText(
+        page_layout.fit_message(
+            self.run_label,
             f"运行 {run_id} · {run_dir}" if run_id or run_dir
-            else "尚未修复（还没有运行目录）")
+            else "尚未修复（还没有运行目录）", max_height=26)
         self._update_exports(result)
         try:
             figure = generate_page.result_figure(result)
@@ -1570,7 +1662,7 @@ class RepairPage(QtWidgets.QWidget):
                 f"结果图渲染失败：{type(error).__name__}: {error}")
         self.last_figure = figure
         if self._plot is not None:
-            self._plot.set_figure(figure)
+            self._push_figure(figure)
         self._expand_result_area()
 
     def render_result(self, result: dict) -> None:
@@ -1588,15 +1680,12 @@ class RepairPage(QtWidgets.QWidget):
         self.render_plan(result)
 
     def _expand_result_area(self) -> None:
-        """出结果后把结果区撑到 :data:`RESULT_MIN_HEIGHT`（默认 120 px 只够看表头）。"""
-        splitter = getattr(self, "_viewer_splitter", None)
-        if splitter is None:
-            return
-        sizes = splitter.sizes()
-        if len(sizes) != 2 or sizes[1] >= RESULT_MIN_HEIGHT:
-            return
-        viewer = max(sizes[0] - (RESULT_MIN_HEIGHT - sizes[1]), 120)
-        splitter.setSizes([viewer, RESULT_MIN_HEIGHT])
+        """出结果后把结果区撑到"够看 ``RESULT_ROW_TARGET`` 行"。
+
+        与生成页同一口径（实现见 ``generate_page.expand_result_area``）：先拿图的
+        高度（不低于 ``PLOT_MIN_HEIGHT``），不够再从预览卡上扣。
+        """
+        generate_page.expand_result_area(self)
 
     def _update_exports(self, result: dict) -> None:
         """按 ``result["artifacts"]`` 启用/禁用四个导出按钮（文件真的在才开）。"""
@@ -1719,8 +1808,14 @@ class RepairPage(QtWidgets.QWidget):
         self.progress_bar.setFormat(text)
 
     def _on_log_line(self, line: str) -> None:
-        """增量日志：直接追加（上限由 ``setMaximumBlockCount`` 管）。"""
-        self.log_edit.appendPlainText(str(line))
+        """增量日志：直接追加；省略提示另存一份到固定标签（L4）。"""
+        text = str(line)
+        if text.startswith(generate_page.OMISSION_PREFIX):
+            self.log_omission_label.setText(
+                f"{text}（更早的行已不在源缓冲里；下面只剩最后"
+                f" {LOG_WIDGET_LIMIT} 行）")
+            self.log_omission_label.show()
+        self.log_edit.appendPlainText(text)
 
     def _on_finished(self, payload: dict) -> None:
         """终态：done → 渲染结果；cancelled → 灰字；failed → 红字。
@@ -1766,7 +1861,9 @@ class RepairPage(QtWidgets.QWidget):
             run_id = result.get("run_id")
             run_dir = result.get("run_dir")
             if run_id or run_dir:
-                self.run_label.setText(f"运行 {run_id} · {run_dir}")
+                page_layout.fit_message(
+                    self.run_label, f"运行 {run_id} · {run_dir}",
+                    max_height=26)
             self._update_exports(result)    # 只会点亮真实存在的那几项
             repair = result.get("repair")
             if isinstance(repair, dict) and repair:
@@ -1794,7 +1891,9 @@ class RepairPage(QtWidgets.QWidget):
             self.last_result = {**carried, "run_id": run_id, "run_dir": run_dir,
                                 "artifacts": artifacts}
             if run_id or run_dir:
-                self.run_label.setText(f"运行 {run_id} · {run_dir}")
+                page_layout.fit_message(
+                    self.run_label, f"运行 {run_id} · {run_dir}",
+                    max_height=26)
             self._update_exports(self.last_result)
             self._set_status(
                 "已取消：任务在当前阶段末尾停下；没来得及落盘的运行目录已删掉，"
@@ -1822,9 +1921,11 @@ class RepairPage(QtWidgets.QWidget):
         self.locate_error = None
         self.last_figure = None
         if self._plot is not None:
-            self._plot.set_figure(
+            self._push_figure(
                 generate_page.placeholder_figure("正在修复：新任务已提交"))
         self.log_edit.clear()
+        self.log_omission_label.clear()
+        self.log_omission_label.hide()
         form_widgets.clear_layout(self.verdict_layout)
         self.kind_badges = []
         self.threshold_labels = []
@@ -1853,7 +1954,8 @@ class RepairPage(QtWidgets.QWidget):
         self.stats_holder.hide()
         self.plan_status_label.clear()
         self.plan_status_label.hide()
-        self.run_label.setText("尚未修复（还没有运行目录）")
+        page_layout.fit_message(self.run_label,
+                                "尚未修复（还没有运行目录）", max_height=26)
         for button in self.export_buttons.values():
             button.setEnabled(False)
             button.setToolTip("")
@@ -1864,20 +1966,101 @@ class RepairPage(QtWidgets.QWidget):
         """结果区状态行：``ok`` 绿 / ``error`` 红 / ``muted`` 灰 / ``info`` 正常。"""
         message = str(text or "")
         self.last_status = message
-        self.status_label.setText(message)
+        page_layout.fit_message(self.status_label, message, max_height=26)
         self.status_label.setStyleSheet(_STATUS_STYLES.get(level, ""))
         self.status_label.setVisible(bool(message.strip()))
+
+    # ------------------------------------------------------------ 表格 ↔ 图
+    def _connect_plot_link(self) -> None:
+        """把「计划」页的路点表与图接起来（S6 P1）：两边都用 GP 号作键。"""
+        self.waypoint_table.itemSelectionChanged.connect(
+            self._on_waypoint_selected)
+        signal = getattr(self._plot, "pointClicked", None)
+        if signal is not None:
+            signal.connect(self._on_plot_clicked)
+
+    def _on_waypoint_selected(self) -> None:
+        """表格选中变化 → 图上放大那个点，状态栏说出 GP 号。"""
+        key = page_layout.table_key(self.waypoint_table,
+                                    self.waypoint_table.currentRow())
+        if key:
+            self.select_key(key)
+
+    def select_key(self, key, report: bool = True) -> None:
+        """选中一个 GP：图上放大、表格行选中、状态栏显示 ``GP0005``。
+
+        隐藏页不动作：三页都 ``connect`` 同一个 ``plot.pointClicked``，隐藏页
+        跟着“选中 + 上报”会改写可见页的状态栏（S6 评审建议 2）。
+        """
+        if not self._active:
+            return
+        label = page_layout.gp_label(key)
+        if report:
+            self._report_status(f"已选中 {label}（图上已放大）")
+        select = getattr(self._plot, "select_points", None)
+        if callable(select):
+            select([key])
+        row = page_layout.find_row(self.waypoint_table, key)
+        if row >= 0 and row != self.waypoint_table.currentRow():
+            self.waypoint_table.blockSignals(True)
+            try:
+                self.waypoint_table.setCurrentCell(row, 0)
+                self.waypoint_table.scrollToItem(
+                    self.waypoint_table.item(row, 0))
+            finally:
+                self.waypoint_table.blockSignals(False)
+
+    def _on_plot_clicked(self, keys) -> None:
+        """图上点了点 → 表格选中它那一行（P1 的反向）。"""
+        for key in (keys or []):
+            if page_layout.find_row(self.waypoint_table, key) >= 0:
+                self.select_key(key)
+                return
 
     def _report_status(self, message: str) -> None:
         """把一句话写到窗口状态栏（没有主窗口的纯逻辑测试里也能断言）。"""
         self.last_status = str(message)
+        self._show_status()
+
+    def _show_status(self) -> None:
+        """把 :attr:`last_status`（带页面前缀）写进状态栏临时区。"""
+        text = self.status_message()
+        if not text:
+            return
         status_bar = getattr(self.window(), "statusBar", None)
         if callable(status_bar):
-            status_bar().showMessage(self.last_status, 10_000)
+            status_bar().showMessage(text, 10_000)
+
+    def status_message(self) -> str:
+        """状态栏里该显示的本页最后一句（带页面前缀）；没说过话时空串。"""
+        text = str(getattr(self, "last_status", "") or "").strip()
+        if not text:
+            return ""
+        return f"{self.STATUS_PREFIX}：{text}"
+
+    def restore_plot_selection(self) -> None:
+        """切回本页时把表格当前行补回图上（S6 评审 R2c）。"""
+        table = self.waypoint_table
+        row = table.currentRow()
+        if row < 0:
+            return
+        key = page_layout.table_key(table, row)
+        if key:
+            self.select_key(key, report=False)
 
     def shutdown(self) -> None:
         """窗口关闭时收尾：注销任务订阅（不取消任务）。"""
         self.bridge.shutdown()
+
+    def set_active(self, active: bool) -> None:
+        """主窗口切页时告知本页是不是当前页（隐藏页不往共享视图推图）。"""
+        self._active = bool(active)
+
+    def _push_figure(self, figure) -> None:
+        """把图推给共享的 ``PlotView``：不是当前页就不推（免得盖掉别页的图）。"""
+        if self._plot is None or not self._active:
+            return
+        self._plot.set_figure(figure)
 
     def current_figure(self):
         """本页当前该展示的图（导航切回来时主窗口用它重推）。
@@ -1890,14 +2073,21 @@ class RepairPage(QtWidgets.QWidget):
         """
         if self.last_figure is not None:
             return self.last_figure
+        # 同一状态下回同一个对象：主窗口按对象身份判重（见 iso_page 同名字段）。
+        cached = getattr(self, "_current_figure", None)
+        if cached is not None and cached[0] == self.run_state:
+            return cached[1]
         if self.run_state == "running":
             # 任务在跑：既不能拿旧图充新结果，也不该说“还没有结果”
-            return generate_page.placeholder_figure(
+            figure = generate_page.placeholder_figure(
                 "正在修复：任务在跑，结果出来会显示在这里。",
                 title="修复后的路点图（进行中）")
-        return generate_page.placeholder_figure(
-            "还没有修复结果：点「修复」后这里显示修复后的计划。",
-            title="修复后的路点图（未出图）")
+        else:
+            figure = generate_page.placeholder_figure(
+                "还没有修复结果：点「修复」后这里显示修复后的计划。",
+                title="修复后的路点图（未出图）")
+        self._current_figure = (self.run_state, figure)
+        return figure
 
     def show_webgl_warning(self) -> None:
         """WebGL 不可用时在页面顶部挂一条中文建议（与生成页同一段文案）。"""
