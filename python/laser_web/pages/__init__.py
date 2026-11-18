@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""页面包：生成页、奇异修复页、工具页。
+"""页面包：生成页、奇异修复页、ISO 五点页、工具页。
 
 每个页面模块只暴露一个 ``render()``，由 :mod:`laser_web.app` 放进各自的
 页面容器里；页面只负责“收集参数 -> 调 core -> 渲染”，不出现算法公式。
 
-这里另外放几个三个页面共用的 UI 小工具（下载守卫、任务接管、取消占位），
+这里另外放几个页面共用的 UI 小工具（下载守卫、任务接管、取消占位），
 避免各页各写一份、行为不一致。
 """
 
@@ -77,7 +77,7 @@ def adopt_running_job(registry, kind: str):
 
     Args:
         registry: ``jobs.JobRegistry``。
-        kind: ``"scan"`` 或 ``"repair"``。
+        kind: ``"scan"`` / ``"repair"`` / ``"iso"``。
 
     Returns:
         ``Job`` 或 ``None``（没有在跑的同类型任务）。

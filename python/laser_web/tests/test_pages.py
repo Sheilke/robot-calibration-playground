@@ -17,9 +17,9 @@ from laser_web.pages import (POINT_COUNT_WARN, adopt_running_job,
 class PagesImportTest(unittest.TestCase):
     def test_pages_import_and_expose_render(self):
         from laser_web import app  # noqa: F401 - 页面注册依赖它
-        from laser_web.pages import generate, repair, tools
+        from laser_web.pages import generate, iso9283, repair, tools
 
-        for module in (generate, repair, tools):
+        for module in (generate, iso9283, repair, tools):
             self.assertTrue(callable(module.render), module.__name__)
 
     def test_warn_threshold_is_sane(self):
@@ -185,21 +185,22 @@ class UploadLimitTest(unittest.TestCase):
 
 
 class PageRenderSmokeTest(unittest.TestCase):
-    """三个页面的 ``render()`` 真的能建完（不连浏览器，但也不只是 import）。
+    """四个页面的 ``render()`` 真的能建完（不连浏览器，但也不只是 import）。
 
     这一层能抓住"元素定义顺序/闭包名字写错"这类只在建页面时才炸的问题
     （例如把被 ``@ui.refreshable`` 函数引用的 helper 定义在它后面）。真的
     交互（点按钮、弹 toast）仍由人工冒烟确认。
     """
 
-    def test_all_three_pages_build(self):
+    def test_all_four_pages_build(self):
         import asyncio
 
         import nicegui
 
-        from laser_web.pages import generate, repair, tools
+        from laser_web.pages import generate, iso9283, repair, tools
 
-        builders = (("/", generate), ("/repair", repair), ("/tools", tools))
+        builders = (("/", generate), ("/repair", repair), ("/iso", iso9283),
+                    ("/tools", tools))
 
         async def build_all() -> dict:
             from nicegui.client import Client

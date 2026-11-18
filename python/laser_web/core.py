@@ -15,7 +15,9 @@ M2 增加 ``run_scan``（完整解算 + 产物落盘，含 ``skip_ik`` 轻量预
 M3 增加 ``build_gp``（扫描结果 + GP 模板 -> GP 文件）、``convert_urdf``
 （控制器 JSON -> URDF）与 ``list_runs`` / ``clean_runs``（运行目录盘点与清理）；
 M4 增加 ``locate_segment``（窗口段剖面 + 判定结论）与 ``run_repair``
-（先局部换端点姿态、失败再整体挪箱，产物与 ``run_scan`` 同构）。
+（先局部换端点姿态、失败再整体挪箱，产物与 ``run_scan`` 同构）；
+M5 增加 ``run_iso9283``（ISO 9283 的 P1~P5 五点，产物与 ``run_scan`` 同构，
+``iso.json`` 能直接喂 ``export_gp``）。
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ import numpy as np
 
 from excitation_trajectory import aabb_snake_scan as scan
 from excitation_trajectory import avoid_singularity as avoid
+from excitation_trajectory import iso9283_cube as iso
 
 from . import jobs
 
@@ -1822,6 +1825,457 @@ def run_repair(params: dict, job=None, on_progress=None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# M5：ISO 9283 P1~P5 五点（立方体 -> 五点 -> IK -> 落盘）
+# ---------------------------------------------------------------------------
+#: ISO 页面的进度阶段名（顺序即执行顺序，页面进度条直接用这些中文短语）。
+ISO_STAGES = ("定立方体", "生成五点", "解算 IK", "出图", "写文件")
+#: 立方体来源（与页面 toggle 的取值一致）：中心+边长 / 范围 / 自动搜索。
+CUBE_MODES = ("center", "bounds", "auto")
+#: 产物文件名（写进 ``runs/<id>/``，也是 ``result["artifacts"]`` 的值）。
+ARTIFACT_ISO_JSON = "iso.json"
+ARTIFACT_ISO_PLOT = "iso.png"
+
+
+def iso_defaults() -> dict:
+    """ISO 页面表单的默认值（**全部来自** ``iso9283_cube`` 的 CLI 默认值）。
+
+    不另抄一份数字，界面与 ``python -m excitation_trajectory.iso9283_cube``
+    的默认值自动一致。``--robot`` 是 CLI 的必填项，所以这里只读参数定义里的
+    ``default``，不跑 ``parse_args``（否则得编一个假模型路径出来）。
+
+    Returns:
+        dict: ``layout`` / ``plane`` / ``square_frac`` / ``rpy`` / ``euler`` /
+        ``q_seed`` / ``j5_min`` / ``resolution`` / ``prefer_x_min``。
+    """
+    parser = iso.build_arg_parser()
+    # argparse 的 ``_actions`` 是读取「参数默认值」的唯一公开来源（parse_args
+    # 会因为 --robot 必填而报错退出）。
+    defaults = {action.dest: action.default for action in parser._actions}
+    return {"layout": str(defaults["layout"]),
+            "plane": str(defaults["plane"]),
+            "square_frac": float(defaults["square_frac"]),
+            "rpy": [float(value) for value in defaults["rpy"]],
+            "euler": str(defaults["euler"]),
+            "q_seed": str(defaults["q_seed"]),
+            "j5_min": float(defaults["j5_min"]),
+            "resolution": float(defaults["resolution"]),
+            "prefer_x_min": defaults["prefer_x_min"]}
+
+
+def _iso_numbers(raw, length: int, name: str) -> list[float]:
+    """把「逗号串 / 序列」归一成 ``length`` 个浮点数（只做类型归一）。
+
+    Args:
+        raw: ``"750,1300,-600,600,270,940"`` 或 ``[750, 1300, ...]``。
+        length: 期望的个数（3 或 6）。
+        name: 出错时回显的字段名。
+
+    Returns:
+        list[float]，长度恰为 ``length``。
+
+    Raises:
+        _FormError: 个数不对或含非数值（消息直接显示给现场工程师）。
+    """
+    if isinstance(raw, str):
+        # 现场习惯用全角逗号/空格分隔，两种都认（与 q_seed 的处理一致）。
+        values = raw.replace("，", ",").replace(",", " ").split()
+    else:
+        values = list(raw)
+    if len(values) != length:
+        raise _FormError(f"{name} 需要 {length} 个数值，当前 {len(values)} 个")
+    try:
+        return [float(value) for value in values]
+    except (TypeError, ValueError):
+        raise _FormError(f"{name} 里有非数值：{values}") from None
+
+
+def _iso_q_seed(raw) -> list[float]:
+    """IK 种子关节角：``"43,-30,-36,42,-89,-1"`` 或 6 个数（空则用 CLI 默认）。
+
+    Args:
+        raw: 表单值（可能是空串/``None``）。
+
+    Returns:
+        list[float]: 6 个 deg 值。
+
+    Raises:
+        _FormError: 个数不对或含非数值。
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = iso_defaults()["q_seed"]
+    return _iso_numbers(raw, 6, "q_seed")
+
+
+def _iso_options(params: dict) -> dict:
+    """归一化 ISO 五点的表单参数（只做类型归一与取值域检查）。
+
+    这里**故意不套** ``aabb_snake_scan._validate_args``：那套校验讲的是 AABB
+    与网格份数（``xs/ys/zs``、``target_count``、``perturb_deg``…），与「立方体
+    + 五点」没有一个共同项，硬套只会要求表单填一堆无关字段。取值域只查
+    ``iso9283_cube`` 自己认的那几个（``LAYOUTS`` / ``PLANES`` /
+    ``EULER_CONVENTIONS``），保证界面提交什么、CLI 就认什么。
+
+    Args:
+        params: 表单值，键见 :func:`run_iso9283`。值为 ``None`` / 缺省时用
+            :func:`iso_defaults` 的 CLI 默认值。
+
+    Returns:
+        dict: ``robot``（按仓库根解析后的路径）/ ``cube_mode`` / ``cube``
+        （按模式只带必要键）/ ``layout`` / ``plane`` / ``square_frac`` /
+        ``rpy`` / ``euler`` / ``q_seed`` / ``j5_min``。
+
+    Raises:
+        _FormError: 参数非法（消息原样回显到页面）。
+    """
+    params = params or {}
+    defaults = iso_defaults()
+
+    robot = params.get("robot")
+    if robot is None or not str(robot).strip():
+        raise _FormError("需要机器人模型（robot）：URDF 或控制器 JSON 的路径")
+    robot_path = _resolve_model_path(robot)
+    if not Path(robot_path).is_file():
+        raise _FormError(f"机器人模型不存在：{robot}")
+
+    cube_mode = str(params.get("cube_mode") or CUBE_MODES[0]).strip().lower()
+    if cube_mode not in CUBE_MODES:
+        raise _FormError(f"立方体来源需为 {' / '.join(CUBE_MODES)} 之一，"
+                         f"当前为 {cube_mode!r}")
+
+    layout = str(params.get("layout") or defaults["layout"]).strip().lower()
+    if layout not in iso.LAYOUTS:
+        raise _FormError(f"布点需为 {' / '.join(iso.LAYOUTS)} 之一，"
+                         f"当前为 {layout!r}")
+    plane = str(params.get("plane") or defaults["plane"]).strip().lower()
+    if plane not in tuple(iso.PLANES):
+        raise _FormError(f"对角截面需为 {' / '.join(iso.PLANES)} 之一，"
+                         f"当前为 {plane!r}")
+
+    euler = str(params.get("euler") or defaults["euler"]).strip().lower()
+    if euler not in scan.EULER_CONVENTIONS:
+        raise _FormError(f"欧拉约定需为 {' / '.join(scan.EULER_CONVENTIONS)}"
+                         f" 之一，当前为 {euler!r}")
+
+    rpy_raw = params.get("rpy")
+    rpy = ([float(value) for value in defaults["rpy"]] if rpy_raw is None
+           else _iso_numbers(rpy_raw, 3, "参考姿态 rpy"))
+    square_frac = (defaults["square_frac"] if params.get("square_frac") is None
+                   else float(params["square_frac"]))
+    j5_min = (defaults["j5_min"] if params.get("j5_min") is None
+              else float(params["j5_min"]))
+
+    cube: dict = {"mode": cube_mode}
+    if cube_mode == "center":
+        if params.get("center") is None:
+            raise _FormError("立方体来源为「中心+边长」时需要 center（X Y Z，mm）")
+        if params.get("side") is None:
+            raise _FormError("立方体来源为「中心+边长」时需要 side（边长，mm）")
+        cube["center"] = _iso_numbers(params["center"], 3, "立方体中心 center")
+        cube["side"] = float(params["side"])
+        if not math.isfinite(cube["side"]) or cube["side"] <= 0.0:
+            raise _FormError(f"立方体边长需为正数，当前 {cube['side']}")
+    elif cube_mode == "bounds":
+        if params.get("cube") is None:
+            raise _FormError("立方体来源为「范围」时需要 cube"
+                             "（x0 x1 y0 y1 z0 z1，mm）")
+        bounds = _iso_numbers(params["cube"], 6, "立方体范围 cube")
+        spans = [bounds[1] - bounds[0], bounds[3] - bounds[2],
+                 bounds[5] - bounds[4]]
+        if min(spans) <= 0.0:
+            raise _FormError(f"cube 的下界必须小于上界：{bounds}")
+        cube["bounds"] = bounds
+    else:
+        if params.get("search_box") is None:
+            raise _FormError("立方体来源为「自动搜索」时需要 search_box"
+                             "（x0 x1 y0 y1 z0 z1，mm）")
+        box = _iso_numbers(params["search_box"], 6, "搜索范围 search_box")
+        if box[0] > box[1] or box[2] > box[3] or box[4] > box[5]:
+            raise _FormError(f"搜索范围的下界大于上界：{box}")
+        cube["search_box"] = box
+        cube["resolution"] = (
+            defaults["resolution"] if params.get("resolution") is None
+            else float(params["resolution"]))
+        # 算法会把 <=0 的分辨率夹到 1 mm，于是 400x600x500 mm 的搜索箱变成
+        # 一亿多个候选（页面卡死、取消也救不回来）。这里直接报错，让现场改数字。
+        if not math.isfinite(cube["resolution"]) or cube["resolution"] <= 0.0:
+            raise _FormError(f"搜索分辨率需为正数（mm），当前 {cube['resolution']}")
+        prefer = params.get("prefer_x_min")
+        if prefer is None or (isinstance(prefer, str) and not prefer.strip()):
+            cube["prefer_x_min"] = defaults["prefer_x_min"]
+        else:
+            cube["prefer_x_min"] = float(prefer)
+
+    return {"robot": robot_path, "cube_mode": cube_mode, "cube": cube,
+            "layout": layout, "plane": plane, "square_frac": square_frac,
+            "rpy": rpy, "euler": euler,
+            "q_seed": _iso_q_seed(params.get("q_seed")), "j5_min": j5_min}
+
+
+def _iso_cube(options: dict, rbt, *, order: str, extrinsic: bool,
+              q_seed) -> tuple[list[float], float]:
+    """按 ``cube_mode`` 定立方体，返回 ``(center, side)``。
+
+    三种给法与 CLI 的顺序/取整规则一致：``bounds`` 取各轴中点为中心、最小
+    跨度为边长（跨度不等时提示）；``auto`` 走 ``find_largest_cube`` 并把边长
+    向下取整到 1 mm（现场读数好看）。
+
+    Args:
+        options: :func:`_iso_options` 的结果。
+        rbt: ``Nexbot6R`` 模型（自动搜索要用它试顶点）。
+        order / extrinsic / q_seed: 欧拉约定拆分结果与 IK 种子（五点统一姿态）。
+
+    Returns:
+        ``(center, side)``：中心 3 个数（mm）与边长（mm）。
+
+    Raises:
+        _FormError: 搜索范围内找不到可解立方体。
+    """
+    cube = options["cube"]
+    if cube["mode"] == "center":
+        return [float(value) for value in cube["center"]], float(cube["side"])
+    if cube["mode"] == "bounds":
+        bounds = cube["bounds"]
+        spans = [bounds[1] - bounds[0], bounds[3] - bounds[2],
+                 bounds[5] - bounds[4]]
+        side = float(min(spans))
+        center = [(bounds[0] + bounds[1]) / 2.0,
+                  (bounds[2] + bounds[3]) / 2.0,
+                  (bounds[4] + bounds[5]) / 2.0]
+        if max(spans) - side > 1e-6:        # 与 CLI 的提示同一条件
+            print(f"提示: cube 三轴跨度不等（{spans}），取最小跨度 "
+                  f"{side:g} mm 为边长，中心用各轴中点")
+        return center, side
+
+    found = iso.find_largest_cube(
+        rbt, cube["search_box"], options["rpy"], order=order,
+        extrinsic=extrinsic, q_seed=q_seed,
+        resolution=cube["resolution"], prefer_x_min=cube["prefer_x_min"])
+    if not found["ok"]:
+        raise _FormError("搜索范围内找不到任何可解立方体，请扩大 search_box "
+                         "或降低 prefer_x_min")
+    side = float(math.floor(found["side"]))
+    if side <= 0.0:
+        raise _FormError(f"自动搜索到的边长不足 1 mm（{found['side']:.3f} mm），"
+                         "请扩大 search_box")
+    print(f"自动搜索：边长 {side:g} mm，中心 "
+          f"({found['center'][0]:.0f}, {found['center'][1]:.0f}, "
+          f"{found['center'][2]:.0f}) mm，"
+          f"评估 {found['samples']} 个候选")
+    return [float(value) for value in found["center"]], side
+
+
+def _iso_row(name: str, solved: dict) -> dict:
+    """``solve_points`` 的单点结果 -> 页面表格/图形用的行（浮点 round 6）。"""
+    return {"name": name,
+            "pos": [round(float(value), 6) for value in solved["pos"]],
+            "q": (None if solved["q"] is None
+                  else [round(float(value), 6) for value in solved["q"]]),
+            "ok": bool(solved["ok"]),
+            "config": (None if solved["config"] is None
+                       else [int(tag) for tag in solved["config"]]),
+            "j3_abs": (None if solved["j3_abs"] is None
+                       else round(float(solved["j3_abs"]), 6)),
+            "j5_abs": (None if solved["j5_abs"] is None
+                       else round(float(solved["j5_abs"]), 6))}
+
+
+def _iso_stats(rows, *, side: float, center, layout: str, plane: str) -> dict:
+    """五点行 -> 页面统计卡字段。
+
+    Args:
+        rows: :func:`_iso_row` 的行（按 ``POINT_NAMES`` 顺序）。
+        side / center: 实际使用的立方体边长与中心。
+        layout / plane: 布点方式与对角截面（回显给现场核对）。
+
+    Returns:
+        dict: ``total`` / ``solved`` / ``reachable`` / ``j3_abs_min`` /
+        ``j5_abs_min`` / ``configs``（**去重升序**的构型标签）/
+        ``config_consistent`` / ``cube_side`` / ``cube_center`` /
+        ``layout`` / ``plane``；无解时为 ``None`` 的最小值不造假数字。
+    """
+    ok_rows = [row for row in rows if row["ok"]]
+    configs = sorted({tuple(row["config"]) for row in ok_rows
+                      if row["config"] is not None})
+    return {"total": len(rows),
+            "solved": len(ok_rows),
+            "reachable": bool(rows) and len(ok_rows) == len(rows),
+            "j3_abs_min": min((row["j3_abs"] for row in ok_rows),
+                              default=None),
+            "j5_abs_min": min((row["j5_abs"] for row in ok_rows),
+                              default=None),
+            "configs": [list(tag) for tag in configs],
+            "config_consistent": len(configs) <= 1,
+            "cube_side": float(side),
+            "cube_center": [float(value) for value in center],
+            "layout": str(layout), "plane": str(plane)}
+
+
+def _execute_iso(options: dict, job, progress: _StageReporter,
+                 warnings: list[str]) -> dict:
+    """``run_iso9283`` 的主体（校验已通过，产物目录在这里建）。
+
+    流程与 CLI ``iso9283_cube.main`` 逐一对应：定立方体 -> ``cube_points`` ->
+    ``solve_points`` -> ``plot_points`` + ``scan_payload`` 落盘。每个阶段边界
+    检查一次取消标志（IK 内部不检查，最坏延迟是一个阶段）。
+    """
+    from robot_model.nexbot_ik import Nexbot6R
+
+    run_id, run_dir = ((str(job.id), Path(job.run_dir)) if job is not None
+                       else jobs.make_run_dir())
+    # 欧拉约定名 -> (轴序, 定/动轴)，与 CLI main() 同一行拆分（同一个函数）。
+    order, extrinsic = iso._split_convention(
+        argparse.Namespace(euler_convention=options["euler"]))
+
+    try:
+        rbt = Nexbot6R(options["robot"])
+    except Exception as error:          # noqa: BLE001 - 模型读不了就是参数错
+        return _failure(f"机器人模型无法加载：{type(error).__name__}: {error}")
+
+    # ---- 1. 定立方体 ----
+    _check_cancel(job)
+    progress(ISO_STAGES[0], 0, 1)
+    try:
+        center, side = _iso_cube(options, rbt, order=order,
+                                 extrinsic=extrinsic, q_seed=options["q_seed"])
+    except _FormError as error:
+        return _failure(str(error))
+    print(f"立方体：边长 {side:g} mm，中心 ({center[0]:.1f}, {center[1]:.1f}, "
+          f"{center[2]:.1f}) mm，布点 {options['layout']}，"
+          f"截面 {options['plane']}")
+    print(f"姿态  ：{options['rpy']} deg（{options['euler']}），五点一致")
+    progress(ISO_STAGES[0], 1, 1)
+
+    # ---- 2. 生成五点 ----
+    _check_cancel(job)
+    progress(ISO_STAGES[1], 0, 1)
+    try:
+        points = iso.cube_points(center, side, options["layout"],
+                                 options["square_frac"], options["plane"])
+    except ValueError as error:         # layout / square_frac 语义错
+        return _failure(str(error))
+    progress(ISO_STAGES[1], 1, 1)
+
+    # ---- 3. 解 IK（相位连续：下一点用上一点的解作参考） ----
+    _check_cancel(job)
+    progress(ISO_STAGES[2], 0, len(iso.POINT_NAMES))
+    results = iso.solve_points(rbt, points, options["rpy"], order=order,
+                              extrinsic=extrinsic, q_seed=options["q_seed"])
+    progress(ISO_STAGES[2], len(iso.POINT_NAMES), len(iso.POINT_NAMES))
+
+    rows = [_iso_row(name, results[name]) for name in iso.POINT_NAMES]
+    stats = _iso_stats(rows, side=side, center=center,
+                       layout=options["layout"], plane=options["plane"])
+    # 与 CLI 打同一组信息（页面的日志面板要“等价终端输出”，否则中心+边长
+    # 模式下日志是空的，现场会以为任务没干活）。
+    for row in rows:
+        head = (f"  {row['name']} pos=({row['pos'][0]:7.1f},"
+                f"{row['pos'][1]:7.1f},{row['pos'][2]:7.1f})")
+        if not row["ok"]:
+            print(f"{head}  无解 [FAIL]")
+            continue
+        q_text = ", ".join(f"{value:7.2f}" for value in row["q"])
+        print(f"{head}  q=[{q_text}]  |J3|={row['j3_abs']:6.2f} "
+              f"|J5|={row['j5_abs']:6.2f}  cfg={row['config']}")
+    failed = [row["name"] for row in rows if not row["ok"]]
+    for row in rows:
+        if (row["ok"] and options["j5_min"] > 0.0
+                and row["j5_abs"] < options["j5_min"]):
+            warnings.append(f"{row['name']} 的 |J5|={row['j5_abs']:.2f}° "
+                            f"低于 {options['j5_min']:g}°（腕部接近奇异）")
+    if not stats["config_consistent"]:
+        warnings.append(f"五点的构型标签不一致（{stats['configs']}）："
+                        f"现场按 MOVL 走点时可能换分支")
+
+    # ---- 4. 出图（matplotlib Agg；plot_points 内部已经 close） ----
+    _check_cancel(job)
+    progress(ISO_STAGES[3], 0, 1)
+    iso.plot_points(points, center, side, str(run_dir / ARTIFACT_ISO_PLOT),
+                    f"ISO 9283 P1~P5 ({options['layout']}, L={side:g} mm)")
+    progress(ISO_STAGES[3], 1, 1)
+
+    # ---- 5. 落盘：iso.json（与 aabb_snake_scan 同构，export_gp 可直接吃） ----
+    _check_cancel(job)
+    progress(ISO_STAGES[4], 0, 1)
+    payload = iso.scan_payload(
+        points, results,
+        cube={"center": [float(value) for value in center],
+              "bounds": iso._cube_bounds(center, side)},
+        layout=options["layout"], side=side, rpy=options["rpy"],
+        convention=options["euler"], motion_hint="MOVL",
+        plane=options["plane"])
+    with open(run_dir / ARTIFACT_ISO_JSON, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2,
+                  allow_nan=False)
+    progress(ISO_STAGES[4], 1, 1)
+
+    result = {"ok": not failed,
+              "run_id": run_id,
+              "run_dir": str(run_dir),
+              "stats": stats,
+              "points": rows,
+              "meta": payload["meta"],
+              "artifacts": {"iso_json": ARTIFACT_ISO_JSON,
+                            "plot": ARTIFACT_ISO_PLOT},
+              "warnings": warnings}
+    if failed:
+        # 有解的点已经落盘（现场可以看 PNG 判断往哪个方向缩），但返回值是失败
+        result["error"] = (f"{len(failed)} 个点无解（{','.join(failed)}）——"
+                           f"缩小立方体或换姿态")
+    return result
+
+
+def run_iso9283(params: dict, job=None, on_progress=None) -> dict:
+    """生成 ISO 9283 的 P1~P5 五点并落盘（M5，**不抛异常**）。
+
+    与 CLI ``python -m excitation_trajectory.iso9283_cube`` 走**同一条**算法
+    路径：立方体由 ``find_largest_cube`` / 调用方给定，P1~P5 由 ``cube_points``
+    算，IK 由 ``solve_points`` 解，JSON 由 ``scan_payload`` 组装（与
+    ``aabb_snake_scan`` 同构，``export_gp.load_scan_points`` 直接能吃）。
+    本函数只负责串流程、报进度、落盘。
+
+    Args:
+        params: 表单值：``robot``（模型路径）/ ``cube_mode``（``center`` /
+            ``bounds`` / ``auto``）/ ``center`` + ``side``（center 模式）/
+            ``cube``（bounds 模式，``x0 x1 y0 y1 z0 z1``）/ ``search_box`` +
+            ``resolution`` + ``prefer_x_min``（auto 模式）/ ``layout`` /
+            ``plane`` / ``square_frac`` / ``rpy`` / ``euler`` / ``q_seed`` /
+            ``j5_min``。
+        job: ``jobs.Job``（可选）。给出时用它已有 ``run_dir`` / ``id``，并在
+            每个阶段边界检查 ``job.cancel``。
+        on_progress: ``on_progress(stage, index, total)`` 或 ``None``；阶段名见
+            :data:`ISO_STAGES`（``定立方体`` / ``生成五点`` / ``解算 IK`` /
+            ``出图`` / ``写文件``）。
+
+    Returns:
+        dict: 成功时 ``{"ok": True, "run_id", "run_dir", "stats", "points",
+        "meta", "artifacts", "warnings"}``；有解不出的点、参数错、搜不到
+        立方体时 ``{"ok": False, "error": 报错原文, "warnings": [...]}``
+        （前一种情况额外带 ``run_id`` / ``artifacts``：PNG 与 JSON 已经落下，
+        现场可以看它判断往哪边缩）。程序性错误（代码 bug）不在这里吞，交给
+        ``jobs`` 层记 ``failed``。
+    """
+    warnings: list[str] = []
+    try:
+        options = _iso_options(params or {})
+    except _FormError as error:
+        return _failure(str(error))
+    except (TypeError, ValueError) as error:
+        return _failure(f"参数无法解析：{error}")
+    try:
+        return _execute_iso(options, job, _StageReporter(on_progress), warnings)
+    except jobs.JobCancelled:
+        raise                          # 交给 jobs 层归为 cancelled
+    except SystemExit as exit_error:
+        return {"ok": False,
+                "error": f"算法中止（退出码 {exit_error.code}），详见任务日志",
+                "warnings": warnings}
+    except Exception as error:          # noqa: BLE001 - 一律转 ok:False
+        return {"ok": False,
+                "error": f"{type(error).__name__}: {error}",
+                "warnings": warnings}
+
+
+# ---------------------------------------------------------------------------
 # M3：工具页（GP 导出 / JSON -> URDF / 运行目录盘点与清理）
 # ---------------------------------------------------------------------------
 #: GP 模板里必须保持原样的元数据字段（写完回读比对，作为"模板未改动"的证据）。
@@ -1933,9 +2387,15 @@ def _gp_scan_path(params: dict) -> Path:
             path = jobs.repo_root() / path
         path = path.resolve()
         if path.is_dir():
-            path = path / ARTIFACT_SCAN_JSON
+            # 正常扫描目录认 ``scan.json``；ISO 五点目录只有 ``iso.json``（同构，
+            # ``load_scan_points`` 一样能读），所以两种产物名都看。
+            for name in (ARTIFACT_SCAN_JSON, ARTIFACT_ISO_JSON):
+                if (path / name).is_file():
+                    return path / name
+            raise _FormError(f"{key} 里没有 {ARTIFACT_SCAN_JSON} 或 "
+                             f"{ARTIFACT_ISO_JSON}：{path}")
         if not path.is_file():
-            raise _FormError(f"{key} 里没有 {ARTIFACT_SCAN_JSON}：{path}")
+            raise _FormError(f"{key} 指向的文件不存在：{path}")
         return path
     raise _FormError(f"需要 run_dir（runs/<id>/）或 scan（{ARTIFACT_SCAN_JSON} 路径）")
 

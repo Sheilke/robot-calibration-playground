@@ -44,13 +44,17 @@ MAX_FINISHED = 50
 #: 判定“运行目录已经有成果”的产物名（与 ``core.ARTIFACT_SCAN_JSON`` 同名）。
 #: ``core`` 反过来 import 本模块，所以常量放在这边，由测试钉住两边一致。
 SCAN_ARTIFACT = "scan.json"
+#: 取消后保留目录的产物判据（见 ``_discard_partial_run``）。
+#: ``iso.json`` 是 ISO 五点页的产物，与 ``scan.json`` 同构（都能喂 ``export_gp``），
+#: 所以也能算“这次运行已经有成果”。
+RESULT_ARTIFACTS = (SCAN_ARTIFACT, "iso.json")
 #: 运行产物目录名（仓库根下，已写入 ``.gitignore``）。
 RUNS_DIRNAME = "runs"
 #: 覆盖产物目录的环境变量（测试用；不设则 ``<repo>/runs``）。
 RUNS_ENV = "LASER_WEB_RUNS"
 
 #: 任务种类的合法取值（与 ``core.run_scan`` 的 ``kind`` 对应）。
-KINDS = ("scan", "repair")
+KINDS = ("scan", "repair", "iso")
 #: 任务状态的合法取值。
 STATES = ("pending", "running", "done", "failed", "cancelled")
 #: 已结束的状态集合（用于判断是否可以再取消）。
@@ -489,23 +493,24 @@ class JobRegistry:
 
     @staticmethod
     def _discard_partial_run(job: Job) -> None:
-        """取消后清掉「半成品」运行目录；已经落下 ``scan.json`` 的则保留。
+        """取消后清掉「半成品」运行目录；已经落下结果 JSON 的则保留。
 
         取消只在阶段边界生效，所以最常出现的是「出图之后、写文件之前」：目录
         里只有一个 ``plot.png``。这种目录既不能导出 GP（没 ``scan.json``），
         又会在工具页的运行列表里伪装成一次正常运行，不如删掉。
 
         反过来，若取消发生在产物都写完、结果被丢弃那一刻，目录是**完整**的
-        （``scan.json`` 已在），保留才能事后回看——所以判据是「有没有
-        ``scan.json``」，而不是「是不是取消的」。
+        （``scan.json`` / ``iso.json`` 已在），保留才能事后回看——所以判据是
+        「有没有结果 JSON」，而不是「是不是取消的」。
 
         删不掉（竞态/权限）也不报错：取消本来就该安静结束。
         """
         run_dir = Path(job.run_dir)
         try:
-            if (run_dir / SCAN_ARTIFACT).is_file():
-                job.append_log(f"保留完整运行目录 {run_dir}")
-                return
+            for name in RESULT_ARTIFACTS:
+                if (run_dir / name).is_file():
+                    job.append_log(f"保留完整运行目录 {run_dir}")
+                    return
             if not run_dir.is_dir():
                 return
             shutil.rmtree(run_dir, ignore_errors=True)

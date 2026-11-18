@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""左侧导航 + 三个页面容器 + ``ui.run``。
+"""左侧导航 + 四个页面容器 + ``ui.run``。
 
-三个页面共用一套布局：顶部标题条 + 左侧固定导航 + 右侧内容区；每个页面的
+四个页面共用一套布局：顶部标题条 + 左侧固定导航 + 右侧内容区；每个页面的
 内容由 :mod:`laser_web.pages` 里对应的 ``render()`` 填充。
 """
 
@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from nicegui import ui
 
-from .pages import generate, repair, tools
+from .pages import generate, iso9283, repair, tools
 
-#: 页面表：路径 -> (标题, 图标, 渲染函数)。
+#: 页面表：路径 -> (标题, 图标, 渲染函数)。顺序就是左侧导航的顺序。
 PAGES = (("/", "生成", "route", generate.render),
          ("/repair", "奇异修复", "build", repair.render),
+         ("/iso", "ISO 五点", "deployed_code", iso9283.render),
          ("/tools", "工具", "construction", tools.render))
 
 
@@ -36,7 +37,7 @@ def _layout(active: str) -> None:
 
 
 def build_pages() -> None:
-    """注册三个页面（生成 / 奇异修复 / 工具）。"""
+    """注册四个页面（生成 / 奇异修复 / ISO 五点 / 工具）。"""
     for path, title, _icon, render in PAGES:
         def _page(active: str = path, body=render) -> None:
             """单个页面的内容函数（工厂内绑定，避免闭包串页）。"""
