@@ -22,7 +22,7 @@ from .generate import (POLL_INTERVAL, _FAILED_ROW_SLOT, _STATE_TEXT, _columns,
                        _fmt, _number, _result_mode, _round)
 
 #: 立方体来源 toggle（值给 ``core``，文案给人看）。
-_CUBE_MODES = {"center": "中心 + 边长", "bounds": "范围", "auto": "自动搜索"}
+_CUBE_MODES = {"bounds": "人工指定范围", "auto": "自动搜索内接"}
 #: 布点方式（值来自 ``iso9283_cube.LAYOUTS``，这里只给中文文案）。
 _LAYOUTS = {"vertices": "对角截面四角（ISO 标准）",
             "circle": "内切圆（旧实现）",
@@ -30,14 +30,8 @@ _LAYOUTS = {"vertices": "对角截面四角（ISO 标准）",
 #: 对角截面（值来自 ``iso9283_cube.PLANES``）。
 _PLANES = {"xz": "XZ 对角面（x=z）", "yz": "YZ 对角面（y=z）",
            "xy": "XY 对角面（x=y）"}
-#: 示例立方体：与「生成」页的示例采样域同源（``ui_state.SAMPLE_POINT_*``），
-#: 中心取各轴中点、边长取最小跨度——就是 CLI ``--cube`` 的取法，只是这里
-#: 拆成「中心 + 边长」两个输入框填。
-_SAMPLE_SPANS = [high - low for low, high
-                 in zip(ui_state.SAMPLE_POINT_MIN, ui_state.SAMPLE_POINT_MAX)]
-_SAMPLE_SIDE = float(min(_SAMPLE_SPANS))
-_SAMPLE_CENTER = [(low + high) / 2.0 for low, high
-                  in zip(ui_state.SAMPLE_POINT_MIN, ui_state.SAMPLE_POINT_MAX)]
+#: 「人工指定范围」的示例值：与「生成」页的示例采样域同源
+#: （``ui_state.SAMPLE_POINT_*``）；立方体取各轴中点、最小跨度为边长。
 #: 自动搜索的示例搜索箱（README「功能四」里跑过的那一组，x 朝机身外侧留开）。
 _SAMPLE_SEARCH_BOX = (700.0, 1400.0, -600.0, 600.0, 200.0, 1300.0)
 #: 「工具」页导 GP 的提示（``iso.json`` 与 ``scan.json`` 同构）。
@@ -129,10 +123,9 @@ def render() -> None:
                   "q_seed": fields["q_seed"].value,
                   "j5_min": fields["j5_min"].value}
         mode = fields["cube_mode"].value
-        if mode == "center":
-            params["center"] = [fields["center_x"].value,
-                                fields["center_y"].value,
-                                fields["center_z"].value]
+        if mode == "bounds":
+            params["cube"] = [fields[f"cube_{axis}"].value
+                              for axis in ("x0", "x1", "y0", "y1", "z0", "z1")]
             params["side"] = fields["side"].value
         elif mode == "bounds":
             params["cube"] = [fields["x0"].value, fields["x1"].value,
@@ -150,7 +143,7 @@ def render() -> None:
         return params
 
     def switch_mode(mode: str) -> None:
-        """切换三种立方体来源：只显示当前那一组输入。"""
+        """切换立方体来源（人工指定范围 / 自动搜索）：只显示当前那一组输入。"""
         for key, box in boxes.items():
             box.set_visibility(key == mode)
 
@@ -175,20 +168,9 @@ def render() -> None:
             with ui.card().classes("w-full"):
                 ui.label("立方体来源").classes("text-subtitle1")
                 fields["cube_mode"] = ui.toggle(
-                    _CUBE_MODES, value="center",
+                    _CUBE_MODES, value="bounds",
                     on_change=lambda event: switch_mode(event.value)).props(
                         "spread")
-                boxes["center"] = ui.column().classes("w-full gap-1")
-                with boxes["center"]:
-                    with ui.row().classes("w-full no-wrap gap-2"):
-                        for key, label, value in (
-                                ("center_x", "中心 X", _SAMPLE_CENTER[0]),
-                                ("center_y", "中心 Y", _SAMPLE_CENTER[1]),
-                                ("center_z", "中心 Z", _SAMPLE_CENTER[2])):
-                            fields[key] = _number(label, value, None, step=1.0)
-                    fields["side"] = _number(
-                        "边长 L（mm，三轴共用）", _SAMPLE_SIDE, None,
-                        min=1.0, step=1.0)
                 boxes["bounds"] = ui.column().classes("w-full gap-1")
                 with boxes["bounds"]:
                     for low_key, high_key, axis, values in (
@@ -292,6 +274,8 @@ def render() -> None:
                     else:
                         stats = result["stats"]
                         with ui.grid(columns=2).classes("w-full gap-x-3"):
+                            ui.label("总点数").classes("text-grey-7")
+                            ui.label(f"{stats['total']} 点").classes("")
                             ui.label("可达").classes("text-grey-7")
                             ok = stats["solved"] == stats["total"]
                             ui.label(f"{stats['solved']}/{stats['total']}").classes(

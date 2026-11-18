@@ -352,7 +352,7 @@ def render() -> None:
                 fields["robot"] = ui.select(
                     options, value=default_robot,
                     label="模型（data/configs 下，只列能加载的）",
-                    on_change=preview_card.refresh).classes("w-full")
+                    on_change=lambda _event: preview_card.refresh()).classes("w-full")
                 if skipped:
                     with ui.expansion(
                             f"另有 {len(skipped)} 个文件不能当模型用", icon="info"
@@ -424,7 +424,7 @@ def render() -> None:
                             for index, (key, label) in enumerate(keys):
                                 fields[key] = _number(label,
                                                       defaults[row][index],
-                                                      preview_card.refresh)
+                                                      lambda _event=None: preview_card.refresh())
                 boxes["axes"] = ui.column().classes("w-full gap-1")
                 with boxes["axes"]:
                     for index, (low_key, high_key, axis) in enumerate(
@@ -434,10 +434,10 @@ def render() -> None:
                         with ui.row().classes("w-full no-wrap gap-2"):
                             fields[low_key] = _number(
                                 f"{axis} 下界", defaults["aabb6"][2 * index],
-                                preview_card.refresh)
+                                lambda _event=None: preview_card.refresh())
                             fields[high_key] = _number(
                                 f"{axis} 上界", defaults["aabb6"][2 * index + 1],
-                                preview_card.refresh)
+                                lambda _event=None: preview_card.refresh())
                 fields["grid_mode"] = ui.toggle(
                     {"count": "目标点数", "explicit": "手填份数"},
                     value=defaults["grid_mode"],
@@ -447,7 +447,7 @@ def render() -> None:
                 with boxes["count"]:
                     fields["target_count"] = _number(
                         "目标点数（自动凑网格）", defaults["target_count"],
-                        preview_card.refresh, min=1, step=1)
+                        lambda _event=None: preview_card.refresh(), min=1, step=1)
                 boxes["explicit"] = ui.column().classes("w-full gap-1")
                 with boxes["explicit"]:
                     with ui.row().classes("w-full no-wrap gap-2"):
@@ -455,7 +455,7 @@ def render() -> None:
                                            ("zs", "Z 份数"),
                                            ("z_insert", "换层插点")):
                             fields[key] = _number(label, defaults[key],
-                                                  preview_card.refresh,
+                                                  lambda _event=None: preview_card.refresh(),
                                                   min=0, step=1)
                 with ui.row().classes("w-full no-wrap gap-2"):
                     for index, (key, label) in enumerate(
@@ -463,11 +463,11 @@ def render() -> None:
                              ("rpy_pitch", "参考 B (pitch)"),
                              ("rpy_yaw", "参考 C (yaw)"))):
                         fields[key] = _number(label, defaults["rpy"][index],
-                                              preview_card.refresh)
+                                              lambda _event=None: preview_card.refresh())
                 fields["euler"] = ui.select(
                     euler_convention_options(), value=defaults["euler"],
                     label="欧拉约定（内旋）",
-                    on_change=preview_card.refresh).classes("w-full")
+                    on_change=lambda _event: preview_card.refresh()).classes("w-full")
                 with ui.row().classes("w-full no-wrap gap-2"):
                     for index, (key, label) in enumerate(
                             (("perturb_roll", "扰动 ±roll"),
@@ -475,7 +475,7 @@ def render() -> None:
                              ("perturb_yaw", "扰动 ±yaw"))):
                         fields[key] = _number(label,
                                               defaults["perturb_deg"][index],
-                                              preview_card.refresh)
+                                              lambda _event=None: preview_card.refresh())
                     fields["seed"] = _number("随机种子 seed", defaults["seed"],
                                              None, min=0, step=1)
                 with ui.row().classes("w-full no-wrap gap-2"):
@@ -487,7 +487,8 @@ def render() -> None:
                         min=0.0, step=1.0)
                     fields["cond_max"] = _number(
                         "条件数上限 cond_max", defaults["cond_max"],
-                        preview_card.refresh, min=1.0, step=0.5)
+                        lambda _event=None: preview_card.refresh(),
+                        min=1.0, step=0.5)
                 fields["q_seed"] = ui.input(
                     "q-seed（6 个关节角，逗号分隔，度）",
                     value=defaults["q_seed"]).classes("w-full")
