@@ -6,12 +6,17 @@
 人工冒烟，这里不碰；但 ``render()`` 会**真的跑一遍**（无 websocket 的 client），
 所以“元素定义顺序/闭包名字写错”这类只在建页面时才炸的问题会被钉住。
 """
+import re
 import tempfile
 import unittest
+from pathlib import Path
 
 from laser_web import jobs
 from laser_web.pages import (POINT_COUNT_WARN, adopt_running_job,
                              cancelled_result)
+
+#: 页面源码目录（回调/初始化写法的静态检查用）。
+PAGES_DIR = Path(__file__).resolve().parents[1] / "pages"
 
 
 class PagesImportTest(unittest.TestCase):
@@ -259,3 +264,60 @@ class GridVertexConversionTest(unittest.TestCase):
         self.assertEqual(vertices_to_segments(0), 0)     # 0 格点按 0 份数处理
         self.assertEqual(vertices_to_segments(-3), 0)
         self.assertEqual(segments_to_vertices(-3), 1)    # 至少 1 个格点
+
+
+class PageInitUsesCurrentToggleTest(unittest.TestCase):
+    """页面初始化必须按 toggle 的**当前值**显示输入块，不能写死模式名。
+
+    真实故障：ISO 页初始化写死 ``switch_mode("center")``，而立方体来源已经没有
+    ``center`` 这一项（只有 bounds / auto）→ 打开页面后**两组输入全被隐藏**，
+    看起来"这一页没有输入框"。源码扫描守住这条，避免再出现写死旧模式名的写法。
+    """
+
+    PAGES = ("generate", "repair", "iso9283")
+
+    def _source(self, name: str) -> str:
+        return (PAGES_DIR / f"{name}.py").read_text(encoding="utf-8")
+
+    def test_iso_initialises_from_the_toggle_value(self):
+        source = self._source("iso9283")
+        self.assertIn('switch_mode(fields["cube_mode"].value)', source)
+        self.assertNotIn('switch_mode("center")', source)
+
+    #: 切换函数 -> 它对应的 toggle 字段名。
+    TOGGLES = {"mode": "cube_mode", "domain": "domain_mode", "grid": "grid_mode"}
+
+    def _literal_switches(self, source: str):
+        """找出 ``switch_*(字面量)`` 的位置，并判断附近是否把 toggle 设成了同一个值。
+
+        允许「先赋值 toggle、再按它切换」的写法（repair 页的"填入样例"就是这样，
+        自洽）；只抓"写死一个模式名，但 toggle 并不指向它"的情况——那才会让可见的
+        切换按钮与实际显示的输入块不一致。
+        """
+        lines = source.splitlines()
+        pattern = re.compile(r"switch_(mode|domain|grid)\(\s*[\"']([^\"']+)[\"']")
+        problems = []
+        for index, line in enumerate(lines):
+            match = pattern.search(line)
+            if not match:
+                continue
+            kind, literal = match.group(1), match.group(2)
+            field = self.TOGGLES[kind]
+            window = lines[max(0, index - 12):index + 4]
+            consistent = any(
+                re.search(rf'fields\["{field}"\]\.value\s*=\s*[\"\']{re.escape(literal)}',
+                          candidate)
+                for candidate in window)
+            if not consistent:
+                problems.append(f"{index + 1}: {line.strip()}（toggle {field} 未设为 {literal!r}）")
+        return problems
+
+    def test_switch_calls_agree_with_their_toggle(self):
+        """``switch_*(字面量)`` 必须伴随把对应 toggle 设成同一个值。"""
+        offenders = []
+        for name in self.PAGES:
+            for problem in self._literal_switches(self._source(name)):
+                offenders.append(f"{name}.py:{problem}")
+        self.assertEqual(offenders, [],
+                         "切换用字面量但 toggle 不是该值 → 按钮与实际输入块不一致：\n"
+                         + "\n".join(offenders))

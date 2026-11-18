@@ -24,8 +24,7 @@ from .generate import (POLL_INTERVAL, _FAILED_ROW_SLOT, _STATE_TEXT, _columns,
                        _fmt, _number, _result_mode, _round)
 
 #: 立方体来源 toggle（值给 ``core``，文案给人看）。
-_CUBE_MODES = {"bounds": "人工指定范围", "auto": "自动搜索内接",
-               "points": "人工指定五点"}
+_CUBE_MODES = {"bounds": "给最大/最小点", "auto": "自动搜索内接"}
 #: 布点方式（值来自 ``iso9283_cube.LAYOUTS``，这里只给中文文案）。
 _LAYOUTS = {"vertices": "对角截面四角（ISO 标准）",
             "circle": "内切圆（旧实现）",
@@ -33,20 +32,7 @@ _LAYOUTS = {"vertices": "对角截面四角（ISO 标准）",
 #: 对角截面（值来自 ``iso9283_cube.PLANES``）。
 _PLANES = {"xz": "XZ 对角面（x=z）", "yz": "YZ 对角面（y=z）",
            "xy": "XY 对角面（x=y）"}
-#: 「人工指定五点」的示例默认值：示例域的立方体中心 + 对角截面四角，
-#: 只是让输入框不至于空着；现场按实际需求改。
-_SAMPLE_POINTS = [[
-    (ui_state.SAMPLE_POINT_MIN[axis] + ui_state.SAMPLE_POINT_MAX[axis]) / 2.0
-    for axis in range(3)]]
-_SAMPLE_HALF = min(hi - lo for lo, hi
-                   in zip(ui_state.SAMPLE_POINT_MIN, ui_state.SAMPLE_POINT_MAX)) / 2.0
-for _sx, _sy, _sz in ((1, 1, 1), (1, -1, 1), (-1, 1, -1), (-1, -1, -1)):
-    _SAMPLE_POINTS.append([
-        _SAMPLE_POINTS[0][0] + _sx * _SAMPLE_HALF,
-        _SAMPLE_POINTS[0][1] + _sy * _SAMPLE_HALF,
-        _SAMPLE_POINTS[0][2] + _sz * _SAMPLE_HALF])
-
-#: 「人工指定范围」的示例值：与「生成」页的示例采样域同源
+#: 「最大/最小点」的示例值：与「生成」页的示例采样域同源
 #: （``ui_state.SAMPLE_POINT_*``）；立方体取各轴中点、最小跨度为边长。
 #: 自动搜索的示例搜索箱（README「功能四」里跑过的那一组，x 朝机身外侧留开）。
 _SAMPLE_SEARCH_BOX = (700.0, 1400.0, -600.0, 600.0, 200.0, 1300.0)
@@ -143,11 +129,6 @@ def render() -> None:
             params["cube"] = [fields["x0"].value, fields["x1"].value,
                               fields["y0"].value, fields["y1"].value,
                               fields["z0"].value, fields["z1"].value]
-        elif mode == "points":
-            # 人工逐点指定：5 组 X/Y/Z
-            params["points"] = [[fields[f"p_{index}_{axis}"].value
-                                 for axis in ("x", "y", "z")]
-                                for index in range(len(iso.POINT_NAMES))]
         else:
             params["search_box"] = [fields["box_x0"].value,
                                     fields["box_x1"].value,
@@ -190,35 +171,18 @@ def render() -> None:
                         "spread")
                 boxes["bounds"] = ui.column().classes("w-full gap-1")
                 with boxes["bounds"]:
-                    for low_key, high_key, axis, values in (
-                            ("x0", "x1", "X",
-                             (ui_state.SAMPLE_POINT_MIN[0],
-                              ui_state.SAMPLE_POINT_MAX[0])),
-                            ("y0", "y1", "Y",
-                             (ui_state.SAMPLE_POINT_MIN[1],
-                              ui_state.SAMPLE_POINT_MAX[1])),
-                            ("z0", "z1", "Z",
-                             (ui_state.SAMPLE_POINT_MIN[2],
-                              ui_state.SAMPLE_POINT_MAX[2]))):
-                        with ui.row().classes("w-full no-wrap gap-2"):
-                            fields[low_key] = _number(
-                                f"{axis} 下界", values[0], None, step=1.0)
-                            fields[high_key] = _number(
-                                f"{axis} 上界", values[1], None, step=1.0)
-                    ui.label("取各轴中点为中心、最小跨度为边长（需近似各向等长）。"
-                             ).classes("text-caption text-grey-7")
-                boxes["points"] = ui.column().classes("w-full gap-1")
-                with boxes["points"]:
-                    for index, name in enumerate(iso.POINT_NAMES):
-                        with ui.row().classes("w-full no-wrap gap-2"):
-                            ui.label(name).classes("w-8 text-grey-7")
-                            for axis, label in (("x", "X"), ("y", "Y"), ("z", "Z")):
-                                fields[f"p_{index}_{axis}"] = _number(
-                                    label, _SAMPLE_POINTS[index][
-                                        ("x", "y", "z").index(axis)],
-                                    None, step=1.0)
-                    ui.label("逐点填 P1～P5 的法兰位置（mm）；"
-                             "五点姿态仍用下面那一个参考姿态。"
+                    # 只要两个极值点：最小点 + 最大点（各 X/Y/Z 三个数）
+                    for row_label, keys, values in (
+                            ("最小点", ("x0", "y0", "z0"),
+                             ui_state.SAMPLE_POINT_MIN),
+                            ("最大点", ("x1", "y1", "z1"),
+                             ui_state.SAMPLE_POINT_MAX)):
+                        with ui.row().classes("w-full no-wrap gap-2 items-baseline"):
+                            ui.label(row_label).classes("w-16 text-grey-7")
+                            for key, axis, value in zip(keys, "XYZ", values):
+                                fields[key] = _number(axis, value, None, step=1.0)
+                    ui.label("只填这两个极值点；程序取各轴中点为中心、"
+                             "最小跨度为立方体边长（三轴跨度不等时会提示）。"
                              ).classes("text-caption text-grey-7")
                 boxes["auto"] = ui.column().classes("w-full gap-1")
                 with boxes["auto"]:
@@ -543,5 +507,7 @@ def render() -> None:
         stage_label.set_text("接管在跑的任务（上一次页面已关闭）")
         poll_timer.activate()
 
-    switch_mode("center")
+    # 初始化必须用 toggle 的**当前值**，不能写死模式名：写死一个已不存在的
+    # 模式（曾经是 "center"）会让两组输入全部隐藏，页面看起来"没有输入框"。
+    switch_mode(fields["cube_mode"].value)
     switch_layout(defaults["layout"])
