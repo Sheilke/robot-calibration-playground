@@ -1,0 +1,10 @@
+# -*- coding: utf-8 -*-
+"""离线授权校验的依赖（与核心算法、网页界面分开）。
+
+核心算法只要 numpy + matplotlib；网页界面要 requirements-web.txt；只有"许可授权"
+这一层需要 Ed25519 签名库。桌面版必须带上这份依赖，命令行工具用不到。
+
+    pip install -r requirements-license.txt
+"""
+
+cryptography>=42
