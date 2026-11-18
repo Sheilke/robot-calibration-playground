@@ -25,6 +25,7 @@ from excitation_trajectory.aabb_snake_scan import (
     EULER_CONVENTIONS,
     _reference_rotation,
     _validate_args,
+    choose_grid,
     config_tag,
     PERTURB_AMPLITUDE_DEG,
     build_arg_parser,
@@ -593,3 +594,42 @@ class ZInsertTest(unittest.TestCase):
         self.assertTrue(plain.issubset({w.pos for w in inserted}))
         indices = [w.index for w in inserted]
         self.assertEqual(indices, list(range(len(inserted))))
+
+
+class ZeroLengthAxisTest(unittest.TestCase):
+    """零长度轴（扫平面）是合法用法，不能让 choose_grid 抛 ZeroDivisionError。
+
+    真实故障：`--target-count` 模式下，`spacings` 只过滤了「份数 > 0」的轴，
+    零长度轴贡献 `length/seg = 0` → `max(spacings)/min(spacings)` 除以零。
+    这个异常从 `core.preview_domain` 里穿出去（它只 catch 少数几类），
+    一路打断 Qt 的槽，界面停在切换前的旧状态。
+    """
+
+    TARGET = 50
+
+    def test_zero_length_axis_does_not_divide_by_zero(self):
+        for dims in ((0.0, 1200.0, 670.0),
+                     (550.0, 0.0, 670.0),
+                     (550.0, 1200.0, 0.0),
+                     (0.0, 0.0, 0.0)):
+            with self.subTest(dims=dims):
+                xs, ys, zs, insert = choose_grid(self.TARGET, dims)  # 不抛即通过
+                self.assertEqual(grid_point_count(xs, ys, zs, insert),
+                                 self.TARGET)
+
+    def test_normal_box_is_unaffected(self):
+        """修零长度轴不能改变正常箱体的选网格结果（回归保护）。"""
+        self.assertEqual(choose_grid(self.TARGET, (550.0, 1200.0, 670.0)),
+                         (1, 4, 4, 0))
+
+    def test_preview_domain_survives_plane_domain_with_target_count(self):
+        """网页/桌面的入口也要过：这是当初真正炸的那条路径。"""
+        from laser_web import core
+
+        result = core.preview_domain({"aabb6": [750, 1300, 600, 600, 270, 940],
+                                      "target_count": 50,
+                                      "rpy": [3, 73, -167],
+                                      "euler": "xyz-intrinsic"})
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["point_count"], 50)
+        self.assertEqual(result["volume_m3"], 0.0)      # Y 为零跨度

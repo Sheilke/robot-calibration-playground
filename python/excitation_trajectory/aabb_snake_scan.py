@@ -224,8 +224,11 @@ def choose_grid(target: int, dims, *, max_per_axis: int = COUNT_GRID_MAX_PER_AXI
                 nearest.append(base + zs * z_insert)
 
                 segments = (xs, ys, zs)
+                # 格距只对"有跨度且分过段"的轴有意义：**零长度轴**（扫平面的合法
+                # 用法）会贡献 length/seg = 0，混进来就让 min(spacings) = 0，
+                # 进而 max/min 抛 ZeroDivisionError（曾在界面上打断 Qt 槽）。
                 spacings = [length / seg for length, seg in zip(lengths, segments)
-                            if seg > 0]
+                            if seg > 0 and length > 0]
                 degenerate = any(seg == 0 and length > 0
                                  for length, seg in zip(lengths, segments))
                 anisotropy = (max(spacings) / min(spacings)

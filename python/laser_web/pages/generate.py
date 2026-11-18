@@ -17,6 +17,7 @@ M2 把两个按钮接上真活儿（设计文档 §5.1 / §8）：
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from nicegui import ui
@@ -76,10 +77,17 @@ _FAILED_ROW_SLOT = """
 
 
 def _fmt(value, digits: int = 3) -> str:
-    """None 安全的数字显示（失败点没有关节角，写 ``—``）。"""
+    """None 安全的数字显示（失败点没有关节角，写 ``—``）。
+
+    奇异参考姿态的 ``inf``（内旋 XYZ 且 pitch=±90°）显示成 ``∞``：那是姿态本身
+    不可用，不是程序 bug，原样打印 ``inf`` 会被当成故障。
+    """
     if value is None:
         return "—"
-    return f"{float(value):.{digits}f}"
+    number = float(value)
+    if math.isinf(number):
+        return "∞"
+    return f"{number:.{digits}f}"
 
 
 def _round(value, digits: int):
