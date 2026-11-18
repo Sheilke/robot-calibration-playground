@@ -449,3 +449,44 @@ class MakeRunDirKeepTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _run_id, run_dir = jobs.make_run_dir(tmp, keep=0)
             self.assertTrue(run_dir.is_dir())
+
+
+class PruneProtectsTheNewDirectoryTest(unittest.TestCase):
+    """mtime 相同（同一秒/同一微秒）时，刚建的目录也不能被淘汰掉。
+
+    真实故障：``prune_runs`` 按 ``(mtime, name)`` 排序，同一时刻创建的目录名里
+    带**随机后缀**，于是一个刚建的新目录可能被排成"最旧"而被删——长任务随后写盘
+    就 ``FileNotFoundError``。修法是 ``make_run_dir`` 把新目录作为 ``protect``
+    传下去：受保护的目录不参与淘汰，但仍计入 keep。
+    """
+
+    def test_survives_when_every_mtime_is_identical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for index in range(6):
+                path = base / f"20260101-000000-{index:04d}"
+                path.mkdir()
+                os.utime(path, (1_800_000_000, 1_800_000_000))   # 全部同一 mtime
+            newest = base / "20260101-000000-ffff"                # 名字排最后
+            newest.mkdir()
+            os.utime(newest, (1_800_000_000, 1_800_000_000))
+
+            removed = jobs.prune_runs(base, keep=1, protect=(newest,))
+
+            self.assertTrue(newest.is_dir(), "受保护的新目录被删了")
+            # 7 个目录、keep=1、新目录受保护 -> 6 个旧目录全删
+            self.assertEqual(len(removed), 6)
+            survivors = sorted(path.name for path in base.iterdir())
+            self.assertEqual(survivors, [newest.name])
+
+    def test_protect_still_counts_towards_keep(self):
+        """受保护目录计入 keep：keep=2 且有 1 个受保护 + 3 个旧 → 只留 1 个旧。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for index in range(3):
+                (base / f"old-{index}").mkdir()
+            protected = base / "newest"
+            protected.mkdir()
+            jobs.prune_runs(base, keep=2, protect=(protected,))
+            self.assertTrue(protected.is_dir())
+            self.assertEqual(len(list(base.iterdir())), 2)

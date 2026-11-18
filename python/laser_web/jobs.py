@@ -109,7 +109,7 @@ def new_run_id(now: datetime | None = None) -> str:
 
 
 def prune_runs(root: str | Path | None = None, keep: int = KEEP_RUNS,
-               exclude=None) -> list[Path]:
+               exclude=None, protect=None) -> list[Path]:
     """删掉最旧的运行目录，使 ``runs/`` 下不超过 ``keep`` 个。
 
     排序键是 ``(目录 mtime, 目录名)``：同一秒内创建的目录按名字（即时间戳 +
@@ -120,6 +120,9 @@ def prune_runs(root: str | Path | None = None, keep: int = KEEP_RUNS,
         keep: 保留个数。
         exclude: 不许删的目录（绝对路径或名字）；调度器会把**还没结束的任务**
             的目录传进来，否则长任务算完写盘时目录已被别人清掉。
+        protect: 同样不删，但**仍计入** keep 的分子——``make_run_dir`` 用它保证
+            "刚建的那个"不会被自己触发的淘汰删掉（目录 mtime 相同时按名字排序
+            会碰运气，随机后缀可能把新目录排成最旧）。
 
     Returns:
         list[Path]: 被删掉的目录（从最旧到次新）；目录不存e时返回空列表。
@@ -128,13 +131,19 @@ def prune_runs(root: str | Path | None = None, keep: int = KEEP_RUNS,
     if not base.is_dir():
         return []
     keep_paths = {str(Path(item).resolve()) for item in (exclude or ())}
-    directories = [path for path in base.iterdir()
-                   if path.is_dir() and str(path.resolve()) not in keep_paths]
-    if len(directories) <= max(0, int(keep)):
+    protected = {str(Path(item).resolve()) for item in (protect or ())}
+    directories = [path for path in base.iterdir() if path.is_dir()]
+    candidates = [path for path in directories
+                  if str(path.resolve()) not in keep_paths
+                  and str(path.resolve()) not in protected]
+    # keep 的分子算**全部**目录（含受保护的），否则新目录会让数量永远超一格
+    excess = len(directories) - len(keep_paths) - max(0, int(keep))
+    if excess <= 0 or not candidates:
         return []
-    directories.sort(key=lambda path: (path.stat().st_mtime, path.name))
+    # mtime 相同时用 st_mtime_ns 再比一次；仍相同才轮到名字（随机后缀，不保证顺序）
+    candidates.sort(key=lambda path: (path.stat().st_mtime_ns, path.name))
     removed: list[Path] = []
-    for path in directories[:len(directories) - max(0, int(keep))]:
+    for path in candidates[:excess]:
         shutil.rmtree(path, ignore_errors=True)
         removed.append(path)
     return removed
@@ -169,7 +178,7 @@ def make_run_dir(root: str | Path | None = None, run_id: str | None = None,
             candidate = None   # 随机后缀撞车：换一个再试
             continue
         break
-    prune_runs(base, keep, exclude)
+    prune_runs(base, keep, exclude, protect=(run_dir,))
     return candidate, run_dir
 
 
