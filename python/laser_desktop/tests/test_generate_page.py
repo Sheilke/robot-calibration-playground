@@ -527,9 +527,13 @@ class RefreshAndFigureTest(PageTest):
             page.deleteLater()
             plot.deleteLater()
 
-    def test_generate_button_is_only_a_s3_placeholder(self):
-        """S2 不接后台任务：按钮文案里就写着 S3。"""
-        self.assertIn("S3", self.page.generate_button.text())
+    def test_generate_button_no_longer_advertises_s3(self):
+        """S3 已接入：按钮文案不再是占位提示，结果区装备到位、任务未跑时为空闲。"""
+        self.assertEqual(self.page.generate_button.text(), "生成并解算")
+        self.assertTrue(self.page.cancel_button.isHidden())
+        self.assertEqual(self.page.progress_bar.format(), "空闲")
+        self.assertEqual(self.page.result_tabs.count(), 3)
+        self.assertIsNone(self.page.last_result)
 
 
 class PreviewFailureTest(PageTest):

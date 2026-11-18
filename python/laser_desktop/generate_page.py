@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""生成页（S2）：完整表单 + 实时预览（只规划路点，**不跑 IK**）。
+"""生成页（S3）：完整表单 + 实时预览 + **真跑解算**（``core.run_scan`` + ``jobs``）。
 
 与网页版 ``laser_web/pages/generate.py`` 的关系
 ----------------------------------------------
@@ -14,8 +14,21 @@
   凑数模式读 ``preview_domain`` 的 ``point_count``；
 * ``core.preview_domain`` 外面还有一层兜底：算法层万一抛异常（历史上的
   ``choose_grid`` 零长度轴 ``ZeroDivisionError``），一律转成预览卡片的报错，
-  不让异常打断 Qt 槽、把界面停在旧状态；
-* S2 只做预览：不跑 IK、不起后台任务、不导出（S3 才接那三件事）。
+  不让异常打断 Qt 槽、把界面停在旧状态。
+
+S3 的"真跑"路径（线程模型见 :mod:`laser_desktop.job_bridge`）
+--------------------------------------------------------------
+1. 点「生成并解算」→ :meth:`GeneratePage.start_scan` 再向 ``core.preview_domain``
+   要一次确认（非法就只把报错原文写在卡片里，**不起任务**）；
+2. ``JobBridge.submit("scan", lambda job: core.run_scan(params, job=job,
+   on_progress=job.set_progress))`` —— ``core`` 与 ``jobs`` 一行未改，解算跑在
+   ``jobs`` 自己的那条工作线程里；
+3. 进度 / 日志 / 终态全部通过 :class:`laser_desktop.job_bridge.JobBridge` 的
+   信号回到 GUI 线程（页面从不轮询 ``snapshot()``）；
+4. 终态：``done`` → 统计标签 + 路点表 + 段诊断表 + 结果图（失败点红叉）；
+   ``cancelled`` → 灰字中性提示（不报红）；``failed`` → 红色报错原文 + 日志保留；
+5. 导出（``scan.json`` / ``joints.txt`` / ``plot.png``）用 ``QFileDialog`` 选
+   目标后从 ``run_dir`` **复制**（复制，不移动：``runs/`` 是归档）。
 
 图只在参数合法且点数不超上限时才规划（``plan_waypoints`` 是毫秒级，但 800 万点
 会直接把内存吃穿），并用 300 ms 去抖，避免拖动 spinbox 时反复重算。
@@ -25,13 +38,17 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
+from pathlib import Path
 from typing import NamedTuple
 
 from excitation_trajectory import aabb_snake_scan as scan
 from laser_web import core, ui_state
 
 from . import paths
-from .qt_compat import Qt, QtCore, QtWidgets
+from .job_bridge import LOG_LIMIT as JOB_LOG_LIMIT
+from .job_bridge import STATE_TEXT, JobBridge, adopt_running_job
+from .qt_compat import Qt, QtCore, QtGui, QtWidgets
 
 try:                                    # 缺算法模块时给说明图，而不是让窗口起不来
     from excitation_trajectory.aabb_snake_scan import plan_waypoints
@@ -78,6 +95,45 @@ _RED_BOLD = "color:#c0392b; font-weight:bold"
 
 #: 预览图去抖间隔（毫秒）：拖动 spinbox 时不必每个刻度都重规划一次。
 DEBOUNCE_MS = 300
+
+#: 日志区最多保留的行数（超出删头部；靠 ``QPlainTextEdit.setMaximumBlockCount``）。
+LOG_WIDGET_LIMIT = 500
+
+#: 出结果后结果区至少占多高（像素）：路点表要露出表头 + 几行，
+#: 默认的 120 px 只够看表头（S3 评审核对过截图）。
+RESULT_MIN_HEIGHT = 260
+
+#: 进度条的量程：分数（0~1）乘它取整，比 0~100 细一个量级，又不用浮点。
+PROGRESS_STEPS = 1000
+
+#: 结果区统计标签的键（顺序即界面顺序；单测按这些键取值）。
+STAT_KEYS = ("solved", "switches", "dq_l2", "j5_min", "j3_min", "cond",
+             "feasible")
+
+#: 路点表列头（与网页版一致，只是少了网页版的 dqL2 列，规格里没要求）。
+WAYPOINT_HEADERS = ("GP", "X (mm)", "Y (mm)", "Z (mm)",
+                    "q1", "q2", "q3", "q4", "q5", "q6",
+                    "|J3|°", "|J5|°", "cfg", "ok")
+
+#: 段诊断表列头（GP 起→止 / |J3|min / |J5|min / 穿零 / 最差点）。
+SEGMENT_HEADERS = ("GP 起→止", "|J3|min °", "|J5|min °", "穿零",
+                   "最差点 (mm, t)")
+
+#: 导出按钮：``(artifacts 键, 按钮文案, 文件对话框过滤器)``。
+EXPORTS = (("scan_json", "导出 scan.json", "JSON (*.json);;所有文件 (*)"),
+           ("joints", "导出 joints.txt", "文本 (*.txt);;所有文件 (*)"),
+           ("plot", "导出 plot.png", "PNG 图片 (*.png);;所有文件 (*)"))
+
+#: 结果区状态行的颜色：红 / 绿 / 灰（取消、中性提示）/ 中性。
+_STATUS_STYLES = {"error": "color:#c0392b", "ok": "color:#1e8449",
+                  "muted": "color:#6b7280", "info": ""}
+
+#: 成功计数的绿色（与 ``_RED`` / ``_RED_BOLD`` 对偶）。
+_GREEN_BOLD = "color:#1e8449; font-weight:bold"
+
+#: 失败行的底色 / 字色（浅红底 + 深红字，比纯红底易读）。
+_FAILED_BG = "#fde8e8"
+_FAILED_FG = "#b00020"
 
 
 class TotalPoints(NamedTuple):
@@ -130,6 +186,75 @@ def format_condition(value) -> str:
     return f"{number:.3f}"
 
 
+def format_metric(value, digits: int = 1) -> str:
+    """结果区数字的显示格式（``None``/``nan`` → ``—``，``inf`` → ``∞``）。
+
+    与 :func:`format_condition` 同一个道理：奇异参考姿态的 ``inf`` 是姿态问题，
+    不是程序 bug，不能原样打 ``inf``；失败路点没有关节角，留空会被当成“值太小
+    被吃掉了”。
+
+    Args:
+        value: ``stats`` / 行里的数字（可能是 ``None``）。
+        digits: 小数位。
+
+    Returns:
+        str: 如 ``"123.46"``、``"—"``、``"∞"``。
+    """
+    if value is None:
+        return "—"
+    number = float(value)
+    if math.isinf(number):
+        return "∞"
+    if math.isnan(number):
+        return "—"
+    return f"{number:.{digits}f}"
+
+
+def sort_key(value):
+    """表格排序键：缺值（``None`` / ``nan`` / ``inf``）一律排到末尾。
+
+    返回的元组第一项是“有没有值”（0 有 1 无），第二项是数值。统一成元组，
+    同一列里就不会既有 float 又有 str 比大小。
+
+    Args:
+        value: 单元格的原始数值。
+
+    Returns:
+        tuple: ``(rank, number)``。
+    """
+    if value is None:
+        return (1, 0.0)
+    number = float(value)
+    if not math.isfinite(number):
+        return (1, 0.0)
+    return (0, number)
+
+
+def result_figure(result: dict):
+    """结果图：成功点按路径顺序着色、**失败点红叉**、段内最差点叠一层方块。
+
+    直接复用网页版 :func:`laser_web.figures.waypoint_figure`（同一份代码，
+    自然与网页版逐点一致）：失败点用红色 ``x``，hover 里有 GP / XYZ /
+    ``|J3|`` / ``|J5|`` 与 ok。
+
+    Args:
+        result: ``core.run_scan`` 的返回值。
+
+    Returns:
+        plotly ``Figure``。
+    """
+    # 与 ``waypoint_figure`` 一样把 plotly 留到用时再 import：本模块在缺 plotly
+    # 的环境里也能 import（S2 就是这样，别把依赖提前）
+    from laser_web import figures
+
+    meta = result.get("meta") or {}
+    return figures.waypoint_figure(
+        result.get("waypoints") or [],
+        color_by="order",
+        worsts=result.get("segments"),
+        all_ok=bool(meta.get("skip_ik")))
+
+
 # ---------------------------------------------------------------------------
 # 纯逻辑（不碰 Qt，单测直接调）
 # ---------------------------------------------------------------------------
@@ -177,7 +302,7 @@ def form_to_params(values: dict) -> dict:
         "euler": str(values["euler"]),
         "perturb_deg": [float(value) for value in values["perturb_deg"]],
         "cond_max": float(values["cond_max"]),
-        # ---- 守卫 / 段检查 / 随机种子（S2 只做搬运，S3 才算） ----
+        # ---- 守卫 / 段检查 / 随机种子（S3 的解算真的用它们） ----
         "j5_min": float(values["j5_min"]),
         "j3_min": float(values["j3_min"]),
         "j5_attempts": int(values["j5_attempts"]),
@@ -403,11 +528,70 @@ def _caption(text: str) -> QtWidgets.QLabel:
     return label
 
 
+#: 等宽字体候选（Linux / Windows 都覆盖；按顺序取第一个装了的）。
+#: ``QFontDatabase.systemFont(FixedFont)`` 在国内机器上可能返回一个非等宽的
+#: 中文字体（实测返回 Noto Sans CJK SC），所以还得自己点名几个真等宽族。
+MONOSPACE_FAMILIES = ("Consolas", "DejaVu Sans Mono", "Liberation Mono",
+                      "Noto Sans Mono", "Courier New", "Menlo", "Monaco")
+
+
+def monospace_font() -> QtGui.QFont:
+    """日志区用的等宽字体（候选族都找不到时退回系统定宽字体，并置位定宽标志）。
+
+    ``QFontDatabase.systemFont(FixedFont)`` 在两个绑定上都可用；但 PySide6 的
+    严格枚举写法是 ``QFontDatabase.FontType.FixedFont``，所以扁平名取不到时
+    退回嵌套枚举，不写死任何一种。
+
+    Returns:
+        QtGui.QFont: 等宽字体。
+    """
+    database = QtGui.QFontDatabase
+    fixed = getattr(database, "FixedFont", None)
+    if fixed is None:                        # pragma: no cover - PySide6 严格枚举
+        fixed = database.FontType.FixedFont
+    font = database.systemFont(fixed)
+    try:
+        available = set(database().families())
+    except Exception:                        # noqa: BLE001 - 无字形库也不该开不了窗口
+        available = set()
+    for family in MONOSPACE_FAMILIES:
+        if family in available:
+            font.setFamily(family)
+            break
+    font.setFixedPitch(True)
+    return font
+
+
+class SortItem(QtWidgets.QTableWidgetItem):
+    """可按**数值**排序的单元格：显示文本自己格式化，排序键单独存。
+
+    ``QTableWidgetItem`` 默认按文本比大小，``"10.0" < "2.0"`` 就错了；而把
+    浮点数直接放进 DisplayRole 又会把小数位丢掉。``operator<`` 在 Qt 里是
+    ``virtual``，所以可以在 Python 里重载（PyQt5 / PySide6 都支持）。
+    """
+
+    def __init__(self, key, text: str) -> None:
+        """建单元格。
+
+        Args:
+            key: 排序键（``sort_key()`` 的元组，或纯文本）。
+            text: 显示文本。
+        """
+        super().__init__(str(text))
+        self.sort_key = key
+
+    def __lt__(self, other) -> bool:         # noqa: D105 - 排序协议
+        try:
+            return self.sort_key < other.sort_key
+        except (AttributeError, TypeError):
+            return super().__lt__(other)
+
+
 # ---------------------------------------------------------------------------
 # 页面
 # ---------------------------------------------------------------------------
 class GeneratePage(QtWidgets.QWidget):
-    """生成页：左侧可滚动表单 + 右上预览卡片 + 右下路点图。
+    """生成页：左侧可滚动表单 + 右上预览卡片 + 右下（图 + 结果区）。
 
     所有输入变化都会立刻重算预览卡片（``core.preview_domain`` 约 1 ms），
     路点图则交给 :data:`DEBOUNCE_MS` 的去抖定时器，避免拖动 spinbox 时卡顿。
@@ -415,14 +599,24 @@ class GeneratePage(QtWidgets.QWidget):
     Attributes:
         fields: ``{键: 控件}``，取值与 :func:`form_to_params` 的入参同名。
         metric_labels: 预览卡片里的数值标签。
-        generate_button: 「生成并解算」（S3 才真干活；参数非法或超上限时禁用）。
+        generate_button: 「生成并解算」（参数非法 / 超上限 / 任务在跑时禁用）。
         total: 最近一次的 :class:`TotalPoints`（网格组与预览卡片共用同一口径）。
+        bridge: :class:`laser_desktop.job_bridge.JobBridge`（提交/取消/接管）。
+        progress_bar: 任务进度条（格式文本就是 ``阶段 索引/总数 · 状态``）。
+        cancel_button: 「取消」（只在任务进行中可见）。
+        stat_labels: 结果区统计标签，键见 :data:`STAT_KEYS`。
+        waypoint_table: 路点表（可排序，失败行标红）。
+        segment_table: 段诊断表。
+        log_edit: 日志区（只读、等宽、最多 :data:`LOG_WIDGET_LIMIT` 行）。
+        export_buttons: ``{artifacts 键: 按钮}``，有产物才可用。
+        last_result: 最近一次建成的 ``core.run_scan`` 返回值（只看不跑）。
+        last_status: 最近一次写到状态栏的文字（无主窗口时也能断言）。
     """
 
     #: 预览图去抖间隔（毫秒）。
     DEBOUNCE_MS = DEBOUNCE_MS
 
-    def __init__(self, plot=None, robots=None, parent=None) -> None:
+    def __init__(self, plot=None, robots=None, parent=None, bridge=None) -> None:
         """建页面。
 
         Args:
@@ -430,6 +624,8 @@ class GeneratePage(QtWidgets.QWidget):
                 不挂 WebEngine（纯逻辑测试用，图仍然会算好放在 ``last_figure``）。
             robots: :func:`laser_web.core.list_robots` 的返回值；``None`` 时现查。
             parent: 父控件。
+            bridge: 现成的 :class:`JobBridge`（测试注入假登记表用）；``None``
+                时按 :func:`laser_desktop.paths.runs_root` 新建一个。
         """
         super().__init__(parent)
         self._plot = plot
@@ -440,6 +636,18 @@ class GeneratePage(QtWidgets.QWidget):
         self.last_figure = None
         self.fields = {}
         self.metric_labels = {}
+        self.stat_labels = {}
+        self.export_buttons = {}
+        self.last_result = None
+        self.last_status = ""
+        self.run_state = "idle"
+        self.last_job_id = None
+        self._busy = False
+        # 表单改动序号 / 出结果时的改动序号：两者相等说明“结果渲染后表单没再变”，
+        # 这时到点的预览去抖不许拿预览图盖掉结果图（见 apply_figure）。
+        self._change_seq = 0
+        self._result_seq = -1
+        self.bridge = bridge if bridge is not None else JobBridge(parent=self)
         self._debounce = QtCore.QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(self.DEBOUNCE_MS)
@@ -461,13 +669,34 @@ class GeneratePage(QtWidgets.QWidget):
         right = QtWidgets.QVBoxLayout()
         right.setSpacing(8)
         right.addWidget(self._build_preview_card(), 0)
-        if self._plot is not None:
-            right.addWidget(self._plot, 1)
-        else:                                            # 纯逻辑测试/无图环境
-            right.addWidget(_caption("路点图在这里（本环境未挂 WebEngine）"), 1)
+        right.addWidget(self._build_viewer(), 1)
         outer.addLayout(right, 1)
         page_layout.addWidget(body, 1)
+
+        # 信号连在控件建完之后：槽里直接碰控件（都在 GUI 线程，见 job_bridge）
+        self.bridge.progress.connect(self._on_progress)
+        self.bridge.log_line.connect(self._on_log_line)
+        self.bridge.finished.connect(self._on_finished)
         self.refresh_preview()
+        self._resume_running_job()
+
+    def _build_viewer(self) -> QtWidgets.QWidget:
+        """图 + 结果区：上下可拖的 ``QSplitter``（默认给图多一点高度）。"""
+        if self._plot is not None:
+            viewer = self._plot
+        else:                                            # 纯逻辑测试/无图环境
+            viewer = _caption("路点图在这里（本环境未挂 WebEngine）")
+        result_area = self._build_result_area()
+        splitter = QtWidgets.QSplitter(Qt.Vertical)
+        splitter.addWidget(viewer)
+        splitter.addWidget(result_area)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        # 初始尺寸：结果区的 sizeHint 比图大（表格），不指定的话图会被压成一条
+        splitter.setSizes([420, 120])
+        splitter.setChildrenCollapsible(False)
+        self._viewer_splitter = splitter
+        return splitter
 
     # ------------------------------------------------------------------ 表单
     def _build_form(self) -> QtWidgets.QScrollArea:
@@ -699,7 +928,8 @@ class GeneratePage(QtWidgets.QWidget):
     def _group_guard(self) -> QtWidgets.QGroupBox:
         """守卫：|J5| / |J3| / 段内 / 条件数 / 段模型 / 段采样 / 重采上限 / q-seed。
 
-        这些阈值 S2 只负责送到 core（校验同一套规则），真正用它们是 S3 的解算。
+        这些阈值一路送到 ``core.run_scan``：校验与用量都是同一套规则（S3 起真
+        拿它们解算）。
         """
         defaults = form_defaults()
         group = QtWidgets.QGroupBox("守卫")
@@ -779,13 +1009,134 @@ class GeneratePage(QtWidgets.QWidget):
         self.warning_label.hide()
         layout.addWidget(self.warning_label)
 
-        self.generate_button = QtWidgets.QPushButton("生成并解算（S3 接入）")
+        self.generate_button = QtWidgets.QPushButton("生成并解算")
+        self.generate_button.setToolTip(
+            "起一条后台任务：生成路点 → 解算 IK → 段检查 → 条件数 → 写 runs/<id>/")
         self.generate_button.clicked.connect(self._on_generate_clicked)
         layout.addWidget(self.generate_button)
         layout.addWidget(_caption(
-            "S2 只做预览：改任何一项都会重算上面这些数，并重画右侧路点图；"
-            "解算、进度与导出在 S3 接入。"))
+            "改任何一项都会重算上面这些数，并重画右侧路点图；"
+            "点「生成并解算」才真的跑 IK（在后台线程，可取消）。"))
         return group
+
+    def _build_result_area(self) -> QtWidgets.QGroupBox:
+        """结果区：状态行 + 进度/取消 + 统计标签 + 三页签（路点 / 段诊断 / 日志） + 导出。"""
+        group = QtWidgets.QGroupBox("结果")
+        layout = QtWidgets.QVBoxLayout(group)
+        layout.setSpacing(4)
+
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.status_label.hide()
+        layout.addWidget(self.status_label)
+
+        # 进度条本身的格式文本就是"阶段 索引/总数 · 状态"（规格要求的展示位）
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, PROGRESS_STEPS)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("空闲")
+        self.cancel_button = QtWidgets.QPushButton("取消")
+        self.cancel_button.setToolTip("只在阶段边界生效：当前阶段跑完就停，不会硬打断 IK")
+        self.cancel_button.clicked.connect(self._on_cancel_clicked)
+        self.cancel_button.hide()
+        progress_row = QtWidgets.QHBoxLayout()
+        progress_row.setContentsMargins(0, 0, 0, 0)
+        progress_row.addWidget(self.progress_bar, 1)
+        progress_row.addWidget(self.cancel_button, 0)
+        layout.addLayout(progress_row)
+
+        stats_row = QtWidgets.QHBoxLayout()
+        stats_row.setContentsMargins(0, 0, 0, 0)
+        stats_row.setSpacing(12)
+        for key in STAT_KEYS:
+            label = QtWidgets.QLabel("—")
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self.stat_labels[key] = label
+            stats_row.addWidget(label)
+        stats_row.addStretch(1)
+        self.stats_holder = QtWidgets.QWidget()
+        self.stats_holder.setLayout(stats_row)
+        self.stats_holder.hide()        # 没结果时不占高度（预览时图可以高一点）
+        layout.addWidget(self.stats_holder)
+
+        self.result_tabs = QtWidgets.QTabWidget()
+        self.waypoints_page = self._build_waypoints_page()
+        self.segments_page = self._build_segments_page()
+        self.log_page = self._build_log_page()
+        self.result_tabs.addTab(self.waypoints_page, "路点")
+        self.result_tabs.addTab(self.segments_page, "段诊断")
+        self.result_tabs.addTab(self.log_page, "日志")
+        self.result_tabs.hide()         # 起任务后才展开（预览时把高度让给图）
+        layout.addWidget(self.result_tabs, 1)
+
+        export_row = QtWidgets.QHBoxLayout()
+        export_row.setContentsMargins(0, 0, 0, 0)
+        export_row.addWidget(_caption("导出（从 runs/<id>/ 复制，不移动）："))
+        for key, title, _filters in EXPORTS:
+            button = QtWidgets.QPushButton(title)
+            button.setEnabled(False)
+            button.clicked.connect(
+                lambda _checked=False, export_key=key: self._on_export(export_key))
+            self.export_buttons[key] = button
+            export_row.addWidget(button)
+        export_row.addStretch(1)
+        layout.addLayout(export_row)
+        return group
+
+    @staticmethod
+    def _make_table(headers) -> QtWidgets.QTableWidget:
+        """只读、整行选中、可排序的表格（填数据前记得先关排序）。"""
+        table = QtWidgets.QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(list(headers))
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.setSortingEnabled(True)
+        table.horizontalHeader().setStretchLastSection(True)
+        return table
+
+    def _build_waypoints_page(self) -> QtWidgets.QWidget:
+        """「路点」页：一行一个 GP，失败行整行标红。"""
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(_caption("点表头排序；无解 / 未通过自校验的行整行标红。"))
+        self.waypoint_table = self._make_table(WAYPOINT_HEADERS)
+        layout.addWidget(self.waypoint_table, 1)
+        return page
+
+    def _build_segments_page(self) -> QtWidgets.QWidget:
+        """「段诊断」页：每段的最小裕度、是否穿零、最差点位置。"""
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(_caption(
+            "最差点 = 段内 |J3| 最小的位置（按关节直线解析求 t，坐标沿线插值）。"))
+        self.segment_table = self._make_table(SEGMENT_HEADERS)
+        layout.addWidget(self.segment_table, 1)
+        return page
+
+    def _build_log_page(self) -> QtWidgets.QWidget:
+        """「日志」页：算法自己的 ``print`` 与 ``jobs`` 的提示，等价终端输出。"""
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(_caption(
+            f"等价终端输出。注意两层上限：后台任务源缓冲只留最近 {JOB_LOG_LIMIT} 行"
+            f"（更早的行在源头就丢了，丢一段会插一行「…已省略 N 行」），本控件最多"
+            f"保留 {LOG_WIDGET_LIMIT} 行（超出删头部）。"))
+        self.log_edit = QtWidgets.QPlainTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setFont(monospace_font())
+        self.log_edit.setMaximumBlockCount(LOG_WIDGET_LIMIT)
+        self.log_edit.setPlaceholderText("点「生成并解算」后，这里实时滚日志。")
+        layout.addWidget(self.log_edit, 1)
+        return page
 
     # ------------------------------------------------------------------ 取值
     def values(self) -> dict:
@@ -865,6 +1216,10 @@ class GeneratePage(QtWidgets.QWidget):
         Returns:
             dict: ``core.preview_domain`` 的结果（``ok``/``error``/…）。
         """
+        # 每重算一次预览就算“表单变了一版”（含两点/六数、目标/手填这种只走
+        # ``_on_domain_switch`` / ``_on_grid_switch`` 的入口）：结果图的
+        # 保护判据靠它区分“用户又改了”与“只是陈旧去抖到点了”。
+        self._change_seq += 1
         values = self.values()
         try:
             result = core.preview_domain(form_to_params(values))
@@ -876,7 +1231,8 @@ class GeneratePage(QtWidgets.QWidget):
         self._update_total_row()
         self._update_card(result)
         self.generate_button.setEnabled(bool(result.get("ok"))
-                                        and not self.total.over)
+                                        and not self.total.over
+                                        and not self._busy)
         self._debounce.start()
         return result
 
@@ -935,6 +1291,14 @@ class GeneratePage(QtWidgets.QWidget):
         Returns:
             plotly ``Figure``（同时存进 ``last_figure``；挂了 PlotView 就推过去）。
         """
+        if self._busy:
+            # 解算期间不拿预览图盖住结果/进度；结束后用户再改表单才回到预览
+            return self.last_figure
+        if self._result_seq == self._change_seq and self.last_result:
+            # 结果渲染之后表单没再变过：这是起任务前排下的陈旧去抖（任务在
+            # DEBOUNCE_MS 内就结束了，``_busy`` 已经放开），不许拿预览图把刚
+            # 推上去的结果图盖掉。改过表单（序号 +1）就照旧回到预览。
+            return self.last_figure
         result = self._preview or {}
         if not result.get("ok"):
             figure = placeholder_figure(
@@ -961,24 +1325,456 @@ class GeneratePage(QtWidgets.QWidget):
         return figure
 
     def _report_status(self, message: str) -> None:
-        """把一句话写到窗口状态栏（没有窗口的纯逻辑测试里就只留日志）。
+        """把一句话写到窗口状态栏（没有窗口的纯逻辑测试里也能断言）。
 
         ``self.window()`` 对没有父控件的页面返回页面自己（它没有 ``statusBar``），
-        所以这里用 ``getattr`` 探测，而不是假设总有 ``QMainWindow``。
+        所以这里用 ``getattr`` 探测，而不是假设总有 ``QMainWindow``；不管有没有
+        状态栏，文字都存在 :attr:`last_status` 里，测试直接看它。
 
         Args:
-            message: 给用户看的一句话（异常类型 + 原文）。
+            message: 给用户看的一句话。
         """
+        self.last_status = str(message)
         status_bar = getattr(self.window(), "statusBar", None)
         if callable(status_bar):
-            status_bar().showMessage(str(message), 10_000)
+            status_bar().showMessage(self.last_status, 10_000)
 
+    # ------------------------------------------------------------ 起任务
     def _on_generate_clicked(self) -> None:
-        """「生成并解算」：S2 只解释按钮还没接活儿（S3 才起后台任务）。"""
-        QtWidgets.QMessageBox.information(
-            self, "S3 接入",
-            "这个按钮在 S3 接入：起后台任务跑 IK、显示进度、写 runs/<id>/ 与导出。\n"
-            "当前 S2 只做预览（右侧路点图与预览卡片）。")
+        """「生成并解算」按钮：起一条后台解算任务（详见 :meth:`start_scan`）。"""
+        self.start_scan()
+
+    def start_scan(self):
+        """校验当前表单并起一次**真解算**。
+
+        流程（与规格一致）：
+
+        1. 先用当前表单值问一次 ``core.preview_domain``：不合法就只把报错原文
+           写进预览卡片，**不起任务**；
+        2. 清空结果区、显示进度条与「取消」、禁用「生成并解算」；
+        3. ``bridge.submit("scan", lambda job: core.run_scan(params, job=job,
+           on_progress=job.set_progress))``——``core`` 与 ``jobs`` 一行未改。
+
+        Returns:
+            str: 任务 id；未启动（参数非法 / 超上限 / 已有任务在跑）时为 ``None``。
+        """
+        if self.bridge.is_running:
+            self._set_status("已有任务在跑：等它结束，或先点「取消」。", level="muted")
+            self._report_status("已有任务在跑，未重复提交")
+            return None
+        values = self.values()
+        params = form_to_params(values)
+        try:
+            preview = core.preview_domain(params)
+        except Exception as error:                      # noqa: BLE001 - 别打断 Qt 槽
+            _LOGGER.exception("core.preview_domain 抛异常（拒绝起任务）")
+            preview = preview_failure(error)
+        self._preview = preview
+        self.total = total_points(values, preview)
+        self._update_total_row()
+        self._update_card(preview)
+        if not preview.get("ok"):
+            self._set_status(
+                f"参数不合法，未启动解算：{preview.get('error') or '预览失败'}",
+                level="error")
+            self._report_status("参数不合法，未启动解算")
+            return None
+        if self.total.over:
+            self._set_status(
+                f"当前设置 {self.total.count} 点，超过 {POINT_COUNT_WARN} 点上限，"
+                f"未启动解算。", level="error")
+            self._report_status("点数超上限，未启动解算")
+            return None
+
+        self._reset_result_area()
+        self._busy = True
+        # 杀掉点按钮前排上的陈旧预览定时器：小案子 200~500 ms 就跑完，
+        # 那个定时器会在 ``_busy`` 放开之后才响，正好把结果图盖成预览图。
+        self._debounce.stop()
+        self.run_state = "running"
+        self.generate_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.show()
+        self.result_tabs.show()         # 跑的时候把页签展开（先看日志）
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("排队 0/0 · 排队中")
+        self.result_tabs.setCurrentWidget(self.log_page)   # 跑的时候先看日志
+        self._set_status(f"已提交：{self.total.text}", level="info")
+        try:
+            job_id = self.bridge.submit(
+                "scan",
+                lambda job: core.run_scan(params, job=job,
+                                          on_progress=job.set_progress))
+        except Exception as error:                      # noqa: BLE001 - 别让槽抛出去
+            # 提交本身也可能失败（runs/ 不可写、磁盘满）：不能让异常穿过 Qt 槽
+            _LOGGER.exception("提交解算任务失败（params=%r）", params)
+            self._busy = False
+            self.run_state = "failed"
+            self.cancel_button.hide()
+            self.generate_button.setEnabled(True)
+            self.progress_bar.setFormat("失败")
+            self._set_status(f"提交任务失败：{type(error).__name__}: {error}",
+                             level="error")
+            self._report_status(f"提交任务失败：{type(error).__name__}: {error}")
+            return None
+        self.last_job_id = job_id
+        self._report_status(f"已提交解算任务 {job_id}")
+        return job_id
+
+    def _resume_running_job(self) -> None:
+        """启动时扫一遍**本桥登记表里**未结束的任务，有就接回来。
+
+        网页版 ``adopt_running_job`` 同语义，但只在同一个 ``JobRegistry`` 内有效：
+        另开窗口/进程是接不回来的（每个默认桥自建进程内登记表，见
+        :func:`laser_desktop.job_bridge.adopt_running_job` 的边界说明）。
+        """
+        job = adopt_running_job(self.bridge.registry, "scan")
+        if job is None:
+            return
+        if self.bridge.attach(job.id) is None:          # 刚好被清掉
+            return
+        self._busy = True
+        self.run_state = "running"
+        self.generate_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.show()
+        self._set_status(
+            f"接管本进程里还没跑完的任务 {job.id}"
+            f"（当前 {STATE_TEXT.get(job.state, job.state)}）",
+            level="info")
+
+    def _on_cancel_clicked(self) -> None:
+        """请求取消：只在阶段边界生效（不会硬打断 IK）。"""
+        if not self.bridge.cancel():
+            self.cancel_button.setEnabled(False)
+            self._report_status("任务已结束，无需取消")
+            return
+        self.cancel_button.setEnabled(False)
+        self._set_status("已请求取消：当前阶段跑完就停（不会硬打断 IK）。",
+                         level="muted")
+        self._report_status("已请求取消")
+
+    # --------------------------------------------------------- 信号（GUI 线程）
+    def _on_progress(self, progress: dict) -> None:
+        """进度：进度条显示 ``阶段 索引/总数 · 状态``。"""
+        stage = str(progress.get("stage") or "")
+        index = int(progress.get("index") or 0)
+        total = int(progress.get("total") or 0)
+        fraction = float(progress.get("fraction") or 0.0)
+        state = str(progress.get("state") or "")
+        self.progress_bar.setValue(int(round(max(0.0, min(1.0, fraction))
+                                            * PROGRESS_STEPS)))
+        text = f"{stage} {index}/{total}"
+        if state:
+            text += f" · {STATE_TEXT.get(state, state)}"
+        self.progress_bar.setFormat(text)
+
+    def _on_log_line(self, line: str) -> None:
+        """增量日志：直接追加（上限由 ``setMaximumBlockCount`` 管）。"""
+        self.log_edit.appendPlainText(str(line))
+
+    def _on_finished(self, payload: dict) -> None:
+        """终态：done → 渲染结果；cancelled → 灰字；failed → 红字。"""
+        state = str(payload.get("state") or "")
+        result = payload.get("result")
+        self._busy = False
+        self.run_state = state
+        self.cancel_button.hide()
+        self.cancel_button.setEnabled(True)
+        self.generate_button.setEnabled(
+            bool((self._preview or {}).get("ok")) and not self.total.over)
+
+        if state == "done" and isinstance(result, dict) and result.get("ok"):
+            self.progress_bar.setValue(PROGRESS_STEPS)
+            self.progress_bar.setFormat("完成 1/1 · 完成")
+            self.render_result(result)
+            stats = result.get("stats") or {}
+            feasible = stats.get("feasible")
+            # 出结果但不可行：原因已经在 core 的 warnings 里拼好了（“姿态激励
+            # 条件数未达标：…”、“段内奇异…”、“N 个路点无解”），不能只把结论
+            # 撂在这儿——现场得知道该改哪个参数。
+            head = "完成" if feasible is not False else "完成（不可行）"
+            text = (f"{head}：成功 {stats.get('solved')}/{stats.get('total')} 点，"
+                    f"运行 {result.get('run_id')} → {result.get('run_dir')}")
+            warnings = [str(line) for line in (result.get("warnings") or [])]
+            if warnings:
+                # 一行搞定：状态行每多一行，结果区就从图区多抢一点高度
+                label = "原因" if feasible is False else "备注"
+                text += f"\n{label}：" + "；".join(warnings)
+            self._set_status(
+                text, level="ok" if feasible is not False else "error")
+            self.result_tabs.setCurrentWidget(self.waypoints_page)
+            self._report_status(
+                f"解算完成：{stats.get('solved')}/{stats.get('total')} 点，"
+                f"{result.get('run_id')}"
+                + ("" if feasible is not False
+                   else "（不可行，原因见结果区）"))
+            return
+
+        if state == "cancelled":
+            # 取消不是失败：现场工程师自己点的，用灰字而不是红字
+            self.progress_bar.setFormat("已取消")
+            self._set_status(
+                "已取消：任务在当前阶段末尾停下；没落下结果 JSON 的半成品运行"
+                "目录已删掉。", level="muted")
+            self._report_status("解算已取消")
+            return
+
+        error = ((result or {}).get("error") if isinstance(result, dict) else None) \
+            or payload.get("error") or "未知错误"
+        warnings = (result or {}).get("warnings") if isinstance(result, dict) else None
+        text = f"失败：{error}"
+        if warnings:
+            text += "\n" + "\n".join(f"· {line}" for line in warnings)
+        self.progress_bar.setFormat("失败")
+        self._set_status(text, level="error")
+        self.result_tabs.setCurrentWidget(self.log_page)   # 日志区保留
+        self._report_status(f"解算失败：{error}")
+
+    # ------------------------------------------------------------- 结果渲染
+    def render_result(self, result: dict) -> None:
+        """把 ``core.run_scan`` 的返回值铺到结果区（统计 / 两张表 / 结果图）。
+
+        参数是真的 ``run_scan`` 返回值还是构造的 dict 都行（单测就构造一份），
+        这里只做展示：不重算、不碰算法。
+
+        Args:
+            result: ``core.run_scan`` 的成功返回值。
+        """
+        self.last_result = result
+        # 记下“结果对应哪一版表单”：此后再没人改表单，预览去抖就该让路
+        self._result_seq = self._change_seq
+        self._fill_stats(result.get("stats") or {})
+        self._fill_waypoints(result.get("waypoints") or [])
+        self._fill_segments(result.get("segments") or [])
+        self.waypoint_table.scrollToTop()      # 排序后别停在中间，从 GP1 看起
+        self._update_exports(result)
+        self.stats_holder.show()
+        self.result_tabs.show()
+        try:
+            figure = result_figure(result)
+        except Exception as error:                      # noqa: BLE001 - 别让窗口崩
+            _LOGGER.exception("结果图渲染失败（运行 %r）", result.get("run_id"))
+            figure = placeholder_figure(
+                f"结果图渲染失败：{type(error).__name__}: {error}")
+            self._report_status(f"结果图渲染失败：{type(error).__name__}: {error}")
+        self.last_figure = figure
+        if self._plot is not None:
+            self._plot.set_figure(figure)
+        self._expand_result_area()
+
+    def _expand_result_area(self) -> None:
+        """出结果后把结果区撑到 :data:`RESULT_MIN_HEIGHT`（默认 120 px 只够看表头）。
+
+        只在结果区比下限矮时才动尺寸：用户自己拖过分隔条就尊重他的选择；
+        图区让出空间但至少留 120 px（不然 3D 图就成了一条缝）。
+        """
+        splitter = getattr(self, "_viewer_splitter", None)
+        if splitter is None:
+            return
+        sizes = splitter.sizes()
+        if len(sizes) != 2 or sizes[1] >= RESULT_MIN_HEIGHT:
+            return
+        viewer = max(sizes[0] - (RESULT_MIN_HEIGHT - sizes[1]), 120)
+        splitter.setSizes([viewer, RESULT_MIN_HEIGHT])
+
+    def _fill_stats(self, stats: dict) -> None:
+        """统计标签：成功 n/N、构型切换、ΣdqL2、|J5|/|J3| 最小值、条件数、可行。"""
+        solved = int(stats.get("solved") or 0)
+        total = int(stats.get("total") or 0)
+        self.stat_labels["solved"].setText(f"成功 {solved}/{total}")
+        self.stat_labels["solved"].setStyleSheet(
+            _GREEN_BOLD if total and solved == total else _RED_BOLD)
+        self.stat_labels["switches"].setText(
+            f"构型切换 {int(stats.get('switches') or 0)}")
+        self.stat_labels["dq_l2"].setText(
+            f"ΣdqL2 {format_metric(stats.get('dq_l2_sum'), 2)}")
+        self.stat_labels["j5_min"].setText(
+            f"|J5|min {format_metric(stats.get('j5_abs_min'))}°")
+        self.stat_labels["j3_min"].setText(
+            f"|J3|min {format_metric(stats.get('j3_abs_min'))}°")
+        self.stat_labels["cond"].setText(
+            f"design {format_metric(stats.get('design_cond'), 3)}"
+            f" / post_ik {format_metric(stats.get('post_ik_cond'), 3)}")
+        feasible = stats.get("feasible")
+        if feasible is None:
+            self.stat_labels["feasible"].setText("—")
+            self.stat_labels["feasible"].setStyleSheet("")
+        else:
+            self.stat_labels["feasible"].setText("可行" if feasible else "不可行")
+            self.stat_labels["feasible"].setStyleSheet(
+                _GREEN_BOLD if feasible else _RED_BOLD)
+
+    def _fill_waypoints(self, rows) -> None:
+        """路点表：GP / X / Y / Z / q1..q6 / |J3| / |J5| / cfg / ok；失败行红底。"""
+        table = self.waypoint_table
+        table.setSortingEnabled(False)
+        table.clearContents()
+        table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            ok = bool(row.get("ok"))
+            position = list(row.get("pos") or [None, None, None])
+            joints = list(row.get("q") or [None] * 6)
+            joints += [None] * (6 - len(joints))
+            config = row.get("config")
+            config_text = ("—" if config is None
+                           else ",".join(str(int(value)) for value in config))
+            gp = row.get("gp")
+            cells = [
+                (sort_key(gp), "—" if gp is None else f"{int(gp)}", "right"),
+                (sort_key(position[0]), format_metric(position[0], 1), "right"),
+                (sort_key(position[1]), format_metric(position[1], 1), "right"),
+                (sort_key(position[2]), format_metric(position[2], 1), "right"),
+            ]
+            cells += [(sort_key(joints[axis]), format_metric(joints[axis], 3),
+                       "right") for axis in range(6)]
+            cells += [
+                (sort_key(row.get("j3_abs")),
+                 format_metric(row.get("j3_abs"), 3), "right"),
+                (sort_key(row.get("j5_abs")),
+                 format_metric(row.get("j5_abs"), 3), "right"),
+                ((0, config_text), config_text, "left"),
+                ((0, 1 if ok else 0), "✓" if ok else "✗", "center"),
+            ]
+            for column, (key, text, align) in enumerate(cells):
+                item = SortItem(key, text)
+                item.setTextAlignment(
+                    {"right": Qt.AlignRight | Qt.AlignVCenter,
+                     "center": Qt.AlignCenter,
+                     "left": Qt.AlignLeft | Qt.AlignVCenter}[align])
+                if not ok:                      # 失败整行标红（表格可排序也不丢）
+                    item.setBackground(QtGui.QColor(_FAILED_BG))
+                    item.setForeground(QtGui.QColor(_FAILED_FG))
+                table.setItem(row_index, column, item)
+        table.setSortingEnabled(True)
+        table.sortItems(0, Qt.AscendingOrder)
+        if len(rows) <= 300:        # 几千行时逐列量宽会把界面卡住
+            table.resizeColumnsToContents()
+
+    def _fill_segments(self, segments) -> None:
+        """段诊断表：GP 起→止 / |J3|min / |J5|min / 穿零 / 最差点坐标与 t。"""
+        table = self.segment_table
+        table.setSortingEnabled(False)
+        table.clearContents()
+        table.setRowCount(len(segments))
+        for row_index, segment in enumerate(segments):
+            start, stop = segment.get("gp_from"), segment.get("gp_to")
+            span = ("—" if start is None or stop is None
+                    else f"{int(start)} → {int(stop)}")
+            position = segment.get("worst_pos")
+            fraction = segment.get("worst_frac")
+            if not position:
+                worst = "—"
+            else:
+                worst = ", ".join(f"{float(value):.1f}" for value in position)
+                if fraction is not None:
+                    worst += f" (t={float(fraction):.2f})"
+            cells = [
+                ((0, span), span, "center"),
+                (sort_key(segment.get("j3_abs_min")),
+                 format_metric(segment.get("j3_abs_min"), 3), "right"),
+                (sort_key(segment.get("j5_abs_min")),
+                 format_metric(segment.get("j5_abs_min"), 3), "right"),
+                ((0, 1 if segment.get("crosses") else 0),
+                 "是" if segment.get("crosses") else "否", "center"),
+                ((0, worst), worst, "left"),
+            ]
+            for column, (key, text, align) in enumerate(cells):
+                item = SortItem(key, text)
+                item.setTextAlignment(
+                    {"right": Qt.AlignRight | Qt.AlignVCenter,
+                     "center": Qt.AlignCenter,
+                     "left": Qt.AlignLeft | Qt.AlignVCenter}[align])
+                if segment.get("crosses"):      # 穿零的段整行标红（最危险）
+                    item.setBackground(QtGui.QColor(_FAILED_BG))
+                    item.setForeground(QtGui.QColor(_FAILED_FG))
+                table.setItem(row_index, column, item)
+        table.setSortingEnabled(True)
+        if segments:
+            # 升序 + “缺值排末尾”（见 sort_key）：裕度最小的段排最前面
+            table.sortItems(1, Qt.AscendingOrder)
+        table.resizeColumnsToContents()
+
+    def _update_exports(self, result: dict) -> None:
+        """按 ``result["artifacts"]`` 启用/禁用三个导出按钮（文件真的在才开）。"""
+        artifacts = result.get("artifacts") or {}
+        run_dir = result.get("run_dir")
+        for key, button in self.export_buttons.items():
+            name = artifacts.get(key)
+            path = None if (name is None or run_dir is None) \
+                else Path(run_dir) / str(name)
+            available = path is not None and path.is_file()
+            button.setEnabled(available)
+            button.setToolTip("" if available else f"本次运行没有 {key} 产物")
+
+    def _on_export(self, key: str) -> None:
+        """导出按钮：选目标后**复制**（不移动，``runs/`` 是归档）。"""
+        result = self.last_result or {}
+        artifacts = result.get("artifacts") or {}
+        run_dir = result.get("run_dir")
+        name = artifacts.get(key)
+        if not name or not run_dir:
+            self._report_status(f"本次运行没有 {key} 产物，无法导出")
+            return
+        source = Path(str(run_dir)) / str(name)
+        if not source.is_file():
+            # 源文件可能在 `runs/` 的保留策略里被清掉了（KEEP_RUNS）：状态栏和
+            # 结果区状态行说同一句话，不要只在一处提示。
+            message = (f"源文件不存在：{source}"
+                       "（可能已被 runs/ 保留策略清掉，或手删了运行目录）")
+            self._set_status(message, level="error")
+            self._report_status(message)
+            return
+        filters = next((item[2] for item in EXPORTS if item[0] == key), "")
+        # 默认文件名带运行号：连跑两次解算时不会互相覆盖（run_id 就是 runs/<id>）
+        run_id = str(result.get("run_id") or "")
+        default_name = f"{run_id}-{name}" if run_id else str(name)
+        target, _selected = QtWidgets.QFileDialog.getSaveFileName(
+            self, f"导出 {name}", str(Path.home() / default_name), filters)
+        if not target:                      # 用户取消
+            return
+        target_path = Path(str(target))
+        if not target_path.suffix:          # 手打完删了扩展名：按源文件补回来
+            target_path = target_path.with_suffix(source.suffix)
+        try:
+            shutil.copy2(source, target_path)
+        except OSError as error:
+            self._set_status(f"导出失败：{type(error).__name__}: {error}",
+                             level="error")
+            self._report_status(f"导出失败：{type(error).__name__}: {error}")
+            return
+        self._report_status(f"已导出 {name} → {target_path}")
+
+    def _reset_result_area(self) -> None:
+        """起新任务前清空结果区（上一次的表、图、日志不留在界面上冒充新结果）。"""
+        self.last_result = None
+        self.log_edit.clear()
+        for table in (self.waypoint_table, self.segment_table):
+            table.setSortingEnabled(False)
+            table.clearContents()
+            table.setRowCount(0)
+            table.setSortingEnabled(True)
+        for label in self.stat_labels.values():
+            label.setText("—")
+            label.setStyleSheet("")
+        self.stats_holder.hide()        # 上一轮的统计不留在界面上冒充新结果
+        for button in self.export_buttons.values():
+            button.setEnabled(False)
+            button.setToolTip("")
+        self.status_label.clear()
+        self.status_label.hide()
+
+    def _set_status(self, text: str, level: str = "info") -> None:
+        """结果区状态行：``ok`` 绿 / ``error`` 红 / ``muted`` 灰 / ``info`` 正常。"""
+        message = str(text or "")
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet(_STATUS_STYLES.get(level, ""))
+        self.status_label.setVisible(bool(message.strip()))
+
+    def shutdown(self) -> None:
+        """窗口关闭时收尾：停去抖/合并定时器并注销任务订阅（不取消任务）。"""
+        self._debounce.stop()
+        self.bridge.shutdown()
 
     # ------------------------------------------------------------------ 横幅
     def show_webgl_warning(self) -> None:

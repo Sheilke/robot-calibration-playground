@@ -13,7 +13,12 @@
    （见 :class:`JobCancelled`），本模块在任务返回/抛错后再复核一次标志，
    保证「点了取消就一定显示已取消」；
 4. **保留策略**：每次新建 ``runs/<id>/`` 后把超过 :data:`KEEP_RUNS` 个的
-   最旧运行目录删掉，磁盘不会被几十次解算的产物撑爆。
+   最旧运行目录删掉，磁盘不会被几十次解算的产物撑爆；
+5. **订阅（桌面端用，S3 新增）**：``Job.subscribe`` 让工作线程在状态 / 进度 /
+   日志变化时就地回调，桌面版因此不必轮询 ``snapshot()``。回调跑在**工作
+   线程**里、并且在锁外调用（回调里再 ``snapshot()`` 不会死锁），监听器自己
+   抛异常只记一条 warning（带栈）、不拖垮任务。网页版继续用 ``snapshot`` 轮询，
+   两条路互不影响（``snapshot`` 的行为一字未改）。
 
 本模块只依赖标准库（``core`` 可以安全 import 它，不会把 UI 库拖进来）。
 """
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import logging
 import os
 import queue
 import secrets
@@ -32,6 +38,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+_LOGGER = logging.getLogger(__name__)
 
 #: 单任务日志环形缓冲上限（行）。
 LOG_LIMIT = 200
@@ -204,6 +212,8 @@ class Job:
     #: 被环形缓冲挤掉的日志行数（``log[0]`` 的绝对序号）。
     _dropped: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    #: 变更订阅者（见 :meth:`subscribe`）。**只在锁内增删、锁外调用**。
+    _listeners: list = field(default_factory=list, repr=False)
 
     def append_log(self, line: str) -> None:
         """往环形缓冲追加一行（线程安全，超过 :data:`LOG_LIMIT` 丢最旧的）。"""
@@ -215,6 +225,7 @@ class Job:
                 excess = len(self.log) - LOG_LIMIT
                 del self.log[:excess]
                 self._dropped += excess
+        self._notify()
 
     def set_progress(self, stage: str, index: int = 0, total: int = 0) -> None:
         """更新进度（线程安全）。``fraction`` 由 ``index/total`` 现算。
@@ -230,6 +241,7 @@ class Job:
         with self._lock:
             self.progress = {"stage": str(stage), "index": index,
                              "total": total, "fraction": fraction}
+        self._notify()
 
     def snapshot(self, log_from: int = 0) -> dict:
         """当前状态快照（给前端轮询）。
@@ -267,6 +279,56 @@ class Job:
             self.state = state
             self.result = result if state == "done" else None
             self.error = error
+        self._notify()
+
+    # ------------------------------------------------------------------ 订阅
+    def subscribe(self, callback: Callable[[Job], Any]) -> None:
+        """注册变更回调（**在工作线程里被调用**，桌面版把轮询换成信号用）。
+
+        ``append_log`` / ``set_progress`` / ``set_state`` 每改完一次就在**锁外**
+        调一次 ``callback(self)``；也就是说回调可能来自工作线程、也可能来自
+        调用方线程（例如 UI 线程自己 ``set_progress``）。因此回调里：
+
+        * 做 UI 的事情只能 ``signal.emit(...)``（Qt 会排队到对象所属线程）；
+        * 读状态请走 :meth:`snapshot`（同一把锁，锁外可重入，不会死锁）。
+
+        ``snapshot()`` 与网页版的轮询行为完全不变，两条路互不影响。
+
+        Args:
+            callback: ``callback(job)``；同一对象重复注册只生效一次。
+        """
+        with self._lock:
+            if any(existing == callback for existing in self._listeners):
+                return
+            self._listeners.append(callback)
+
+    def unsubscribe(self, callback: Callable[[Job], Any]) -> None:
+        """注销订阅（没注册过就静默忽略，便于在 ``finally`` 里无条件调用）。"""
+        with self._lock:
+            for index, existing in enumerate(self._listeners):
+                if existing is callback or existing == callback:
+                    del self._listeners[index]
+                    return
+
+    def _notify(self) -> None:
+        """在**锁外**依次回调订阅者（监听器自己的异常只记录，不拖垮任务）。
+
+        先复制一份订阅者列表再调用：回调里增删订阅（或干脆 ``unsubscribe``
+        自己）都不会破坏本次遍历；也不持锁调用，避免与 ``snapshot`` 互锁。
+        """
+        with self._lock:
+            if not self._listeners:      # 网页版（不订阅）就多一次空判断，没别的开销
+                return
+            listeners = list(self._listeners)
+        for callback in listeners:
+            try:
+                callback(self)
+            except Exception:       # noqa: BLE001 - 监听器的 bug 不该弄挂解算
+                # 吞掉但不能静默：监听器（桌面端的 Qt 信号转发）出错时解算照跑，
+                # 只会“界面不再更新”，没有日志根本无从排查。
+                _LOGGER.warning("订阅回调异常（任务 %s，回调 %r）",
+                                self.id, callback, exc_info=True)
+                continue
 
 
 class _JobStream(io.TextIOBase):

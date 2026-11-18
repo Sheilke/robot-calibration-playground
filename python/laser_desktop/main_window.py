@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""主窗口：左侧导航 + 右侧四页（S2 起「生成」页是完整表单 + 实时预览）。
+"""主窗口：左侧导航 + 右侧四页（S3 起「生成」页真跑解算）。
 
-S2 的定位：生成页能**真正用起来**——填域/网格/姿态，右侧预览卡片与路点图
-跟着变（只规划路点，不跑 IK）。其余三页仍是占位说明，等 S4/S5 逐个填。
+S3 的定位：生成页能**从头跑到尾**——填域/网格/姿态，预览卡片与路点图跟着变，
+点「生成并解算」就在后台线程跑 IK，进度/日志/取消/结果表/导出全部就位（
+线程模型见 :mod:`laser_desktop.job_bridge`）。其余三页仍是占位说明，等 S4/S5
+逐个填。
 
 表单与预览的实现在 :mod:`laser_desktop.generate_page`；本模块只负责窗口骨架、
 导航、状态栏，以及给冒烟脚本用的 :func:`build_preview_figure`。
@@ -87,3 +89,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if DEV_ONLY_BINDING:
             text += "　|　⚠ PyQt5 仅供本地验证，交付用 PySide6"
         return text
+
+    def closeEvent(self, event) -> None:            # noqa: N802 - Qt 回调命名
+        """关闭前断开任务订阅 / 停定时器（任务本身在工作线程里，不强杀）。"""
+        self.generate.shutdown()
+        super().closeEvent(event)
