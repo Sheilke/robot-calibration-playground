@@ -9,7 +9,9 @@
 * ``paths``        打包后仍能找到资产/写到可写目录（源码里到处数 ``parents`` 的替代）
 * ``qt_compat``    Qt 绑定兼容层（交付 PySide6；Linux 验证退回 PyQt5）
 * ``plot_view``    一次加载壳页、之后 ``Plotly.react`` 就地换图
-* ``generate_page`` 生成页：完整表单 + 实时预览（只规划路点，不跑 IK）
+* ``form_widgets`` 表单构件（域/网格/姿态/扰动/守卫/模型，生成页与修复页同源）
+* ``generate_page`` 生成页：完整表单 + 实时预览 + 真跑解算（S3）
+* ``repair_page``  奇异修复页：定位段 / 修复 / 四页签结果（S4）
 * ``main_window``  左侧导航 + 四页
 """
 from . import paths

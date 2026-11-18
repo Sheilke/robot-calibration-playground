@@ -587,6 +587,199 @@ class SortItem(QtWidgets.QTableWidgetItem):
             return super().__lt__(other)
 
 
+def make_table(headers) -> QtWidgets.QTableWidget:
+    """只读、整行选中、可排序的表格（填数据前记得先关排序）。"""
+    table = QtWidgets.QTableWidget(0, len(headers))
+    table.setHorizontalHeaderLabels(list(headers))
+    table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+    table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+    table.setAlternatingRowColors(True)
+    table.verticalHeader().setVisible(False)
+    table.setSortingEnabled(True)
+    table.horizontalHeader().setStretchLastSection(True)
+    return table
+
+
+def fill_stat_labels(labels: dict, stats: dict) -> None:
+    """统计标签：成功 n/N、构型切换、ΣdqL2、|J5|/|J3| 最小值、条件数、可行。
+
+    这是模块级函数（不是页面方法）**为了复用**：修复页的「计划」页签要把
+    ``core.run_repair`` 的 ``stats`` 铺成同一排骨架标签，照同一个口径格式化
+    （键见 :data:`STAT_KEYS`）。
+
+    Args:
+        labels: ``{STAT_KEYS 里的键: QLabel}``。
+        stats: ``core.run_scan`` / ``core.run_repair`` 的 ``stats``。
+    """
+    solved = int(stats.get("solved") or 0)
+    total = int(stats.get("total") or 0)
+    labels["solved"].setText(f"成功 {solved}/{total}")
+    labels["solved"].setStyleSheet(
+        _GREEN_BOLD if total and solved == total else _RED_BOLD)
+    labels["switches"].setText(f"构型切换 {int(stats.get('switches') or 0)}")
+    labels["dq_l2"].setText(f"ΣdqL2 {format_metric(stats.get('dq_l2_sum'), 2)}")
+    labels["j5_min"].setText(
+        f"|J5|min {format_metric(stats.get('j5_abs_min'))}°")
+    labels["j3_min"].setText(
+        f"|J3|min {format_metric(stats.get('j3_abs_min'))}°")
+    labels["cond"].setText(
+        f"design {format_metric(stats.get('design_cond'), 3)}"
+        f" / post_ik {format_metric(stats.get('post_ik_cond'), 3)}")
+    feasible = stats.get("feasible")
+    if feasible is None:
+        labels["feasible"].setText("—")
+        labels["feasible"].setStyleSheet("")
+    else:
+        labels["feasible"].setText("可行" if feasible else "不可行")
+        labels["feasible"].setStyleSheet(
+            _GREEN_BOLD if feasible else _RED_BOLD)
+
+
+def fill_waypoint_table(table, rows) -> None:
+    """路点表：GP / X / Y / Z / q1..q6 / |J3| / |J5| / cfg / ok；失败行红底。
+
+    Args:
+        table: 列头为 :data:`WAYPOINT_HEADERS` 的 ``QTableWidget``。
+        rows: ``result["waypoints"]``。
+    """
+    table.setSortingEnabled(False)
+    table.clearContents()
+    table.setRowCount(len(rows))
+    for row_index, row in enumerate(rows):
+        ok = bool(row.get("ok"))
+        position = list(row.get("pos") or [None, None, None])
+        joints = list(row.get("q") or [None] * 6)
+        joints += [None] * (6 - len(joints))
+        config = row.get("config")
+        config_text = ("—" if config is None
+                       else ",".join(str(int(value)) for value in config))
+        gp = row.get("gp")
+        cells = [
+            (sort_key(gp), "—" if gp is None else f"{int(gp)}", "right"),
+            (sort_key(position[0]), format_metric(position[0], 1), "right"),
+            (sort_key(position[1]), format_metric(position[1], 1), "right"),
+            (sort_key(position[2]), format_metric(position[2], 1), "right"),
+        ]
+        cells += [(sort_key(joints[axis]), format_metric(joints[axis], 3),
+                   "right") for axis in range(6)]
+        cells += [
+            (sort_key(row.get("j3_abs")),
+             format_metric(row.get("j3_abs"), 3), "right"),
+            (sort_key(row.get("j5_abs")),
+             format_metric(row.get("j5_abs"), 3), "right"),
+            ((0, config_text), config_text, "left"),
+            ((0, 1 if ok else 0), "✓" if ok else "✗", "center"),
+        ]
+        for column, (key, text, align) in enumerate(cells):
+            item = SortItem(key, text)
+            item.setTextAlignment(
+                {"right": Qt.AlignRight | Qt.AlignVCenter,
+                 "center": Qt.AlignCenter,
+                 "left": Qt.AlignLeft | Qt.AlignVCenter}[align])
+            if not ok:                      # 失败整行标红（表格可排序也不丢）
+                item.setBackground(QtGui.QColor(_FAILED_BG))
+                item.setForeground(QtGui.QColor(_FAILED_FG))
+            table.setItem(row_index, column, item)
+    table.setSortingEnabled(True)
+    table.sortItems(0, Qt.AscendingOrder)
+    if len(rows) <= 300:        # 几千行时逐列量宽会把界面卡住
+        table.resizeColumnsToContents()
+
+
+def fill_segment_table(table, segments) -> None:
+    """段诊断表：GP 起→止 / |J3|min / |J5|min / 穿零 / 最差点坐标与 t。
+
+    Args:
+        table: 列头为 :data:`SEGMENT_HEADERS` 的 ``QTableWidget``。
+        segments: ``result["segments"]``。
+    """
+    table.setSortingEnabled(False)
+    table.clearContents()
+    table.setRowCount(len(segments))
+    for row_index, segment in enumerate(segments):
+        start, stop = segment.get("gp_from"), segment.get("gp_to")
+        span = ("—" if start is None or stop is None
+                else f"{int(start)} → {int(stop)}")
+        position = segment.get("worst_pos")
+        fraction = segment.get("worst_frac")
+        if not position:
+            worst = "—"
+        else:
+            worst = ", ".join(f"{float(value):.1f}" for value in position)
+            if fraction is not None:
+                worst += f" (t={float(fraction):.2f})"
+        cells = [
+            ((0, span), span, "center"),
+            (sort_key(segment.get("j3_abs_min")),
+             format_metric(segment.get("j3_abs_min"), 3), "right"),
+            (sort_key(segment.get("j5_abs_min")),
+             format_metric(segment.get("j5_abs_min"), 3), "right"),
+            ((0, 1 if segment.get("crosses") else 0),
+             "是" if segment.get("crosses") else "否", "center"),
+            ((0, worst), worst, "left"),
+        ]
+        for column, (key, text, align) in enumerate(cells):
+            item = SortItem(key, text)
+            item.setTextAlignment(
+                {"right": Qt.AlignRight | Qt.AlignVCenter,
+                 "center": Qt.AlignCenter,
+                 "left": Qt.AlignLeft | Qt.AlignVCenter}[align])
+            if segment.get("crosses"):      # 穿零的段整行标红（最危险）
+                item.setBackground(QtGui.QColor(_FAILED_BG))
+                item.setForeground(QtGui.QColor(_FAILED_FG))
+            table.setItem(row_index, column, item)
+    table.setSortingEnabled(True)
+    if segments:
+        # 升序 + “缺值排末尾”（见 sort_key）：裕度最小的段排最前面
+        table.sortItems(1, Qt.AscendingOrder)
+    table.resizeColumnsToContents()
+
+
+def export_artifact(result: dict, key: str, specs, parent=None):
+    """把 ``result["artifacts"][key]`` 复制到用户选的位置（选完就复制，不移动）。
+
+    ``runs/`` 是归档，导出只做复制；默认文件名带运行号，连跑两次不会互相覆盖。
+    这是节点级函数（不是页面方法）为了让修复页复用同一套“缺产物 / 源文件被清 /
+    手打漏扩展名 / 用户取消”的分支，而不是各页各写一份再漂移。
+
+    Args:
+        result: ``core.run_scan`` / ``core.run_repair`` 的返回值。
+        key: ``artifacts`` 里的键（``scan_json`` / ``joints`` / ``plot`` / ``repair``）。
+        specs: ``((键, 按钮文案, 文件对话框过滤器), ...)``，用于取过滤器。
+        parent: ``QFileDialog`` 的父控件。
+
+    Returns:
+        ``(level, message)``：``message`` 是要显示的原文；``level`` 为 ``None``
+        表示只是“正常提示”（只写状态栏），``"error"`` 表示结果区也要标红。
+        用户取消返回 ``(None, "")``。
+    """
+    artifacts = (result or {}).get("artifacts") or {}
+    run_dir = (result or {}).get("run_dir")
+    name = artifacts.get(key)
+    if not name or not run_dir:
+        return None, f"本次运行没有 {key} 产物，无法导出"
+    source = Path(str(run_dir)) / str(name)
+    if not source.is_file():
+        # 源文件可能在 `runs/` 的保留策略里被清掉了（KEEP_RUNS）
+        return "error", (f"源文件不存在：{source}"
+                          "（可能已被 runs/ 保留策略清掉，或手删了运行目录）")
+    filters = next((item[2] for item in specs if item[0] == key), "")
+    run_id = str((result or {}).get("run_id") or "")
+    default_name = f"{run_id}-{name}" if run_id else str(name)
+    target, _selected = QtWidgets.QFileDialog.getSaveFileName(
+        parent, f"导出 {name}", str(Path.home() / default_name), filters)
+    if not target:                          # 用户取消
+        return None, ""
+    target_path = Path(str(target))
+    if not target_path.suffix:              # 手打完删了扩展名：按源文件补回来
+        target_path = target_path.with_suffix(source.suffix)
+    try:
+        shutil.copy2(source, target_path)
+    except OSError as error:
+        return "error", f"导出失败：{type(error).__name__}: {error}"
+    return None, f"已导出 {name} → {target_path}"
+
+
 # ---------------------------------------------------------------------------
 # 页面
 # ---------------------------------------------------------------------------
@@ -700,13 +893,47 @@ class GeneratePage(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ 表单
     def _build_form(self) -> QtWidgets.QScrollArea:
-        """左侧表单：六个分组塞进 ``QScrollArea``。"""
+        """左侧表单：六个分组塞进 ``QScrollArea``。
+
+        六组控件全部由 :mod:`laser_desktop.form_widgets` 建（与修复页共用同一
+        份实现，S4 评审第 1 条：之前两页各存一份副本，改一处忘了另一处就分叉）。
+        本方法只负责“摆”和把页面要用的属性接回来。
+        """
+        from . import form_widgets      # 延迟导入：本模块是 form_widgets 的依赖
+        defaults = form_defaults()
         content = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(content)
         layout.setSpacing(8)
-        for builder in (self._group_robot, self._group_domain, self._group_grid,
-                        self._group_pose, self._group_perturb, self._group_guard):
-            layout.addWidget(builder())
+
+        robot = form_widgets.build_robot_group(
+            self.fields, self._robots, self._on_change, defaults["robot"])
+        self.robot_path_label = robot["path_label"]
+        self.skipped_label = robot["skipped_label"]
+        layout.addWidget(robot["group"])
+
+        domain = form_widgets.build_domain_group(self.fields, defaults,
+                                                 self._on_change)
+        self.domain_stack = domain["stack"]
+        domain["points"].toggled.connect(self._on_domain_switch)
+        domain["axes"].toggled.connect(self._on_domain_switch)
+        layout.addWidget(domain["group"])
+
+        grid = form_widgets.build_grid_group(self.fields, defaults,
+                                             self._on_change)
+        self.grid_stack = grid["stack"]
+        self.total_value = grid["total_value"]
+        self.total_hint = grid["total_hint"]
+        self.grid_caption = grid["caption"]
+        grid["count"].toggled.connect(self._on_grid_switch)
+        grid["explicit"].toggled.connect(self._on_grid_switch)
+        layout.addWidget(grid["group"])
+
+        layout.addWidget(form_widgets.build_pose_group(self.fields, defaults,
+                                                       self._on_change))
+        layout.addWidget(form_widgets.build_perturb_group(self.fields, defaults,
+                                                          self._on_change))
+        layout.addWidget(form_widgets.build_guard_group(self.fields, defaults,
+                                                        self._on_change))
         layout.addStretch(1)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidget(content)
@@ -714,266 +941,6 @@ class GeneratePage(QtWidgets.QWidget):
         scroll.setMinimumWidth(455)
         scroll.setMaximumWidth(560)
         return scroll
-
-    def _group_robot(self) -> QtWidgets.QGroupBox:
-        """机器人模型：只列 ``Nexbot6R`` 真能加载的；其余折叠成一句提示。"""
-        group = QtWidgets.QGroupBox("机器人模型")
-        form = QtWidgets.QFormLayout(group)
-        usable = [robot for robot in self._robots if robot["usable"]]
-        skipped = [robot for robot in self._robots if not robot["usable"]]
-
-        combo = QtWidgets.QComboBox()
-        for robot in usable:
-            combo.addItem(robot["label"], robot["path"])
-        if combo.count() == 0:                           # 一个都用不了时别空着
-            combo.addItem(ui_state.default_robot(), ui_state.default_robot())
-        default_path = ui_state.default_robot()
-        index = combo.findData(default_path)
-        combo.setCurrentIndex(index if index >= 0 else 0)
-        combo.currentIndexChanged.connect(self._on_change)
-        self.fields["robot"] = combo
-        form.addRow("模型", combo)
-
-        self.robot_path_label = _caption(f"路径：{combo.currentData()}")
-        form.addRow(self.robot_path_label)
-        combo.currentIndexChanged.connect(
-            lambda *_args: self.robot_path_label.setText(
-                f"路径：{combo.currentData()}"))
-
-        self.skipped_label = _caption("")
-        if skipped:
-            detail = "；".join(f"{robot['label']}（{robot['reason']}）"
-                              for robot in skipped)
-            self.skipped_label.setText(
-                f"另有 {len(skipped)} 个文件不能当模型用")
-            self.skipped_label.setToolTip(detail)
-        else:
-            self.skipped_label.setText("data/configs 下的文件全部可以当模型用")
-        form.addRow(self.skipped_label)
-        return group
-
-    def _group_domain(self) -> QtWidgets.QGroupBox:
-        """采样域：两点对角点 / 六个轴边界（互斥，二选一）。"""
-        defaults = form_defaults()
-        group = QtWidgets.QGroupBox("采样域")
-        form = QtWidgets.QFormLayout(group)
-
-        points = QtWidgets.QRadioButton("两点输入")
-        axes = QtWidgets.QRadioButton("六个轴边界")
-        buttons = QtWidgets.QButtonGroup(group)
-        buttons.addButton(points, 0)
-        buttons.addButton(axes, 1)
-        self.fields["domain_points"] = points
-        self.fields["domain_axes"] = axes
-        form.addRow(_row(points, axes))
-
-        self.domain_stack = QtWidgets.QStackedWidget()
-        points_panel = QtWidgets.QWidget()
-        points_layout = QtWidgets.QVBoxLayout(points_panel)
-        points_layout.setContentsMargins(0, 0, 0, 0)
-        points_layout.setSpacing(4)
-        lows, highs = [], []
-        for axis in range(3):
-            name = "XYZ"[axis]
-            low = _double_spin(-10000.0, 10000.0, defaults["point_min"][axis])
-            high = _double_spin(-10000.0, 10000.0, defaults["point_max"][axis])
-            low.valueChanged.connect(self._on_change)
-            high.valueChanged.connect(self._on_change)
-            self.fields[f"min_{name.lower()}"] = low
-            self.fields[f"max_{name.lower()}"] = high
-            lows.append((f"{name} 最小", low))
-            highs.append((f"{name} 最大", high))
-        points_layout.addWidget(_inline(lows))
-        points_layout.addWidget(_inline(highs))
-        self.domain_stack.addWidget(points_panel)
-
-        axes_panel = QtWidgets.QWidget()
-        axes_layout = QtWidgets.QVBoxLayout(axes_panel)
-        axes_layout.setContentsMargins(0, 0, 0, 0)
-        axes_layout.setSpacing(4)
-        lows, highs = [], []
-        for axis in range(3):
-            name = "XYZ"[axis]
-            low = _double_spin(-10000.0, 10000.0, defaults["aabb6"][2 * axis])
-            high = _double_spin(-10000.0, 10000.0, defaults["aabb6"][2 * axis + 1])
-            low.valueChanged.connect(self._on_change)
-            high.valueChanged.connect(self._on_change)
-            self.fields[f"{name.lower()}_min"] = low
-            self.fields[f"{name.lower()}_max"] = high
-            lows.append((f"{name} 下界", low))
-            highs.append((f"{name} 上界", high))
-        axes_layout.addWidget(_inline(lows))
-        axes_layout.addWidget(_inline(highs))
-        self.domain_stack.addWidget(axes_panel)
-
-        form.addRow(self.domain_stack)
-        points.setChecked(defaults["domain_mode"] == DOMAIN_MODES[0])
-        axes.setChecked(defaults["domain_mode"] == DOMAIN_MODES[1])
-        self.domain_stack.setCurrentIndex(0 if points.isChecked() else 1)
-        points.toggled.connect(self._on_domain_switch)
-        axes.toggled.connect(self._on_domain_switch)
-        return group
-
-    def _group_grid(self) -> QtWidgets.QGroupBox:
-        """网格：目标点数 / 手填格点数；总点数就地显示（不用只看右侧）。"""
-        defaults = form_defaults()
-        group = QtWidgets.QGroupBox("网格")
-        form = QtWidgets.QFormLayout(group)
-
-        count = QtWidgets.QRadioButton("目标点数")
-        explicit = QtWidgets.QRadioButton("手填格点数")
-        buttons = QtWidgets.QButtonGroup(group)
-        buttons.addButton(count, 0)
-        buttons.addButton(explicit, 1)
-        self.fields["grid_count"] = count
-        self.fields["grid_explicit"] = explicit
-        form.addRow(_row(count, explicit))
-
-        self.grid_stack = QtWidgets.QStackedWidget()
-        count_panel = QtWidgets.QWidget()
-        count_form = QtWidgets.QFormLayout(count_panel)
-        target = _int_spin(1, TARGET_COUNT_MAX, defaults["target_count"])
-        target.valueChanged.connect(self._on_change)
-        self.fields["target_count"] = target
-        count_form.addRow("目标点数", target)
-        count_form.addRow(_caption(
-            f"自动凑一组 X×Y×Z 格点，恰好凑出这个点数。上限 "
-            f"{TARGET_COUNT_MAX} = {scan.COUNT_GRID_MAX_PER_AXIS + 1}³ + "
-            f"{scan.COUNT_GRID_MAX_PER_AXIS}×{scan.COUNT_GRID_MAX_INSERT}"
-            f"（单轴份数 / 单次插点的硬约束），再往上凑不出来；"
-            f"凑不出来会显示 core 的报错原文。"))
-        self.grid_stack.addWidget(count_panel)
-
-        explicit_panel = QtWidgets.QWidget()
-        explicit_layout = QtWidgets.QVBoxLayout(explicit_panel)
-        explicit_layout.setContentsMargins(0, 0, 0, 0)
-        explicit_layout.setSpacing(4)
-        columns = []
-        for key, title in (("xs", "X 格点数"), ("ys", "Y 格点数"),
-                           ("zs", "Z 格点数"), ("z_insert", "换层插点")):
-            maximum = 20 if key == "z_insert" else 200
-            box = _int_spin(0 if key == "z_insert" else 1, maximum,
-                            defaults[key])
-            box.valueChanged.connect(self._on_change)
-            self.fields[key] = box
-            columns.append((title, box))
-        explicit_layout.addWidget(_inline(columns))
-        # 文案里的公式必须是真公式：插点按“换层次数”算，即 Z 格点数 − 1
-        self.grid_caption = _caption(
-            "格点数 = 该方向的点数（旧的“份数” + 1）；"
-            "总点数 = X×Y×Z 格点 + (Z 格点数−1) × 换层插点。")
-        explicit_layout.addWidget(self.grid_caption)
-        self.grid_stack.addWidget(explicit_panel)
-
-        form.addRow(self.grid_stack)
-
-        # 总点数就地显示：填格点时要当场看到总数，不能只看右侧卡片
-        self.total_value = QtWidgets.QLabel("—")
-        self.total_hint = _caption(f"（超过 {POINT_COUNT_WARN} 点，无法生成）")
-        form.addRow("总点数", _row(self.total_value, self.total_hint))
-
-        count.setChecked(defaults["grid_mode"] == GRID_MODES[0])
-        explicit.setChecked(defaults["grid_mode"] == GRID_MODES[1])
-        self.grid_stack.setCurrentIndex(0 if count.isChecked() else 1)
-        count.toggled.connect(self._on_grid_switch)
-        explicit.toggled.connect(self._on_grid_switch)
-        return group
-
-    def _group_pose(self) -> QtWidgets.QGroupBox:
-        """参考姿态：A/B/C 三个角 + 欧拉约定（显示「内旋」，值仍是算法约定名）。"""
-        defaults = form_defaults()
-        group = QtWidgets.QGroupBox("参考姿态")
-        form = QtWidgets.QFormLayout(group)
-        columns = []
-        for index, (key, title) in enumerate(
-                (("rpy_a", "A (roll)"), ("rpy_b", "B (pitch)"),
-                 ("rpy_c", "C (yaw)"))):
-            box = _double_spin(-360.0, 360.0, defaults["rpy"][index], UNIT_DEG)
-            box.valueChanged.connect(self._on_change)
-            self.fields[key] = box
-            columns.append((title, box))
-        form.addRow(_inline(columns))
-
-        combo = QtWidgets.QComboBox()
-        for value, label in ui_state.euler_convention_options().items():
-            combo.addItem(label, value)
-        index = combo.findData(defaults["euler"])
-        combo.setCurrentIndex(index if index >= 0 else 0)
-        combo.currentIndexChanged.connect(self._on_change)
-        self.fields["euler"] = combo
-        form.addRow("欧拉约定", combo)
-        return group
-
-    def _group_perturb(self) -> QtWidgets.QGroupBox:
-        """姿态扰动：三轴半宽 + 随机种子。"""
-        defaults = form_defaults()
-        group = QtWidgets.QGroupBox("姿态扰动")
-        form = QtWidgets.QFormLayout(group)
-        columns = []
-        for index, (key, title) in enumerate(
-                (("perturb_a", "±A (roll)"), ("perturb_b", "±B (pitch)"),
-                 ("perturb_c", "±C (yaw)"))):
-            box = _double_spin(0.0, 90.0, defaults["perturb_deg"][index], UNIT_DEG)
-            box.valueChanged.connect(self._on_change)
-            self.fields[key] = box
-            columns.append((title, box))
-        form.addRow(_inline(columns))
-
-        seed = _int_spin(0, 2_147_483_647, defaults["seed"])
-        seed.valueChanged.connect(self._on_change)
-        self.fields["seed"] = seed
-        form.addRow("随机种子", seed)
-        return group
-
-    def _group_guard(self) -> QtWidgets.QGroupBox:
-        """守卫：|J5| / |J3| / 段内 / 条件数 / 段模型 / 段采样 / 重采上限 / q-seed。
-
-        这些阈值一路送到 ``core.run_scan``：校验与用量都是同一套规则（S3 起真
-        拿它们解算）。
-        """
-        defaults = form_defaults()
-        group = QtWidgets.QGroupBox("守卫")
-        form = QtWidgets.QFormLayout(group)
-        columns = []
-        for key, title in (("j5_min", "|J5| 下限"), ("j3_min", "|J3| 下限"),
-                           ("seg_min", "段内下限")):
-            box = _double_spin(0.0, 90.0, defaults[key], UNIT_DEG)
-            box.valueChanged.connect(self._on_change)
-            self.fields[key] = box
-            columns.append((title, box))
-        form.addRow(_inline(columns))
-
-        cond = _double_spin(1.0, 1000.0, defaults["cond_max"], "",
-                            decimals=2, step=0.5)
-        cond.valueChanged.connect(self._on_change)
-        self.fields["cond_max"] = cond
-
-        mode = QtWidgets.QComboBox()
-        for value, label in SEG_MODES.items():
-            mode.addItem(label, value)
-        index = mode.findData(defaults["seg_mode"])
-        mode.setCurrentIndex(index if index >= 0 else 0)
-        mode.currentIndexChanged.connect(self._on_change)
-        self.fields["seg_mode"] = mode
-
-        samples = _int_spin(2, 200, defaults["seg_samples"])
-        samples.valueChanged.connect(self._on_change)
-        self.fields["seg_samples"] = samples
-
-        # 网页版有「重采上限」（laser_web/pages/generate.py 的 j5_attempts），
-        # 它进 collect() 后成 --j5-attempts；桌面版不能少这一项。
-        attempts = _int_spin(1, 100, defaults["j5_attempts"])
-        attempts.valueChanged.connect(self._on_change)
-        self.fields["j5_attempts"] = attempts
-        form.addRow(_inline([("条件数上限", cond), ("段采样", samples),
-                             ("重采上限", attempts)]))
-        form.addRow("段模型", mode)
-
-        q_seed = QtWidgets.QLineEdit(str(defaults["q_seed"]))
-        q_seed.textChanged.connect(self._on_change)
-        self.fields["q_seed"] = q_seed
-        form.addRow("q-seed（6 个角）", q_seed)
-        return group
 
     def _build_preview_card(self) -> QtWidgets.QGroupBox:
         """预览卡片：体积 / 格点 / 总点数 / 设计条件数 / 欧拉约定 + 报错原文。"""
@@ -1086,16 +1053,8 @@ class GeneratePage(QtWidgets.QWidget):
 
     @staticmethod
     def _make_table(headers) -> QtWidgets.QTableWidget:
-        """只读、整行选中、可排序的表格（填数据前记得先关排序）。"""
-        table = QtWidgets.QTableWidget(0, len(headers))
-        table.setHorizontalHeaderLabels(list(headers))
-        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        table.setAlternatingRowColors(True)
-        table.verticalHeader().setVisible(False)
-        table.setSortingEnabled(True)
-        table.horizontalHeader().setStretchLastSection(True)
-        return table
+        """只读、整行选中、可排序的表格（见 :func:`make_table`）。"""
+        return make_table(headers)
 
     def _build_waypoints_page(self) -> QtWidgets.QWidget:
         """「路点」页：一行一个 GP，失败行整行标红。"""
@@ -1579,121 +1538,17 @@ class GeneratePage(QtWidgets.QWidget):
         splitter.setSizes([viewer, RESULT_MIN_HEIGHT])
 
     def _fill_stats(self, stats: dict) -> None:
-        """统计标签：成功 n/N、构型切换、ΣdqL2、|J5|/|J3| 最小值、条件数、可行。"""
-        solved = int(stats.get("solved") or 0)
-        total = int(stats.get("total") or 0)
-        self.stat_labels["solved"].setText(f"成功 {solved}/{total}")
-        self.stat_labels["solved"].setStyleSheet(
-            _GREEN_BOLD if total and solved == total else _RED_BOLD)
-        self.stat_labels["switches"].setText(
-            f"构型切换 {int(stats.get('switches') or 0)}")
-        self.stat_labels["dq_l2"].setText(
-            f"ΣdqL2 {format_metric(stats.get('dq_l2_sum'), 2)}")
-        self.stat_labels["j5_min"].setText(
-            f"|J5|min {format_metric(stats.get('j5_abs_min'))}°")
-        self.stat_labels["j3_min"].setText(
-            f"|J3|min {format_metric(stats.get('j3_abs_min'))}°")
-        self.stat_labels["cond"].setText(
-            f"design {format_metric(stats.get('design_cond'), 3)}"
-            f" / post_ik {format_metric(stats.get('post_ik_cond'), 3)}")
-        feasible = stats.get("feasible")
-        if feasible is None:
-            self.stat_labels["feasible"].setText("—")
-            self.stat_labels["feasible"].setStyleSheet("")
-        else:
-            self.stat_labels["feasible"].setText("可行" if feasible else "不可行")
-            self.stat_labels["feasible"].setStyleSheet(
-                _GREEN_BOLD if feasible else _RED_BOLD)
+        """统计标签（实现见 :func:`fill_stat_labels`，修复页复用同一份）。"""
+        fill_stat_labels(self.stat_labels, stats)
 
     def _fill_waypoints(self, rows) -> None:
-        """路点表：GP / X / Y / Z / q1..q6 / |J3| / |J5| / cfg / ok；失败行红底。"""
-        table = self.waypoint_table
-        table.setSortingEnabled(False)
-        table.clearContents()
-        table.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
-            ok = bool(row.get("ok"))
-            position = list(row.get("pos") or [None, None, None])
-            joints = list(row.get("q") or [None] * 6)
-            joints += [None] * (6 - len(joints))
-            config = row.get("config")
-            config_text = ("—" if config is None
-                           else ",".join(str(int(value)) for value in config))
-            gp = row.get("gp")
-            cells = [
-                (sort_key(gp), "—" if gp is None else f"{int(gp)}", "right"),
-                (sort_key(position[0]), format_metric(position[0], 1), "right"),
-                (sort_key(position[1]), format_metric(position[1], 1), "right"),
-                (sort_key(position[2]), format_metric(position[2], 1), "right"),
-            ]
-            cells += [(sort_key(joints[axis]), format_metric(joints[axis], 3),
-                       "right") for axis in range(6)]
-            cells += [
-                (sort_key(row.get("j3_abs")),
-                 format_metric(row.get("j3_abs"), 3), "right"),
-                (sort_key(row.get("j5_abs")),
-                 format_metric(row.get("j5_abs"), 3), "right"),
-                ((0, config_text), config_text, "left"),
-                ((0, 1 if ok else 0), "✓" if ok else "✗", "center"),
-            ]
-            for column, (key, text, align) in enumerate(cells):
-                item = SortItem(key, text)
-                item.setTextAlignment(
-                    {"right": Qt.AlignRight | Qt.AlignVCenter,
-                     "center": Qt.AlignCenter,
-                     "left": Qt.AlignLeft | Qt.AlignVCenter}[align])
-                if not ok:                      # 失败整行标红（表格可排序也不丢）
-                    item.setBackground(QtGui.QColor(_FAILED_BG))
-                    item.setForeground(QtGui.QColor(_FAILED_FG))
-                table.setItem(row_index, column, item)
-        table.setSortingEnabled(True)
-        table.sortItems(0, Qt.AscendingOrder)
-        if len(rows) <= 300:        # 几千行时逐列量宽会把界面卡住
-            table.resizeColumnsToContents()
+        """路点表（实现见 :func:`fill_waypoint_table`，修复页复用同一份）。"""
+        fill_waypoint_table(self.waypoint_table, rows)
+        self.waypoint_table.scrollToTop()  # 排序后别停在中间，从 GP1 看起
 
     def _fill_segments(self, segments) -> None:
-        """段诊断表：GP 起→止 / |J3|min / |J5|min / 穿零 / 最差点坐标与 t。"""
-        table = self.segment_table
-        table.setSortingEnabled(False)
-        table.clearContents()
-        table.setRowCount(len(segments))
-        for row_index, segment in enumerate(segments):
-            start, stop = segment.get("gp_from"), segment.get("gp_to")
-            span = ("—" if start is None or stop is None
-                    else f"{int(start)} → {int(stop)}")
-            position = segment.get("worst_pos")
-            fraction = segment.get("worst_frac")
-            if not position:
-                worst = "—"
-            else:
-                worst = ", ".join(f"{float(value):.1f}" for value in position)
-                if fraction is not None:
-                    worst += f" (t={float(fraction):.2f})"
-            cells = [
-                ((0, span), span, "center"),
-                (sort_key(segment.get("j3_abs_min")),
-                 format_metric(segment.get("j3_abs_min"), 3), "right"),
-                (sort_key(segment.get("j5_abs_min")),
-                 format_metric(segment.get("j5_abs_min"), 3), "right"),
-                ((0, 1 if segment.get("crosses") else 0),
-                 "是" if segment.get("crosses") else "否", "center"),
-                ((0, worst), worst, "left"),
-            ]
-            for column, (key, text, align) in enumerate(cells):
-                item = SortItem(key, text)
-                item.setTextAlignment(
-                    {"right": Qt.AlignRight | Qt.AlignVCenter,
-                     "center": Qt.AlignCenter,
-                     "left": Qt.AlignLeft | Qt.AlignVCenter}[align])
-                if segment.get("crosses"):      # 穿零的段整行标红（最危险）
-                    item.setBackground(QtGui.QColor(_FAILED_BG))
-                    item.setForeground(QtGui.QColor(_FAILED_FG))
-                table.setItem(row_index, column, item)
-        table.setSortingEnabled(True)
-        if segments:
-            # 升序 + “缺值排末尾”（见 sort_key）：裕度最小的段排最前面
-            table.sortItems(1, Qt.AscendingOrder)
-        table.resizeColumnsToContents()
+        """段诊断表（实现见 :func:`fill_segment_table`，修复页复用同一份）。"""
+        fill_segment_table(self.segment_table, segments)
 
     def _update_exports(self, result: dict) -> None:
         """按 ``result["artifacts"]`` 启用/禁用三个导出按钮（文件真的在才开）。"""
@@ -1708,42 +1563,21 @@ class GeneratePage(QtWidgets.QWidget):
             button.setToolTip("" if available else f"本次运行没有 {key} 产物")
 
     def _on_export(self, key: str) -> None:
-        """导出按钮：选目标后**复制**（不移动，``runs/`` 是归档）。"""
-        result = self.last_result or {}
-        artifacts = result.get("artifacts") or {}
-        run_dir = result.get("run_dir")
-        name = artifacts.get(key)
-        if not name or not run_dir:
-            self._report_status(f"本次运行没有 {key} 产物，无法导出")
+        """导出按钮：选目标后**复制**（不移动，``runs/`` 是归档）。
+
+        实现见 :func:`export_artifact`（修复页复用同一份分支：缺产物 /
+        源文件被清 / 手打漏扩展名 / 用户取消）。
+
+        Args:
+            key: ``artifacts`` 里的键。
+        """
+        level, message = export_artifact(self.last_result or {}, key, EXPORTS,
+                                         self)
+        if not message:                     # 用户取消
             return
-        source = Path(str(run_dir)) / str(name)
-        if not source.is_file():
-            # 源文件可能在 `runs/` 的保留策略里被清掉了（KEEP_RUNS）：状态栏和
-            # 结果区状态行说同一句话，不要只在一处提示。
-            message = (f"源文件不存在：{source}"
-                       "（可能已被 runs/ 保留策略清掉，或手删了运行目录）")
+        if level == "error":
             self._set_status(message, level="error")
-            self._report_status(message)
-            return
-        filters = next((item[2] for item in EXPORTS if item[0] == key), "")
-        # 默认文件名带运行号：连跑两次解算时不会互相覆盖（run_id 就是 runs/<id>）
-        run_id = str(result.get("run_id") or "")
-        default_name = f"{run_id}-{name}" if run_id else str(name)
-        target, _selected = QtWidgets.QFileDialog.getSaveFileName(
-            self, f"导出 {name}", str(Path.home() / default_name), filters)
-        if not target:                      # 用户取消
-            return
-        target_path = Path(str(target))
-        if not target_path.suffix:          # 手打完删了扩展名：按源文件补回来
-            target_path = target_path.with_suffix(source.suffix)
-        try:
-            shutil.copy2(source, target_path)
-        except OSError as error:
-            self._set_status(f"导出失败：{type(error).__name__}: {error}",
-                             level="error")
-            self._report_status(f"导出失败：{type(error).__name__}: {error}")
-            return
-        self._report_status(f"已导出 {name} → {target_path}")
+        self._report_status(message)
 
     def _reset_result_area(self) -> None:
         """起新任务前清空结果区（上一次的表、图、日志不留在界面上冒充新结果）。"""
@@ -1775,6 +1609,14 @@ class GeneratePage(QtWidgets.QWidget):
         """窗口关闭时收尾：停去抖/合并定时器并注销任务订阅（不取消任务）。"""
         self._debounce.stop()
         self.bridge.shutdown()
+
+    def current_figure(self):
+        """本页当前该展示的图（导航切回来时主窗口用它重推）。
+
+        Returns:
+            plotly ``Figure`` 或 ``None``（还没出过图）。
+        """
+        return self.last_figure
 
     # ------------------------------------------------------------------ 横幅
     def show_webgl_warning(self) -> None:
