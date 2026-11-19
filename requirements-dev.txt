@@ -1,0 +1,18 @@
+# 构建机 / 开发机上的**测试**依赖。
+#
+# 为什么不并进 requirements-desktop.txt：那份是"交付运行需要什么"，会被
+# PyInstaller 当成打包依据；测试与网页版是构建期的事，混进去会让"哪些包真进
+# 了安装包"变得含糊。这个文件只在 `pip install -r requirements-dev.txt` 时用。
+#
+# 为什么构建脚本必须装它：跑 `pytest python -q` 时的解释器是**构建 venv** 自己的
+# 那个（要与打出来的 exe 同版本同依赖），而 pytest 不在任何运行期依赖里。第一次
+# 在 Windows 上构建时就卡在这里：`No module named pytest`。
+#
+# nicegui 同理：网页版页面测试 `from laser_web.pages import ...` 会在 import 期
+# 就碰 nicegui（pages/__init__.py 里有 `from nicegui import ui`）。桌面版运行**不**
+# 需要它（desktop.spec 里显式排除，省 27 MB），但测试要收集那些用例就得有。
+
+-r requirements-desktop.txt
+-r requirements-web.txt
+
+pytest>=8

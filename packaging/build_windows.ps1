@@ -251,7 +251,7 @@ if (-not $SkipPythonCheck) {
 # ---------------------------------------------------------------------------
 # 2. venv + 依赖
 # ---------------------------------------------------------------------------
-Write-Step "准备 venv 并安装依赖（requirements-desktop.txt + pyinstaller 6.16.*）"
+Write-Step "准备 venv 并安装依赖（requirements-desktop.txt + 测试依赖 + pyinstaller 6.16.*）"
 $VenvPython = Join-Path $VenvPath 'Scripts\python.exe'
 if (Test-Path -LiteralPath $VenvPython) {
     Write-Host ("  复用已有 venv：" + $VenvPath)
@@ -267,10 +267,28 @@ if (Test-Path -LiteralPath $VenvPython) {
 }
 Invoke-Native -What "pip 升级" -Body { & $VenvPython -m pip install --upgrade pip --quiet }
 $reqs = Join-Path $RepoRoot 'requirements-desktop.txt'
-Write-Host ("  安装：" + $reqs)
+Write-Host ("  安装运行依赖：" + $reqs)
 Invoke-Native -What "pip install -r requirements-desktop.txt" -Body {
     & $VenvPython -m pip install -r $reqs --quiet
 } -Hints @("内网构建机先配 pip 源：pip config set global.index-url <内网源>")
+
+# 测试依赖单独一份：第 4 步用的是**这个 venv** 的解释器跑 pytest（要与打出来的
+# exe 同版本同依赖），而 pytest 不在任何运行期依赖里。第一次在 Windows 上构建
+# 就卡在这：`No module named pytest`。网页版测试还会 import nicegui（页面模块
+# 顶层就 import 它），也要一并装上——它不会进交付包（desktop.spec 已排除）。
+$devReqs = Join-Path $RepoRoot 'requirements-dev.txt'
+if (Test-Path -LiteralPath $devReqs) {
+    Write-Host ("  安装测试依赖：" + $devReqs)
+    Invoke-Native -What "pip install -r requirements-dev.txt" -Body {
+        & $VenvPython -m pip install -r $devReqs --quiet
+    } -Hints @("这条装的是 pytest + 网页版依赖（nicegui 等），只为跑测试，不进交付包。")
+} else {
+    # 兜底：仓库里没有 requirements-dev.txt 时，至少要能让 pytest 跑起来
+    Write-Host "  没有 requirements-dev.txt，直接装 pytest + nicegui 兜底" -ForegroundColor Yellow
+    Invoke-Native -What "pip install pytest nicegui" -Body {
+        & $VenvPython -m pip install 'pytest>=8' 'nicegui>=2' --quiet
+    }
+}
 Write-Host "  安装：pyinstaller==6.16.*"
 Invoke-Native -What "pip install pyinstaller" -Body {
     & $VenvPython -m pip install 'pyinstaller==6.16.*' --quiet
@@ -366,6 +384,14 @@ if (Test-Path -LiteralPath $pubKeyPath) {
 # 4. 测试
 # ---------------------------------------------------------------------------
 Write-Step "跑测试（pytest python -q；红的代码不许打包）"
+# 先确认 pytest 真的在这个 venv 里：缺了是环境问题，不该让人去翻代码。
+& $VenvPython -c "import pytest" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Fail -Message "构建 venv 里没有 pytest（环境问题，不是代码问题）。" -Hints @(
+        "重跑本脚本即可（第 2 步会装 requirements-dev.txt）；",
+        "若反复失败：删掉 build\venv-desktop 重来，或手动执行",
+        "  build\venv-desktop\Scripts\python.exe -m pip install -r requirements-dev.txt")
+}
 if ($SkipTests) {
     Write-Host "  已按 -SkipTests 跳过 —— 这一版没有测试背书。" -ForegroundColor Yellow
 } else {
