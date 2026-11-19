@@ -441,12 +441,18 @@ if ($SkipTests) {
 # ---------------------------------------------------------------------------
 # 5. PyInstaller
 # ---------------------------------------------------------------------------
-Write-Step "PyInstaller 打包（onedir，--noupx）"
+Write-Step "PyInstaller 打包（onedir，spec 里已关 UPX）"
 if ($Clean -and (Test-Path -LiteralPath $DistDir)) {
     Write-Host ("  删除旧产物：" + $DistDir)
     Remove-Item -LiteralPath $DistDir -Recurse -Force
 }
-$pyiArgs = @('-m', 'PyInstaller', $SpecPath, '--noconfirm', '--noupx',
+# 注意：给了 .spec 之后，**makespec 专属选项一律不能传**（--noupx / --onedir /
+# --windowed / --name 都属于那类），PyInstaller 会直接拒：
+#   ERROR: option(s) not allowed: --noupx ... not valid when a .spec file is given
+# UPX 在 spec 里用 upx=False 关掉（EXE 与 COLLECT 两处，Chromium 的 dll 尤其
+# 不能被 UPX 碰——压缩后的 PE 段是杀软启发式的高危特征）。
+# 这里只留“打包执行期”的选项：--noconfirm / --distpath / --workpath / --clean。
+$pyiArgs = @('-m', 'PyInstaller', $SpecPath, '--noconfirm',
              '--distpath', (Join-Path $RepoRoot 'dist'),
              '--workpath', (Join-Path $RepoRoot 'build\desktop'))
 if ($Clean) { $pyiArgs += '--clean' }
