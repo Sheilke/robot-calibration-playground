@@ -204,7 +204,9 @@ class MissingFileTest(GateTestBase):
         missing = self.tmp / "不存在" / "license.json"
         result = self.check(missing)
         self.assertFalse(result.ok)
-        self.assertIn(str(missing), result.message)
+        self.assertIn("联系供应商", result.message)
+        self.assertNotIn(str(missing), result.message)
+        self.assertIn(str(missing), result.detail)
         self.assertIn("未找到许可证文件", result.message)
 
     def test_auto_search_names_the_preferred_location(self):
@@ -219,7 +221,13 @@ class MissingFileTest(GateTestBase):
                                  self.tmp / "数据目录" / "license.json")
                 result = self.check()
         self.assertFalse(result.ok)
-        self.assertIn(str(self.tmp / "数据目录" / "license.json"), result.message)
+        # 主提示**不**给出文件该放哪：那句话读起来像"自己拷一个进去就行"，
+        # 而许可证绑定本机指纹，现场照做只会得到一个无效文件。
+        self.assertIn("联系供应商", result.message)
+        self.assertNotIn(str(self.tmp / "数据目录" / "license.json"),
+                         result.message)
+        # 路径仍然记录在 detail 里（支持与日志要用），只是不给用户看
+        self.assertIn(str(self.tmp / "数据目录" / "license.json"), result.detail)
 
     def test_env_var_points_at_the_license(self):
         path = self.issue(expires="2027-11-18")

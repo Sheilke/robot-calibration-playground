@@ -74,17 +74,25 @@ EXIT_LICENSE = 3
 EMBEDDED_PUBLIC_KEY_PEM: bytes | None = None
 
 #: 找不到许可证时的话术（``%s`` 是它应该在的位置）。
-_MESSAGE_NOT_FOUND = ("未找到许可证文件。请把供应商提供的 license.json 放到 %s，"
-                      "或联系供应商。")
+#: 找不到许可证时的话术。
+#:
+#: **不在界面上给出文件该放哪**：那句话读起来像"你自己拷一个文件进去就行"，
+#: 现场照着做出来的往往是无效文件（许可证绑定本机网卡指纹，不是通用文件），
+#: 反而把问题拖长。放哪个路径只写进 ``detail``（支持与日志用），主提示只说
+#: "联系供应商"——分发时由供应商把授权随安装包放好或当场导入。
+_MESSAGE_NOT_FOUND = "未找到许可证文件。请联系供应商获取授权。"
 
 #: 源码运行时追加的一句：把开发者的出路写在错误里，而不是藏在文档里。
 #: 冻结包**不**追加——现场看到”设法绕过校验”的提示只会让人误以为绕过是正当操作。
 _MESSAGE_DEV_HINT = ("（开发调试：可设环境变量 %s=1 跳过校验；"
                      "冻结后的安装包不受该变量影响）")
 
-def _not_found_message(target) -> str:
-    """找不到证时的话术：源码运行额外告诉开发者怎么跳过。"""
-    message = _MESSAGE_NOT_FOUND % target
+def _not_found_message() -> str:
+    """找不到证时的话术：源码运行额外告诉开发者怎么跳过。
+
+    路径**不进**这句话（见 :data:`_MESSAGE_NOT_FOUND`），只进 ``detail``。
+    """
+    message = _MESSAGE_NOT_FOUND
     if not paths.is_frozen():
         message += _MESSAGE_DEV_HINT % ENV_SKIP
     return message
@@ -424,7 +432,7 @@ def _check(licenses_path, *, skip, public_key_pem, local_fingerprints,
             exists = False
         if not exists:
             return GateResult(
-                False, _not_found_message(path),
+                False, _not_found_message(),
                 detail=f"显式指定的许可证路径不存在或不是文件：{path}；"
                        f"候选位置：{[str(item) for item in license_candidates()]}")
     else:
@@ -432,7 +440,7 @@ def _check(licenses_path, *, skip, public_key_pem, local_fingerprints,
         if found is None:
             target = preferred_path()
             return GateResult(
-                False, _not_found_message(target),
+                False, _not_found_message(),
                 detail="没有找到许可证；按优先级查过："
                        + "、".join(str(item) for item in license_candidates()))
         path = found
