@@ -430,6 +430,12 @@ class PlotView(QWebEngineView):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.loaded = False
+        # 图不需要键盘焦点：``QWebEngineView`` 默认是 ``StrongFocus``，于是 Tab
+        # 会把焦点送进 Chromium，页面激活时也可能把它抢过去。焦点一旦离开正在
+        # 编辑的输入框，输入法的候选窗就会立即收起（用户看到的“输入过程中候选框
+        # 消失、打断了选词”）。改成只有点击才拿焦点：想在图上滚轮/点击缩放仍然
+        # 可以，但打字时它不再插队。
+        self.setFocusPolicy(Qt.ClickFocus)
         self.load_count = 0
         self._pending = None
         self._pending_measure = None
