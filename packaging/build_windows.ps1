@@ -480,11 +480,15 @@ Write-Host ("  [OK] " + $exePath + "（" + (Format-MB (Get-Item -LiteralPath $ex
 Write-Step "产物自检（verify_dist.py：必需文件 / 不该有的东西 / 体积 / --self-check）"
 Push-Location $RepoRoot
 try {
+    # 输出落盘：verify_dist 会跑一次 exe（--self-check），几十行里 FAIL 往往在
+    # 中间，控制台被滚过去就只剩结论。留一份文件，排查时直接搜 [FAIL]。
+    $verifyLog = Join-Path $RepoRoot 'build\verify_dist.log'
     Invoke-Native -What "verify_dist.py" -Body {
-        & $VenvPython $VerifyScript --dist $DistDir
+        & $VenvPython $VerifyScript --dist $DistDir 2>&1 | Tee-Object -FilePath $verifyLog
     } -Hints @(
         "FAIL 项逐条写在上面；改 spec 后重跑，不要手动往 dist 里拷文件。",
-        "WARN 只影响体积/观感，不影响能不能跑。")
+        "WARN 只影响体积/观感，不影响能不能跑。",
+        ("完整输出： " + $verifyLog))
 } finally {
     Pop-Location
 }
