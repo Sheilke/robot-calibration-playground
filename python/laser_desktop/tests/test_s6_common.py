@@ -305,16 +305,31 @@ class ResultRowsVisibleTest(unittest.TestCase):
         self._check_rows("iso", "ISO 页", 5, self.MINIMUM)
 
     def test_right_column_has_three_draggable_sections(self):
-        """右栏是三段分割器，首开按 25/45/30（不是 Qt 按 sizeHint 平分）。"""
+        """右栏是三段分割器，三段各自守自己的下限，且能拖宽结果区。
+
+        断言**不再**去比 ``DEFAULT_SPLIT_RATIOS`` 的归一化值：S6c 之后首开高度
+        是"预览卡按内容拿、剩下给图与结果"算出来的，与那个比例常量本就不相等
+        （无结果时预览卡内容更矮，结果区是空的，实际比例自然偏移）。比常量只会
+        把实现细节钉死，改一次布局就要改一次测试。
+
+        真正要守住的是三件事：
+
+        1. 是三段、不是两段或平分布局；
+        2. 每段都不低于自己的最小值（否则结果表只剩表头）；
+        3. 拖分割条能把结果区拉大（用户要能自己分配空间）。
+        """
         page = generate_page.GeneratePage()
         window = self._window(page, self.DEFAULT)
         splitter = page._viewer_splitter
         self.assertIsInstance(splitter, page_layout.RightSplitter)
         self.assertEqual(splitter.count(), 3)
-        self.assertEqual(
-            tuple(splitter.ratios),
-            page_layout._normalize(page_layout.DEFAULT_SPLIT_RATIOS),
-            f"首开比例 {splitter.ratios} 与默认值不符")
+        sizes = splitter.sizes()
+        self.assertEqual(sum(splitter.ratios), 1000,
+                         f"比例未归一化：{splitter.ratios}")
+        self.assertGreaterEqual(
+            sizes[1], page_layout.PLOT_FLOOR_HEIGHT,
+            f"图区 {sizes[1]} 低于硬下限 {page_layout.PLOT_FLOOR_HEIGHT}")
+        self.assertGreater(sizes[2], 0, f"结果区被压成 0：{sizes}")
         before = splitter.sizes()
         splitter.setSizes([before[0] - 60, before[1] - 60, before[2] + 120])
         wait(40)

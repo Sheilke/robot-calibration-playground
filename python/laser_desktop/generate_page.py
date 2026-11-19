@@ -1207,21 +1207,25 @@ class GeneratePage(QtWidgets.QWidget):
         self._debounce.setInterval(self.DEBOUNCE_MS)
         self._debounce.timeout.connect(self.apply_figure)
 
-        page_layout = QtWidgets.QVBoxLayout(self)
-        page_layout.setContentsMargins(8, 8, 8, 8)
-        page_layout.setSpacing(6)
+        # 页面自己的纵向布局叫 layout（避开 ``page_layout`` 这个名字：它是模块，
+        # 后面建 :class:`page_layout.BodySplitter` 要用）。
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
         self.banner = QtWidgets.QLabel("")
         self.banner.setWordWrap(True)
         self.banner.hide()
-        page_layout.addWidget(self.banner)
+        layout.addWidget(self.banner)
 
-        body = QtWidgets.QWidget()
-        outer = QtWidgets.QHBoxLayout(body)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(8)
-        outer.addWidget(self._build_left_column(), 0)
-        outer.addWidget(self._build_right_column(), 1)
-        page_layout.addWidget(body, 1)
+        # 左右两栏之间是**横向**分割器（S6e）：普通 ``QHBoxLayout`` 时三列里
+        # 只有右栏内部那条竖分割条能拖，现场想把表单拖窄、把图拖宽却无处可拖。
+        # 两段的宽度下限钉在内容的最小宽度上（拖到极端也不裁数值框），比例存
+        # ``QSettings`` 的 ``body_splitter/generate``。
+        body = page_layout.BodySplitter("generate", self._build_left_column(),
+                                        self._build_right_column(),
+                                        settings=self._settings)
+        self._body_splitter = body
+        layout.addWidget(body, 1)
 
         # 信号连在控件建完之后：槽里直接碰控件（都在 GUI 线程，见 job_bridge）
         self.bridge.progress.connect(self._on_progress)

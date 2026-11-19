@@ -43,6 +43,13 @@ S6c 最后一段（**三页 × 两种窗口尺寸，六张截图**）：主操�
 不用滚、图 ≥260 / 表 8 行（1280×800 是图 ≥200 / 表 ≥5 行）。截图存
 ``/tmp/desktop_s6d_<page>_<1600|1280>.png``。
 
+S6e 最后一段（**三页 × 默认/拖动，六张截图**）：左导航 / 表单 / 右栏三列里，
+表单与右栏之间现在是可拖的横向分割器（``page_layout.BodySplitter``）。
+断言：两段之间真是 ``QSplitter``（水平、手柄 8 px、不可折叠）、默认左栏
+≈ 540 px、拖到最左贴住表单的最小宽度且数值框不被压窄、横向拖动不动竖分割
+比例。截图存 ``/tmp/desktop_s6e_<page>_<default|dragged>.png``
+（``dragged`` 就是左栏拖窄、右栏放宽那一下）。
+
 S6 评审后的三处必改（S6d，全部用真 WebEngine 探针量，不是看代码）：
 
 * **R1**：图上高亮只增不减——``Plotly.restyle`` 就地改写 ``gd.data[t].marker
@@ -96,6 +103,10 @@ SHOT_S6_SMALL = "/tmp/desktop_s6b_small.png"
 SHOT_S6C = {(kind, size_label): f"/tmp/desktop_s6d_{kind}_{size_label}.png"
             for kind in ("generate", "iso", "repair")
             for size_label in ("1600", "1280")}
+#: S6e（三页的左右两栏横向可拖）的六张截图：默认 / 把左栏拖到最窄。
+SHOT_S6E = {(kind, label): f"/tmp/desktop_s6e_{kind}_{label}.png"
+            for kind in ("generate", "iso", "repair")
+            for label in ("default", "dragged")}
 #: S6b 的**默认**窗口（= MainWindow 的默认尺寸）：一屏 8 行的口径。
 S6_WIDTH, S6_HEIGHT = 1600, 950
 #: 最小窗口：允许纵向滚动，但 5 行仍要露出来。
@@ -1308,7 +1319,113 @@ def s6d_done():
     window.resize(S6_WIDTH, S6_HEIGHT)
     window.nav.setCurrentRow(0)
     wait_events(0.3)
-    finish()
+    s6e_start()
+
+
+# ---------------------------------------------------------------------------
+# S6e：三页的左右两栏横向可拖（默认 / 拖到最窄，六张截图）
+# ---------------------------------------------------------------------------
+def s6e_start():
+    """S6e：三页 ×（默认 / 把左栏拖到最窄）的横向分割器，六张截图。"""
+    window.resize(S6_WIDTH, S6_HEIGHT)
+    state["s6e_queue"] = [("generate", 0), ("iso", 2), ("repair", 1)]
+    s6e_next()
+
+
+def s6e_next():
+    queue = state.get("s6e_queue") or []
+    if not queue:
+        finish()
+        return
+    kind, row = queue.pop(0)
+    window.nav.setCurrentRow(row)
+    QtCore.QTimer.singleShot(500, lambda: s6e_default(kind))
+
+
+def s6e_table_tab(page):
+    """截图里要看得到结果表：切到带表的页签。"""
+    if page is window.iso:
+        return page.points_page
+    if page is window.repair:
+        return page.plan_page
+    return page.waypoints_page
+
+
+def s6e_grab(kind, label):
+    """存一张 S6e 截图。"""
+    shot = SHOT_S6E[(kind, label)]
+    saved = window.grab().save(shot)
+    size_bytes = os.path.getsize(shot) if os.path.exists(shot) else 0
+    step(f"截图（S6e {kind} {label}）", bool(saved) and size_bytes > 5000,
+         f"{size_bytes} 字节 → {shot}")
+
+
+def s6e_default(kind):
+    """① 默认宽度（可复现）+ 两段下限的硬指标 + ``default`` 截图。"""
+    page = window.stack.currentWidget()
+    page.result_tabs.setCurrentWidget(s6e_table_tab(page))
+    body = page._body_splitter
+    body.reset_ratios()            # 截图要可复现：回默认比例（不读用户存过的）
+    wait_events(0.5)
+    sizes = body.sizes()
+    left_min, right_min = body.segment_minimums()
+    natural = body.natural_left_width()
+    form = page.form_scroll
+    vertical = page._right_splitter
+    state["s6e_vsizes"] = list(vertical.sizes())
+    step(f"S6e {kind} 两栏之间确实是可拖分割器",
+         isinstance(body, QtWidgets.QSplitter)
+         and body.orientation() == QtCore.Qt.Horizontal
+         and body.count() == 2
+         and body.handleWidth() == page_layout.BODY_HANDLE_WIDTH
+         and not body.childrenCollapsible(),
+         f"手柄={body.handleWidth()} px，不可折叠={not body.childrenCollapsible()}，"
+         f"两段={body.count()}")
+    share = sizes[0] / float(window.width())
+    step(f"S6e {kind} 默认宽度（左栏 ≈ 表单自然宽度，窗口宽的 {share:.0%}）",
+         sizes[0] >= natural and sizes[0] >= left_min
+         and 0.30 < share < 0.45 and sizes[1] > sizes[0],
+         f"左={sizes[0]}（自然宽 {natural}，下限 {left_min}，表单 {form.width()}）"
+         f" 右={sizes[1]}（下限 {right_min}），可拖幅 {sizes[0] - left_min} px")
+    s6e_grab(kind, "default")
+    QtCore.QTimer.singleShot(200, lambda: s6e_dragged(kind, page))
+
+
+def s6e_dragged(kind, page):
+    """② 把左栏拖到最窄（右栏放宽）：不裁数值框 + 竖分割不动 + 截图。"""
+    body = page._body_splitter
+    form = page.form_scroll
+    vertical = page._right_splitter
+    before_v = state.get("s6e_vsizes") or []
+    left_min = body.widget(0).minimumWidth()
+    body.moveSplitter(1, 1)        # 当真用户拖到最左边（handle 1 拖到 x=1）
+    wait_events(0.5)
+    sizes = body.sizes()
+    step(f"S6e {kind} 拖到最左后左段贴住下限",
+         left_min <= sizes[0] <= left_min + 2,
+         f"左={sizes[0]}（下限 {left_min}） 右={sizes[1]}"
+         f" 比例={body.live_ratios()} 用户拖过={body.user_moved}")
+    boxes = {key: widget for key, widget in page.fields.items()
+             if isinstance(widget, QtWidgets.QAbstractSpinBox)
+             and widget.isVisible()}
+    clipped = {key: (box.width(), box.sizeHint().width())
+               for key, box in boxes.items()
+               if box.width() < box.sizeHint().width()}
+    step(f"S6e {kind} 左栏最窄时数值框完整",
+         not clipped and form.horizontalScrollBar().maximum() == 0,
+         f"数值框 {len(boxes)} 个，被压窄={clipped or '无'}，"
+         f"表单横滚条={form.horizontalScrollBar().maximum()}"
+         f"（视口 {form.viewport().width()}，内容最小 "
+         f"{form.widget().minimumSizeHint().width()}）")
+    after_v = list(vertical.sizes())
+    step(f"S6e {kind} 横向拖动不动竖分割比例", after_v == before_v,
+         f"竖分割 {before_v} → {after_v}，``protect_plot`` "
+         f"{'不抢' if not vertical.protect_plot() else '还在抢'}")
+    shot = SHOT_S6E[(kind, "dragged")]
+    s6e_grab(kind, "dragged")
+    body.reset_ratios()            # 下一张默认截图仍要可复现
+    wait_events(0.2)
+    QtCore.QTimer.singleShot(150, s6e_next)
 
 
 def finish():

@@ -13,6 +13,10 @@ S3–S5 是各页自己摆 ``QVBoxLayout`` + 两段 ``QSplitter``，结果在 11
 * :class:`RightSplitter`：垂直三段，首开时预览卡按**内容高度**拿（150–220，
   见 :func:`preview_default_height`）、剩下的按 :data:`DEFAULT_SPLIT_RATIOS`
   折算给图 / 结果；用户拖动后把比例写进 ``QSettings``，下次开窗读回来；
+* :class:`BodySplitter`：左右两栏（表单列 / 右栏）之间的**横向**分割器——
+  2026-02 之前这里是普通 ``QHBoxLayout``，三列里只有右栏**内部**那条竖分割器
+  能拖，现场想"表单拖窄、图拖宽"时无处可拖（S6e）。两段的宽度下限显式钉住，
+  比例同样存 ``QSettings``（键 ``body_splitter/<page>``）；
 * :func:`build_action_row`：主操作按钮的固定行（不滚动、不被压缩）——
   S6b 把按钮放在预览卡里，卡片被压矮后按钮就跟着滚出/被切半截；
 * :class:`MetricGrid` / :class:`StatsGrid`：预览数值与统计卡按需换行
@@ -124,6 +128,36 @@ DEFAULT_SPLIT_RATIOS = (16, 38, 46)
 
 #: 比例存进 ``QSettings`` 时的放大倍数（存整数，避免浮点格式差异）。
 RATIO_SCALE = 1000
+
+#: 左右两栏（表单 / 右栏）分割条的**手柄宽度**（px）。6 px 在浅色背景上几乎
+#: 看不出来，现场反馈"不知道这里能拖"；8 px 才摸得到、也拖得动。
+BODY_HANDLE_WIDTH = 8
+
+#: 表单列 / 右栏的宽度**兜底**（px）：真正生效的下限是
+#: ``max(兜底, 内容 minimumSizeHint().width())``（见
+#: :meth:`BodySplitter.segment_minimums`）。兜底只是防"某页内容特别窄时左栏
+#: 能被拖到只剩一条"，三页实测都远大于它：表单 467 / 586 / 524，右栏
+#: 301 / 396 / 218（结果表的硬下限）。
+BODY_LEFT_FLOOR_WIDTH = 320
+BODY_RIGHT_FLOOR_WIDTH = 280
+
+#: 左右两栏的首开比例（千分比，合计 :data:`RATIO_SCALE`）。
+#:
+#: 口径：1600 宽的窗口里，导航 92 + 页边距 16 + 手柄 8 之后分割器自身 1324 px。
+#: 左栏保底 **~540 px**（= 窗口宽的 34%，六个数值框加标签才排得开），
+#: 540 / 1324 ≈ **41%**；右栏拿剩下的 59%（≈ 776 px）。
+#:
+#: 为什么不是直接写 34%：34% 是按**窗口宽**折算的，分割器实际只有 1324 px，
+#: 34% 只有 447 px——比表单自己的最小宽度（467）还窄。41% 才真的把 540 px
+#: 给到表单。1280 宽的窗口里 41% 只有 408 px，会被抬到各自的
+#: ``minimumSizeHint``。
+#:
+#: 首开还取 **max(这个比例, 表单自身的 ``sizeHint``)**：表单里六组控件本来就是按
+#: 自然宽度排的（生成/ISO 560、修复 640），比它窄会把 ``QFormLayout`` 的列挤到
+#: 换行。结果就是 1600×950 / 1280×800 下首开与改造前的 ``QHBoxLayout`` **逐像素
+#: 一致**（560/640/560），拖动的空间留给用户；比例在窗口比 1600 更宽时才真正
+#: 接管。
+DEFAULT_BODY_RATIOS = (41, 59)
 
 
 def default_settings():
@@ -976,6 +1010,288 @@ class RightSplitter(QtWidgets.QSplitter):
             self.apply_ratios()
 
 
+class BodySplitter(QtWidgets.QSplitter):
+    """页面左右两半（表单列 / 右栏）之间的**横向**分割器，可拖、可记忆。
+
+    S6e 之前这里是普通 ``QHBoxLayout``：三列（左导航 / 表单 / 右栏）里只有
+    右栏**内部**那条竖分割器能拖，现场想把表单拖窄、把图拖宽时发现无处可拖。
+    换成 ``QSplitter`` 之后：
+
+    * 两段的宽度下限显式钉在控件上（:meth:`apply_minimum_widths`：左 = 表单的
+      ``minimumSizeHint().width()``，右 = 图与结果表挤出来的硬下限），再加
+      ``setChildrenCollapsible(False)``——左边拖到 0、右边拖到 0 都会被挡在下限，
+      数值框不会被裁掉；
+    * 比例存 ``QSettings``（键 ``body_splitter/<page>``），下次开窗读回来；
+      存过的比例在这一档宽度上装不下时回默认比例（与 :class:`RightSplitter`
+      同一套“存过但比最小尺寸小就回默认”的判据）；
+    * **只管横向**：竖分割器（:class:`RightSplitter`）的 ``protect_plot`` /
+      ``plot_floor`` 不认它，用户拖完不会被程序抢回去。程序只在首次布局时
+      按比例分一次（:meth:`apply_ratios`），之后完全交给 ``QSplitter``——窗口
+      resize 时 Qt 本来就按当前比例缩放。
+
+    Attributes:
+        name: 页面名（``"generate"`` / ``"repair"`` / ``"iso"``），也是
+            ``QSettings`` 键的一部分。
+        ratios: 当前设计比例（千分比二元组，合计 :data:`RATIO_SCALE`）。
+    """
+
+    def __init__(self, name: str, left, right, settings=None,
+                 ratios=DEFAULT_BODY_RATIOS) -> None:
+        """建两段横向分割器（左 = 表单列，右 = 右栏）。
+
+        Args:
+            name: 页面名（QSettings 键 ``body_splitter/<name>``）。
+            left: 左段（``_build_left_column()`` 的返回物：表单滚动区 + 操作行）。
+            right: 右段（``_build_right_column()`` 的返回物：
+                :class:`RightSplitter`）。
+            settings: ``QSettings`` 实例；``None`` 时用 :func:`default_settings`。
+            ratios: 首开比例（没有存过设置时用）。
+        """
+        super().__init__(Qt.Horizontal)
+        self.name = str(name)
+        self._settings = settings
+        self._applying = False
+        self._applied = False
+        self._user_moved = False
+        #: 存过的比例在当前宽度上会把某段压到硬下限以下（:meth:`default_sizes`
+        #: 已经改回默认比例）。测试/冒烟要看这个状态。
+        self._stored_too_narrow = False
+        self._left = left
+        self._right = right
+        for widget in (left, right):
+            self.addWidget(widget)
+            self.setStretchFactor(self.count() - 1, 1)
+        self.setChildrenCollapsible(False)
+        self.setHandleWidth(BODY_HANDLE_WIDTH)
+        self.apply_minimum_widths()
+        stored = self.saved_ratios()
+        self._from_settings = stored is not None
+        self._ratios = (stored if stored is not None
+                        else _normalize(ratios, 2, DEFAULT_BODY_RATIOS))
+        self.splitterMoved.connect(self._on_moved)
+
+    # ------------------------------------------------------------ 两段
+    @property
+    def left_column(self):
+        """左段控件（表单列）。"""
+        return self._left
+
+    @property
+    def right_column(self):
+        """右段控件（右栏 = 竖分割器）。"""
+        return self._right
+
+    @property
+    def user_moved(self) -> bool:
+        """用户亲手拖过没有（拖过就不再接受程序改宽度）。"""
+        return bool(self._user_moved)
+
+    @staticmethod
+    def _segment_minimum(widget, floor: int) -> int:
+        """一段的硬下限（px）：``max(兜底, minimumSizeHint, 已设的 minimumWidth)``。"""
+        try:
+            hint = int(widget.minimumSizeHint().width())
+            current = int(widget.minimumWidth())
+        except RuntimeError:                    # 控件已被删
+            hint = current = 0
+        return max(int(floor), hint, current)
+
+    def segment_minimums(self):
+        """两段的硬下限 ``[左, 右]``（px）。
+
+        左段 = 表单的 ``minimumSizeHint().width()``（三页实测 467 / 586 / 524，
+        含纵向滚动条与边框）；右段 = 图与结果表挤出来的宽度（301 / 396 / 218，
+        就是 :class:`RightSplitter` 自己的 ``minimumSizeHint().width()``）。
+        两者都没到兜底时用 :data:`BODY_LEFT_FLOOR_WIDTH` /
+        :data:`BODY_RIGHT_FLOOR_WIDTH`。
+
+        Returns:
+            list[int]: ``[左段最小宽, 右段最小宽]``。
+        """
+        return [self._segment_minimum(self._left, BODY_LEFT_FLOOR_WIDTH),
+                self._segment_minimum(self._right, BODY_RIGHT_FLOOR_WIDTH)]
+
+    def apply_minimum_widths(self) -> None:
+        """把两段的硬下限钉到控件上（拖到极端也不许裁内容）。
+
+        为什么不用布局自己的 ``minimumSizeHint`` 兜底就够了：``QSplitter`` 确实
+        认子控件的 ``minimumSizeHint``，但那是**隐式**的——一旦某段的最小尺寸
+        跟着内容变（切页签 / 出结果），生效的下限也跟着变。显式 ``setMinimumWidth``
+        让“拖不动到这里”有一条测试量与代码读得懂的线，再让 ``QSplitter`` 在两者
+        里取大即可。
+        """
+        left_min, right_min = self.segment_minimums()
+        self._left.setMinimumWidth(left_min)
+        self._right.setMinimumWidth(right_min)
+
+    def children_min_width(self) -> int:
+        """两段 + 手柄的最小宽度之和（低于它就别谈“按比例分配”了）。"""
+        left_min, right_min = self.segment_minimums()
+        return (left_min + right_min
+                + self.handleWidth() * max(0, self.count() - 1))
+
+    def natural_left_width(self) -> int:
+        """表单想要的宽度（左段 ``sizeHint``）：六组控件就是按这个宽度排的。
+
+        生成/ISO 560、修复 640（实测），恰好是改造前 ``QHBoxLayout`` 给左栏的
+        宽度（``setStretchFactor(0, 0)`` 就是“拿 sizeHint”）。
+        """
+        try:
+            return max(0, int(self._left.sizeHint().width()))
+        except RuntimeError:                     # 控件已被删
+            return 0
+
+    # ------------------------------------------------------------ 设置读写
+    def settings_key(self) -> str:
+        """``QSettings`` 里的键名（一个页面一个）。"""
+        return f"body_splitter/{self.name}"
+
+    def settings(self):
+        """实际的 ``QSettings``（测试注入时就是注入的那个）。"""
+        if self._settings is None:
+            self._settings = default_settings()
+        return self._settings
+
+    def saved_ratios(self):
+        """读回上次存的比例（千分比二元组）；没存过/读坏了返回 ``None``。"""
+        try:
+            raw = self.settings().value(self.settings_key())
+        except (TypeError, ValueError):             # pragma: no cover - 坏配置
+            return None
+        return _parse_ratios(raw, 2, DEFAULT_BODY_RATIOS)
+
+    def save_ratios(self) -> None:
+        """把**当前**比例写进 ``QSettings``（用户拖动分割条后自动调）。"""
+        self._ratios = self.live_ratios()
+        self.settings().setValue(self.settings_key(), list(self._ratios))
+
+    def reset_ratios(self) -> None:
+        """回到首开比例（冒烟脚本/测试要可复现的截图时用）。"""
+        self._ratios = _normalize(DEFAULT_BODY_RATIOS, 2, DEFAULT_BODY_RATIOS)
+        self._from_settings = False
+        self._applied = False
+        self.apply_ratios()
+
+    # ------------------------------------------------------------ 比例
+    @property
+    def ratios(self):
+        """下一轮布局要用的比例（千分比二元组）：存过就是存的，否则是默认值。"""
+        return tuple(self._ratios)
+
+    def live_ratios(self):
+        """屏幕上**现在的**比例（千分比）；还没布局过时返回设计比例。"""
+        sizes = self.sizes()
+        total = sum(sizes)
+        if total <= 0 or len(sizes) != 2:
+            return tuple(self._ratios)
+        return _normalize([size * RATIO_SCALE / total for size in sizes],
+                          2, DEFAULT_BODY_RATIOS)
+
+    def default_sizes(self, total: int):
+        """首开尺寸（两段像素宽）：按比例算，再抬到各自的硬下限。
+
+        顺序：先看 ``QSettings`` 里存过的比例——它在这一档宽度上**两段都不低于
+        下限**才用；只要有一段被压到下限以下（比如在宽窗口拖出来的比例，在
+        1280 窗口里装不下表单），就当作“存过的比最小尺寸还小”，回默认
+        （判据与 :meth:`restore_window_geometry` 的“存过但比最小尺寸小就回默认”
+        是同一套，见 :attr:`_stored_too_narrow`）。
+
+        首开的默认值取 **max(比例, 表单的 ``sizeHint``)**：比表单自然宽度窄会
+        把 ``QFormLayout`` 的列挤到换行，而改造前 ``QHBoxLayout`` 给左栏的就是
+        ``sizeHint``——两者一致，改完首开看不出来，想窄自己去拖。
+
+        Args:
+            total: 分割器当前宽度（px，含手柄，口径与 ``QSplitter.width()`` 相同）。
+
+        Returns:
+            list[int]: 两段宽度，合计 = ``total - handleWidth``。
+        """
+        total = int(total)
+        usable = max(2, total
+                     - self.handleWidth() * max(0, self.count() - 1))
+        mins = self.segment_minimums()
+        self._stored_too_narrow = False
+        if self._from_settings:
+            wanted = [usable * ratio / RATIO_SCALE for ratio in self._ratios]
+            if wanted[0] >= mins[0] and wanted[1] >= mins[1]:
+                return _fit_pair(wanted, mins, usable)
+            self._stored_too_narrow = True
+        wanted_left = max(usable * DEFAULT_BODY_RATIOS[0] / RATIO_SCALE,
+                          float(self.natural_left_width()))
+        return _fit_pair([wanted_left, usable - wanted_left], mins, usable)
+
+    def apply_ratios(self) -> bool:
+        """按当前比例分配宽度；控件还没有宽度/装不下下限时返回 ``False``。
+
+        只在**首次**布局时调（``showEvent`` / ``resizeEvent`` 里 ``_applied``
+        为假时）。之后绝不重算：用户拖过的宽度、窗口 resize 后的比例都由
+        ``QSplitter`` 自己维持，程序插手就会把用户的拖动“抢回去”。
+
+        Returns:
+            bool: 真的分配过才 ``True``。
+        """
+        total = self.width()
+        if total <= 0:
+            return False
+        if total < self.children_min_width():
+            return False
+        self._apply_sizes(self.default_sizes(total))
+        self._applied = True
+        return True
+
+    def _apply_sizes(self, sizes) -> None:
+        """程序性地设尺寸（不当作“用户拖过”写进 ``QSettings``）。"""
+        self._applying = True
+        try:
+            self.setSizes(list(sizes))
+        finally:
+            self._applying = False
+
+    def _on_moved(self, *_args) -> None:
+        """用户拖动分割条：把比例存下来（程序自己 setSizes 时不存）。"""
+        if self._applying:
+            return
+        self._user_moved = True
+        self.save_ratios()
+
+    def showEvent(self, event) -> None:             # noqa: N802 - Qt 回调命名
+        """第一次显示时按比例分配（构造时还没有宽度）。"""
+        super().showEvent(event)
+        if not self._applied:
+            self.apply_ratios()
+
+    def resizeEvent(self, event) -> None:           # noqa: N802 - Qt 回调命名
+        """第一次拿到宽度时按比例分配；之后交给 Qt 按当前比例缩放。"""
+        super().resizeEvent(event)
+        if not self._applied:
+            self.apply_ratios()
+
+
+def _fit_pair(wanted, minimums, usable: int):
+    """把两段的设计宽度抬到下限、再凑成 ``usable``（多余给右段、不够从右段扣）。
+
+    Args:
+        wanted: 设计宽度（浮点，两段）。
+        minimums: 两段的硬下限（px）。
+        usable: 两段宽度之和（px，已经扣掉手柄）。
+
+    Returns:
+        list[int]: 两段宽度，合计 = ``usable``（下限之和超过 ``usable`` 时只能
+        ``QRect`` 式的截断——那种情况 ``apply_ratios`` 根本不会调到本函数）。
+    """
+    sizes = [max(int(round(float(width))), int(low))
+             for width, low in zip(wanted, minimums)]
+    excess = sum(sizes) - int(usable)
+    for index in (1, 0):                        # 先扣右段（图/结果有余量时）
+        if excess <= 0:
+            break
+        take = min(excess, max(0, sizes[index] - int(minimums[index])))
+        sizes[index] -= take
+        excess -= take
+    sizes[1] += max(0, int(usable) - sum(sizes))
+    return sizes
+
+
 def _wrap_scrollable(widget, minimum_height: int):
     """把预览卡套进一个无边框滚动区（窗口变矮时可以滚，不撑大最小高度）。"""
     scroll = QtWidgets.QScrollArea()
@@ -987,22 +1303,34 @@ def _wrap_scrollable(widget, minimum_height: int):
     return scroll
 
 
-def _normalize(values) -> tuple:
-    """任意正数序列 -> 合计 :data:`RATIO_SCALE` 的三元整数（坏输入给默认值）。"""
+def _normalize(values, count: int = 3, default=DEFAULT_SPLIT_RATIOS) -> tuple:
+    """任意正数序列 -> 合计 :data:`RATIO_SCALE` 的 ``count`` 元整数（坏输入给兜底）。
+
+    Args:
+        values: 比例（任意正数，个数必须等于 ``count``）。
+        count: 段数（3 = 预览/图/结果，2 = 表单/右栏）。
+        default: 坏输入的兜底比例（必须也是 ``count`` 段，否则全平）。
+
+    Returns:
+        tuple: ``count`` 个整数，合计 :data:`RATIO_SCALE`。
+    """
+    fallback = [float(value) for value in default]
+    if len(fallback) != int(count):              # 兜底值也得是 count 段
+        fallback = [1.0] * int(count)            # pragma: no cover - 调用方写错
     try:
         numbers = [float(value) for value in values]
     except (TypeError, ValueError):
-        numbers = list(DEFAULT_SPLIT_RATIOS)
-    if len(numbers) != 3 or any(value <= 0 for value in numbers):
-        numbers = [float(value) for value in DEFAULT_SPLIT_RATIOS]
+        numbers = list(fallback)
+    if len(numbers) != int(count) or any(value <= 0 for value in numbers):
+        numbers = list(fallback)
     total = sum(numbers)
     scaled = [int(round(value * RATIO_SCALE / total)) for value in numbers]
-    scaled[-1] = RATIO_SCALE - scaled[0] - scaled[1]
+    scaled[-1] = RATIO_SCALE - sum(scaled[:-1])
     return tuple(int(value) for value in scaled)
 
 
-def _parse_ratios(raw):
-    """``QSettings`` 读出来的东西 -> 三元组；形状不对返回 ``None``。"""
+def _parse_ratios(raw, count: int = 3, default=DEFAULT_SPLIT_RATIOS):
+    """``QSettings`` 读出来的东西 -> ``count`` 元组；形状不对返回 ``None``。"""
     if raw is None:
         return None
     if isinstance(raw, str):
@@ -1013,7 +1341,7 @@ def _parse_ratios(raw):
         parts = list(raw)
     else:
         return None
-    if len(parts) != 3:
+    if len(parts) != int(count):
         return None
     try:
         values = [float(part) for part in parts]
@@ -1021,4 +1349,4 @@ def _parse_ratios(raw):
         return None
     if any(value <= 0 for value in values):
         return None
-    return _normalize(values)
+    return _normalize(values, count, default)

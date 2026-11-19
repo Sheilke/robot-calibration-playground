@@ -776,12 +776,12 @@ class IsoPage(QtWidgets.QWidget):
         self.banner.hide()
         column.addWidget(self.banner)
 
-        body = QtWidgets.QWidget()
-        outer = QtWidgets.QHBoxLayout(body)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(8)
-        outer.addWidget(self._build_left_column(), 0)
-        outer.addWidget(self._build_right_column(), 1)
+        # 左右两栏之间是**横向**分割器（S6e，与生成页同一份实现）：宽度下限
+        # 钉在表单/右栏自身的最小宽度上，比例存 ``body_splitter/iso``。
+        body = page_layout.BodySplitter("iso", self._build_left_column(),
+                                        self._build_right_column(),
+                                        settings=self._settings)
+        self._body_splitter = body
         column.addWidget(body, 1)
 
         # 信号连在控件建完之后（槽里直接碰控件，都在 GUI 线程，见 job_bridge）
