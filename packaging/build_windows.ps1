@@ -94,6 +94,40 @@ function Write-Hint {
     Write-Host ("  · " + $Text) -ForegroundColor DarkGray
 }
 
+function Get-BuildLogPath {
+    <# 构建日志的固定位置：一个文件装下全过程（含 Python/PyInstaller 的原始输出）。 #>
+    return (Join-Path $RepoRoot 'build\build.log')
+}
+
+function Start-BuildLog {
+    <#
+      开始把**整个构建过程**录进 build\build.log。
+
+      为什么要转录而不是各处 Tee：出问题时现场只会截最后几行，而真正的原因
+      往往在中段（比如 PyInstaller 的 ERROR 行、verify_dist 的 [FAIL] 行）。
+      一个完整文件可以直接发过来，省掉"再跑一遍把中间那段给我看看"。
+
+      Start-Transcript 在 5.1 里只允许一个会话；已经在录就忽略，不要因为
+      日志功能把构建本身打断。
+    #>
+    try {
+        $path = Get-BuildLogPath
+        New-Item -ItemType Directory -Force -Path (Split-Path $path) | Out-Null
+        Start-Transcript -LiteralPath $path -Force | Out-Null
+        $script:TranscriptActive = $true
+        Write-Host ("  构建日志：" + $path)
+    } catch {
+        Write-Host ("  （没能开始录制构建日志：" + $_.Exception.Message + "）") -ForegroundColor Yellow
+    }
+}
+
+function Stop-BuildLog {
+    if ($script:TranscriptActive) {
+        try { Stop-Transcript | Out-Null } catch { }
+        $script:TranscriptActive = $false
+    }
+}
+
 function Fail {
     param(
         [string] $Message,
@@ -106,6 +140,8 @@ function Fail {
     }
     Write-Host ""
     Write-Host "构建已停止（半成品不算产物；改完再跑一次）。" -ForegroundColor Red
+    Write-Host ("  完整构建日志：" + (Get-BuildLogPath)) -ForegroundColor Yellow
+    Stop-BuildLog
     exit 1
 }
 
@@ -216,6 +252,8 @@ if ($IssVersion -and ($IssVersion -ne $AppVersion)) {
 # ---------------------------------------------------------------------------
 # 1. Python：3.13 + x64
 # ---------------------------------------------------------------------------
+Start-BuildLog
+
 Write-Step "检查 Python（要求 3.13 x64：包里的解释器版本要与目标机一致）"
 $Runner = Get-PythonRunner
 $probeCode = "import sys, struct, platform; print(platform.python_version()); print(struct.calcsize('P') * 8); print(sys.executable)"
@@ -597,4 +635,6 @@ Write-Host "  3. 任务管理器里 QtWebEngineProcess ≤ 2；netstat -ano 无�
 Write-Host "  4. 卸载 → 确认按选择保留/删除了 %LOCALAPPDATA%\LaserWaypoint"
 Write-Host ""
 Write-Host "构建完成。" -ForegroundColor Green
+Write-Host ("完整构建日志：" + (Get-BuildLogPath))
+Stop-BuildLog
 exit 0
