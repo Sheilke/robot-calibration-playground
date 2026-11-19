@@ -16,3 +16,21 @@ Traceback (most recent call last):
   File "/home/infoli/projects/robot-calibration-playground/python/laser_desktop/tests/test_s6_common.py", line 1311, in boom
     raise RuntimeError("页面槽炸了")
 RuntimeError: 页面槽炸了
+
+==== PyQt5 崩溃 ====
+Traceback (most recent call last):
+  File "/home/infoli/projects/robot-calibration-playground/python/laser_desktop/tests/test_s6_common.py", line 1335, in boom
+    raise RuntimeError("桥下游炸了")
+RuntimeError: 桥下游炸了
+
+==== PyQt5 崩溃 ====
+Traceback (most recent call last):
+  File "/home/infoli/projects/robot-calibration-playground/python/laser_desktop/tests/test_s6_common.py", line 1311, in boom
+    raise RuntimeError("页面槽炸了")
+RuntimeError: 页面槽炸了
+
+==== PyQt5 崩溃 ====
+Traceback (most recent call last):
+  File "/home/infoli/projects/robot-calibration-playground/python/laser_desktop/tests/test_s6_common.py", line 1311, in boom
+    raise RuntimeError("页面槽炸了")
+RuntimeError: 页面槽炸了

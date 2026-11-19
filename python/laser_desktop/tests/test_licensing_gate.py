@@ -587,14 +587,22 @@ class PublicKeySwallowTest(GateTestBase):
         self.assertIn("签名", result.message)
 
     def test_frozen_without_embedded_key_says_package_is_incomplete(self):
-        """冻结包没编进公钥时不能退回读文件，否则换文件又通了。"""
+        """冻结包没编进公钥时不能退回读文件，否则换文件又通了。
+
+        必须**同时**把 ``_embedded_public_key`` 打桩成 None：构建跑过一次之后，
+        源码树里会留下 ``laser_desktop/_embedded_key.py``（spec 生成、已 gitignore），
+        真实导入会拿到那把公钥，于是这条用例在"已经构建过"的机器上就变成另一种
+        失败（签名不通过，而不是"缺公钥"）。这种"测试依赖工作区状态"的坑在 Linux
+        上永远看不到——那边从不生成这个文件。
+        """
         forged, attacker_pem = self._forged_license()
         assets = self.tmp / "assets"
         assets.mkdir()
         (assets / "license_public.pem").write_bytes(attacker_pem)
         with mock.patch.object(gate.paths, "is_frozen", return_value=True), \
                 mock.patch.object(gate.paths, "asset_root", return_value=assets), \
-                mock.patch.object(gate, "EMBEDDED_PUBLIC_KEY_PEM", None):
+                mock.patch.object(gate, "EMBEDDED_PUBLIC_KEY_PEM", None), \
+                mock.patch.object(gate, "_embedded_public_key", return_value=None):
             result = gate.check(forged, local_fingerprints=[LOCAL_A], today=TODAY)
         self.assertFalse(result.ok)
         self.assertIn("公钥", result.message)
