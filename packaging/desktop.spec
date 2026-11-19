@@ -16,8 +16,9 @@
 
 这个 spec 干四件事
 ------------------
-1. **只读资产**：机器人模型（``data/configs`` 顶层的 ``*.urdf`` / ``*_dh.json``）
-   与离线 ``plotly.min.js`` → ``_internal/assets/``，正好是
+1. **只读资产**：机器人模型（``data/configs`` 顶层的 ``*.urdf`` / ``*_dh.json``）、
+   离线 ``plotly.min.js`` 与**授权公钥**（``data/assets/license_public.pem``，
+   有就收）→ ``_internal/assets/``，正好是
    :func:`laser_desktop.paths.asset_root` 在冻结状态下要找的位置。
 2. **QtWebEngine 运行时**：交给 PyInstaller 自带的
    ``hook-PySide6.QtWebEngineCore.py``（它调
@@ -133,6 +134,28 @@ if _js_size < 3.5 * 1024 * 1024:
     raise SystemExit("[desktop.spec] plotly.min.js 只有 %.1f KB，明显不完整：%s"
                      % (_js_size / 1024.0, _plotly_asset))
 _log("plotly.min.js %.2f MB -> assets/plotly" % (_js_size / 1024.0 / 1024.0))
+
+# ---------------------------------------------------------------------------
+# 1b. 离线授权的**公钥**（私钥绝不进包）
+# ---------------------------------------------------------------------------
+# 启动闸门（laser_desktop/licensing.py）在 asset_root() 下找 license_public.pem，
+# 冻结后就是 _internal/assets/license_public.pem，所以目标目录必须写 "assets"。
+#
+# 为什么没有这份文件**不算构建失败**：换一把私钥签发、先出一个只给内测机的包，
+# 都是正常需求；而把"缺公钥"做成硬失败，会让人为了赶进度去注释掉这行检查。
+# 但包里没公钥 = 装到客户机上启动就报「程序缺少内置公钥」，所以这里喊一嗓，
+# 再由 verify_dist.py 的 [WARN] 与 build_windows.ps1 的醒目提示各提醒一遍。
+#
+# 私钥（*.pem 里带 PRIVATE KEY 的那个）**绝不能**出现在这里：它一泄露，谁都能
+# 自己签授权。仓库里也不应该有——签发在离线机器上做。
+_PUBLIC_KEY_SRC = os.path.join(REPO_ROOT, "data", "assets", "license_public.pem")
+if os.path.isfile(_PUBLIC_KEY_SRC):
+    datas.append((_PUBLIC_KEY_SRC, "assets"))
+    _log("授权公钥 %d B -> assets/license_public.pem"
+         % os.path.getsize(_PUBLIC_KEY_SRC))
+else:
+    _log("!! 没有 data/assets/license_public.pem：这个包将不含授权公钥，"
+         "客户机上启动会直接报「程序缺少内置公钥」（只适合内测包）")
 
 # ---------------------------------------------------------------------------
 # 2. matplotlib：mpl-data（字体、样式表、teardown.cfg）
@@ -280,6 +303,12 @@ hiddenimports = [
     "laser_web.jobs",
     "laser_web.figures",
     "licensing.hwid",
+    # 启动闸门里的 import 都在函数体内（延迟到真要校验时才花这个钱）：
+    # 静态分析能看见，但它们是"不点就不知道"的那一类，点名更保险。
+    # cryptography 带 Rust 后端（_rust.pyd），靠 PyInstaller 自带的
+    # hook-cryptography 收，不要在这里手写二进制。
+    "licensing.license",
+    "cryptography",
     # matplotlib 的 Agg：源码里是 matplotlib.use("Agg")（字符串），
     # hooksconfig 已经钉死后端，这里再点名一次。
     "matplotlib.backends.backend_agg",

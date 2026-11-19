@@ -75,12 +75,27 @@ class MainWindow(QtWidgets.QMainWindow):
         page_layout.restore_window_geometry(self, self._settings)
 
         self.nav = QtWidgets.QListWidget()
-        self.nav.setFixedWidth(page_layout.NAV_WIDTH)
         self.nav.addItems(PAGES)
+        # 宽度不能钉死：NAV_WIDTH 是 96 dpi 下量的，字体一大就切字（见 _nav_width）
+        self.nav.setFixedWidth(self._nav_width())
+        # 宽度就是按最长一项算的，横滚条只会在字体量不准时冒出来白占高度
+        self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.stack = QtWidgets.QStackedWidget()
 
+        # 导航不能直接 addWidget 进分割器：``QListWidget.sizeHint()`` 是 256 px，
+        # ``QSplitter`` 按 sizeHint 分槽位，而控件被 ``setFixedWidth`` 钉在 92——
+        # 实测槽位 256 / 控件 92，导航右边空出 164 px（截图里导航与表单之间
+        # 那块白），表单和图各少拿 164 px。套一层 holder：布局按子控件的
+        # ``maximumWidth`` 收窄，holder 的 sizeHint 就等于导航真实宽度，
+        # 分割器分的槽位才对得上（实测 [92, 1504]）。
+        nav_holder = QtWidgets.QWidget()
+        nav_layout = QtWidgets.QHBoxLayout(nav_holder)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        nav_layout.setSpacing(0)
+        nav_layout.addWidget(self.nav)
+
         splitter = QtWidgets.QSplitter()
-        splitter.addWidget(self.nav)
+        splitter.addWidget(nav_holder)
         splitter.addWidget(self.stack)
         splitter.setStretchFactor(1, 1)
         self.setCentralWidget(splitter)
@@ -122,6 +137,27 @@ class MainWindow(QtWidgets.QMainWindow):
             if registry is not None:
                 directories |= registry.active_dirs()
         return directories
+
+    def _nav_width(self) -> int:
+        """导航列宽度（px）：按最长的一项算，下限是 :data:`page_layout.NAV_WIDTH`。
+
+        为什么不再直接 ``setFixedWidth(NAV_WIDTH)``：92 px 是在 96 dpi 下量的
+        （那时最长一项「奇异修复」只有 74 px，92 还宽出 18）。S7 现场机器的
+        ``Xft.dpi=192``：同样四项要 122 px，钉死的 92 就把「奇异修复」切成
+        「奇异修」、「ISO 五点」切成「ISO 五」（截图 ``/tmp/ld-shot.png``）。
+
+        宽度改成「最长一项」与「老下限」取大：96 dpi 下仍然等于 92（视觉与旧版
+        完全一致，省下的 38 px 还给表单和图），字体一变就自己变宽、不再切字。
+        ``sizeHintForColumn`` 含列表项的左、右内边距，但**不含**列表自己的
+        边框：不补这 2 px，现场实测会冒一根最大 2 px 的横滚条（白吃 20 px 高，
+        截图里导航底下多一条带箭头的槽）。
+
+        Returns:
+            int: 导航列宽度（px）。
+        """
+        padding = 2 * int(self.nav.frameWidth())
+        return max(int(page_layout.NAV_WIDTH),
+                   int(self.nav.sizeHintForColumn(0)) + padding)
 
     def _on_webgl(self, ok: bool, renderer: str) -> None:
         """WebGL 自检结果：可用就写进状态栏，不可用就把英文报错换成中文建议。"""

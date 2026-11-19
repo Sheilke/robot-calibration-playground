@@ -420,7 +420,7 @@ class FlowRow(QtWidgets.QWidget):
     实际行数（只在行数/高度变了时重设，否则会把父布局抽死）。
     """
 
-    #: 一张卡的高度（px）。
+    #: 一张卡的高度（px）的**下限**：实际行高跟字体走，见 :meth:`__init__`。
     ITEM_HEIGHT = 22
 
     #: 卡与卡之间的水平间距（px）。
@@ -436,6 +436,15 @@ class FlowRow(QtWidgets.QWidget):
         """建空排（子类负责把控件建出来）。"""
         super().__init__(parent)
         self._rows = 0
+        # 行高跟字体走：类常量 22 px 是 96 dpi 下量的（行距 25），而 S7 现场机器
+        # 是 ``Xft.dpi=192``——行距 35 px，钉死的 22 就把「体积 / 格点」两行字
+        # 上下各切掉一截（截图 /tmp/volume.png：两行都只露出中间部分）。
+        # 改成同名实例属性：``sizeHint`` / ``height_for_width`` /
+        # ``minimumSizeHint`` / ``relayout`` 读到的都是这个值；子类常量（如
+        # ``MetricGrid`` 的 21）只表达"卡可以比统计卡矮一点"的意图，仍受字体兜底。
+        # 多给 4 px：标签自己的行距不含上下内边距，刚好一行高时下缘会贴着框。
+        self.ITEM_HEIGHT = max(int(self.ITEM_HEIGHT),
+                               int(self.fontMetrics().lineSpacing()) + 4)
         self.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
                            QtWidgets.QSizePolicy.Fixed)
 
@@ -574,7 +583,8 @@ class MetricGrid(FlowRow):
     每对内部是"名称 + 数值"同一行，卡与卡之间留 16 px。
     """
 
-    #: 一对的高度（px）：比统计卡矮一点（卡片里没有状态色块）。
+    #: 一对的高度（px）的下限：实际行高跟字体走（``FlowRow.__init__``）。
+    #: 21 是 96 dpi 下"比统计卡矮一点"的意图，字体大时会被行距兜底。
     ITEM_HEIGHT = 21
 
     #: 对与对之间的水平间距（px）：比统计卡宽一点，肉眼能分组。

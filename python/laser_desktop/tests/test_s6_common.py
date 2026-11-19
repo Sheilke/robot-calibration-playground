@@ -705,11 +705,22 @@ class WindowStrategyTest(unittest.TestCase):
         window.close()
 
     def test_nav_is_about_92px(self):
-        """P4：导航栏收窄（130 → 92），省下的 38 px 给表单和图。"""
+        """P4：导航栏收窄（130 → 92），省下的 38 px 给表单和图。
+
+        S7 起宽度 = ``max(NAV_WIDTH, 最长一项)``：92 px 是 96 dpi 下的量法
+        （最长一项「奇异修复」74 px）；现场机 ``Xft.dpi=192``，同样四项要
+        122 px，钉死 92 就把「奇异修复」切成「奇异修」。所以这里断言的是
+        “下限仍是 92、且不比最长一项窄”，不再钉死等于 92。
+        """
         from laser_desktop import main_window
 
         window = main_window.MainWindow(settings=self.settings)
-        self.assertEqual(window.nav.width(), page_layout.NAV_WIDTH)
+        window.show()
+        wait(80)
+        self.assertGreaterEqual(window.nav.width(), page_layout.NAV_WIDTH)
+        self.assertGreaterEqual(
+            window.nav.width(), window.nav.sizeHintForColumn(0),
+            "导航比最长的一项还窄——文字会被切")
         self.assertLessEqual(page_layout.NAV_WIDTH, 100)
         window.close()
 

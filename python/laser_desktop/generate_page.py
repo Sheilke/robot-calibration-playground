@@ -130,9 +130,16 @@ SPIN_MIN_WIDTH = 88
 #: 整数框的最小宽度下限（px，同上）。
 INT_SPIN_MIN_WIDTH = 76
 
-#: 左侧表单列的宽度上限（px）：再宽就是从图和结果表那里硬拿。
-#: 下限不写死：由 :func:`_form_scroll` 量内容的 ``minimumSizeHint``（不裁控件）。
+#: 左侧表单列的宽度预算（px）：再宽就是从图和结果表那里硬拿。
+#: 它**不再**给滚动区封顶（那会裁字，见 :func:`_form_scroll`），只用来决定
+#: 说明小字在哪里换行（:data:`FORM_CAPTION_INSET`）。
 FORM_MAX_WIDTH = 560
+
+#: 说明小字（``HintLabel``）比表单预算窄多少（px）。分组 + 内容的左右边距
+#: （24 + 18）、竖滚动条（15）、边框（2）实测 ≈ 63；取 100 让说明文字比数值框
+#: 那几行再窄一截——宽出来的那一截就是 ``QFormLayout`` 的字段列，说明文字铺满
+#: 会看着像贴到列边。
+FORM_CAPTION_INSET = 100
 
 #: 进度条的量程：分数（0~1）乘它取整，比 0~100 细一个量级，又不用浮点。
 PROGRESS_STEPS = 1000
@@ -746,31 +753,100 @@ def _int_spin(minimum: int, maximum: int, value: int,
     return _fit_width(box, INT_SPIN_MIN_WIDTH)
 
 
+def _wrap_captions(content, maximum_width: int) -> None:
+    """把表单里的说明小字限到 ``maximum_width - FORM_CAPTION_INSET`` 宽。
+
+    为什么必须限：:class:`~laser_desktop.page_layout.HintLabel` 虽然
+    ``wordWrap``，但 ``sizeHint`` 报的是**整句不换行**的宽度（实测一句
+    673 px）。一个标签就能把表单列的自然宽顶到 794，而它本该占两三行。
+    ``setMaximumWidth`` 会让布局按这个宽度算 ``sizeHint``（``QWidgetItem``
+    取 ``sizeHint`` 与 ``maximumSize`` 的较小者），于是这部分宽度不再算进
+    "不裁"所需的宽度里。
+
+    Args:
+        content: 表单内容控件（已摆好布局）。
+        maximum_width: 表单的宽度预算（px），见 :data:`FORM_MAX_WIDTH`。
+    """
+    cap = max(240, int(maximum_width) - FORM_CAPTION_INSET)
+    for label in content.findChildren(QtWidgets.QLabel):
+        if isinstance(label, page_layout.HintLabel):
+            label.setMaximumWidth(cap)
+
+
+class _FormScroll(QtWidgets.QScrollArea):
+    """表单滚动区：把 ``sizeHint`` 的宽度压在表单预算里（硬下限另算）。
+
+    为什么需要它：内容里本来就有宽的排——修复页「现场信息」是 6 个关节角输入
+    + 「删除本组」，实测 ``sizeHint`` 1132。``QScrollArea.sizeHint`` 会把这个数
+    原样报上去，而 ``BodySplitter.natural_left_width()`` 量的是**左栏**的
+    ``sizeHint``：首开就按 1132 给表单，右栏被压到硬下限以下，窗口最小宽度被
+    顶到 1880（实测）。
+
+    这里只定"想多宽"这一层：宽度 = ``max(预算, 硬下限)``——96 dpi 下就是
+    560 / 640（与改动前逐像素一致），字体大到预算装不下时才按硬下限（不裁）。
+    **不封硬下限**：``minimumWidth`` 由 :func:`_form_scroll` 按内容真正需要的
+    宽度设，预算盖住它时以硬下限为准（``QWidgetItem`` 会把 ``sizeHint`` 抬到
+    ``minimumSize``）。
+    """
+
+    def __init__(self, budget: int) -> None:
+        """记下宽度预算（px）。"""
+        super().__init__()
+        self._budget = int(budget)
+
+    def sizeHint(self) -> QtCore.QSize:          # noqa: N802 - Qt 覆写
+        """表单想要的尺寸：宽度 = ``max(预算, 硬下限)``。"""
+        size = super().sizeHint()
+        return QtCore.QSize(max(self._budget, int(self.minimumWidth())),
+                            int(size.height()))
+
+
 def _form_scroll(content, maximum_width: int) -> QtWidgets.QScrollArea:
-    """把表单内容装进纵向滚动区，宽度不小于内容真正需要的最小宽度。
+    """把表单内容装进纵向滚动区，宽度不小于内容真正需要的宽度。
 
     为什么不能拍一个数字：三页的表单行宽差很多（修复页的「现场信息」有 6 个
     关节角 + 「删除本组」，是四页里最宽的）。写死一个 455 时它比内容窄，于是
     底部出现横向滚动条，右边的数值框/按钮被裁掉一半（S6 截图里的
-    ``500.0 mr`` 与只露一半的「删除本组」）。这里量 ``minimumSizeHint``：
-    **控件的最小宽度之和**才是"不裁"的边界，再补上纵向滚动条与边框。
+    ``500.0 mr`` 与只露一半的「删除本组」）。
+
+    为什么量 ``minimumSizeHint``：S7 现场截图里表单**右边半截被切**
+    （``Z 最小`` 显示成 ``00.0 m``、「六个轴边界」只剩「六个轴」），而列右边
+    还有一条 240 px 的死区。根因是旧写法把这个数量完又拿 ``FORM_MAX_WIDTH``
+    封了一次顶：现场字体下它本来就是 759，封到 560 之后视口只有 544，内容却
+    按 759 摆，横向滚动条又被 ``ScrollBarAlwaysOff`` 关掉——多出来的部分既不滚
+    也缩不回去，直接裁掉。现在：
+
+    1. 说明小字先按表单预算换行（:func:`_wrap_captions`），把自然宽从 794 压回
+       数值框那几行的水平（≈520），不会因为一句话把图区挤掉；
+    2. 滚动区报的**自然宽**（:class:`_FormScroll.sizeHint`）= ``max(预算, 硬下限)``：
+       96 dpi 下仍然是 560 / 640（与改动前一致），大字体时才变宽；
+    3. 硬下限（:meth:`~laser_desktop.qt_compat.QtWidgets.QWidget.setMinimumWidth`）
+       就是**上面量出的「不裁」边界**，不再被预算二次压缩。预算比它大时以预算
+       为准（拖到 467 仍是完整可见），预算比它小时以它为准（不裁）。
+    4. **不再给滚动区 maxWidth**：分割器给这一列多少，滚动区就用多少，右边
+       不再留白条（旧写法钉在 560，列 800 → 右边 240 px 死区）；
+    5. 横滚条留成 ``AsNeeded``：正常宽度下不会出现（内容比视口窄），真出现
+       说明上面哪一步被绕过了，那时宁可让它能滚，也不要静默裁字。
 
     Args:
         content: 表单内容控件（已摆好布局）。
-        maximum_width: 宽度上限（px）：再宽就是浪费图的横向空间。
+        maximum_width: 表单的宽度预算（px，含竖滚动条与边框）：说明小字在这里
+            换行，滚动区报的自然宽也不超过它（图区不能被表单吃光），但**不**
+            拿它去压“不裁”的硬下限。
 
     Returns:
-        ``QScrollArea``（纵向可滚，横向不允许）。
+        ``QScrollArea``（纵向可滚；横滚条仅在装不下时出现）。
     """
-    scroll = QtWidgets.QScrollArea()
+    _wrap_captions(content, maximum_width)
+    scroll = _FormScroll(maximum_width)
     scroll.setWidget(content)
     scroll.setWidgetResizable(True)
-    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-    needed = (content.minimumSizeHint().width()
-              + scroll.verticalScrollBar().sizeHint().width()
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    # 竖滚动条 + 边框 + 余量：“不裁”要算上这些，视口才不会差几像素（真差这几
+    # 像素，纵向滚动条一出现就又要冒横向滚动条）。
+    chrome = (scroll.verticalScrollBar().sizeHint().width()
               + 2 * scroll.frameWidth() + 4)
-    scroll.setMinimumWidth(min(int(needed), int(maximum_width)))
-    scroll.setMaximumWidth(int(maximum_width))
+    scroll.setMinimumWidth(int(content.minimumSizeHint().width()) + chrome)
     return scroll
 
 

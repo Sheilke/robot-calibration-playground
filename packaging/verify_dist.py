@@ -17,7 +17,9 @@
 ----------
 ``[OK]``   通过。
 ``[FAIL]`` 硬失败，退出码 1。缺一个都意味着包是坏的（大多表现为"图区白屏"）。
-``[WARN]`` 只提示，不影响退出码：体积超预算、多出来的调试资源、两份 plotly.js 不一致。
+         也包括"包里出现了私钥"——那等于把签发权一起发出去了。
+``[WARN]`` 只提示，不影响退出码：体积超预算、多出来的调试资源、两份 plotly.js 不一致、
+         包里没有授权公钥（包能打出来，但客户机上装上也用不了）。
            ——体积超了还能用，白屏不能用，所以两者不同级。
 
 退出码：0 全通过（可能有 WARN）；1 有 FAIL。
@@ -223,6 +225,68 @@ def check_required(dist: Path, internal: Path, rep: Report) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 1b. 离线授权：公钥可以在（缺了只警告），私钥绝不能出现
+# ---------------------------------------------------------------------------
+#: 授权公钥在包里的位置。``laser_desktop.licensing.public_key()`` 冻结后找的是
+#: ``asset_root()/license_public.pem``，也就是 ``_internal/assets/`` 下这一份。
+PUBLIC_KEY_NAME = "license_public.pem"
+
+#: PEM 私钥的头部特征。
+PRIVATE_KEY_MARKERS = (b"PRIVATE KEY-----",)
+
+#: 扫内容时只看这么小的文件。私钥是几百字节的 PEM 文本，没必要为了找它去读
+#: 那 203 MB 的 Qt6WebEngineCore.dll（扫全树体积会让这个脚本慢上好几十秒）。
+KEY_SCAN_MAX_BYTES = 64 * 1024
+
+
+def _looks_like_private_key(path: Path) -> bool:
+    """文件内容像不像 PEM 私钥（只看前 64 KB）。"""
+    try:
+        if path.stat().st_size > KEY_SCAN_MAX_BYTES:
+            return False
+        with path.open("rb") as handle:
+            head = handle.read(KEY_SCAN_MAX_BYTES)
+    except OSError:
+        return False
+    return any(marker in head for marker in PRIVATE_KEY_MARKERS)
+
+
+def check_license_key(dist: Path, internal: Path, rep: Report) -> None:
+    section("1b. 离线授权：公钥可以在，私钥绝不能出现")
+
+    key = internal / "assets" / PUBLIC_KEY_NAME
+    if key.is_file():
+        # PEM 是文本，但读成 bytes 更宽容（带 BOM / CRLF 都无所谓）。
+        blob = key.read_bytes()
+        if b"PUBLIC KEY-----" in blob:
+            rep.ok("授权公钥", f"_internal/assets/{PUBLIC_KEY_NAME}（{len(blob)} B）")
+        else:
+            rep.fail("授权公钥",
+                     f"{key.relative_to(internal)} 在，但内容不像 PEM 公钥——"
+                     "构建时是不是把私钥或者别的文件拷过来了？")
+    else:
+        # 只警告：包能装、能跑，只是客户机上启动会直接报“程序缺少内置公钥”。
+        # 构建机可以没有这把钥（换钥、内测包），但不能不知道。
+        rep.warn("包里没有授权公钥",
+                 f"客户机上装上也用不了（启动就报“程序缺少内置公钥”）。"
+                 f"把 data/assets/{PUBLIC_KEY_NAME} 放好再重新打包")
+
+    # 私钥泄露是灾难级的：拿到它就能自己签任意授权，而且无法撤销。
+    files = [path for path in dist.rglob("*") if path.is_file()]
+    by_name = sorted({p for p in files if "private" in p.name.lower()})
+    by_content = sorted({p for p in files if _looks_like_private_key(p)})
+    leaked = sorted(set(by_name) | set(by_content))
+    if leaked:
+        rep.fail("包里出现了私钥",
+                 "、".join(str(p.relative_to(dist)).replace("\\", "/")
+                          for p in leaked[:3])
+                 + " —— 私钥泄露等于签发权泄露，这个包不能用，改完 spec 重打")
+    else:
+        rep.ok("没有私钥",
+               f"扫了 {len(files)} 个文件：文件名无 private、内容无 “PRIVATE KEY”")
+
+
+# ---------------------------------------------------------------------------
 # 2. 不该出现的东西
 # ---------------------------------------------------------------------------
 def check_forbidden(dist: Path, rep: Report) -> None:
@@ -394,8 +458,16 @@ def check_self_check(dist: Path, timeout: int, rep: Report) -> None:
 
     fails = [line for line in stdout.splitlines() if "[FAIL]" in line]
     oks = [line for line in stdout.splitlines() if "[OK]" in line]
+    # [SKIP] 不是失败：构建机上没装许可证是常态（第 7 项），把它算进 OK 数会
+    # 让“N 项全 OK”与实际项数对不上。
+    skips = [line for line in stdout.splitlines() if "[SKIP]" in line]
     if completed.returncode == 0 and not fails:
-        rep.ok("启动自检", f"{len(oks)} 项全 OK，退出码 0")
+        if skips:
+            rep.ok("启动自检",
+                   f"{len(oks)} 项 OK、{len(skips)} 项跳过"
+                   f"（{skips[0].split(']')[-1].strip()}），退出码 0")
+        else:
+            rep.ok("启动自检", f"{len(oks)} 项全 OK，退出码 0")
     else:
         rep.fail("启动自检",
                  f"退出码 {completed.returncode}，FAIL {len(fails)} 项"
@@ -432,6 +504,7 @@ def main(argv=None) -> int:
         rep.fail("_internal/ 目录",
                  "没有它说明不是 PyInstaller 6 的 onedir 产物（或 contents_directory 被改了）")
     check_required(dist, internal, rep)
+    check_license_key(dist, internal, rep)
     check_forbidden(dist, rep)
     check_sizes(dist, internal, installer, rep)
     if args.skip_self_check:

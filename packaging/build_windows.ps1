@@ -324,6 +324,39 @@ if ($assetSize -lt 3500000) {
 Write-Host ("  [OK] plotly.min.js " + (Format-MB $assetSize)) -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
+# 3b. 授权公钥（离线授权）
+# ---------------------------------------------------------------------------
+# 公钥是**随包发布**的那一半（私钥永远只在签发方的离线机器上）。桌面版启动时
+# 拿它验签 license.json；包里没有公钥，客户机上装完一启动就报
+# 「程序缺少内置公钥，无法校验许可证（安装包可能不完整）」。
+#
+# 这里**只提醒、不失败**：换一把私钥、或先出一个只给内测机的包，都是正常需求。
+# 把“缺公钥”做成硬失败，只会让人临时去注释掉检查；宁可把话说得足够大声。
+Write-Step "公钥检查（离线授权：data\assets\license_public.pem）"
+$pubKeyPath = Join-Path $RepoRoot 'data\assets\license_public.pem'
+if (Test-Path -LiteralPath $pubKeyPath) {
+    $keySize = (Get-Item -LiteralPath $pubKeyPath).Length
+    # 只做最基本的形状检查：Ed25519 公钥（PEM）就是几十到一百多字节的文本。
+    $keyText = Get-Content -LiteralPath $pubKeyPath -Raw -ErrorAction SilentlyContinue
+    if ($null -ne $keyText -and $keyText -match 'PUBLIC KEY-----' -and $keyText -notmatch 'PRIVATE KEY-----') {
+        Write-Host ("  [OK] license_public.pem（" + $keySize + " B）") -ForegroundColor Green
+    } else {
+        Write-Host "  [!] license_public.pem 不像 PEM 公钥（或里面混了 PRIVATE KEY）。" -ForegroundColor Yellow
+        Write-Host "      包里带上它也验不了签，请重新从签发方拷一份公钥。" -ForegroundColor Yellow
+    }
+} else {
+    # 不画边框：中文是全角，手数的 # 永远对不齐，打印出来反而更像出了大事。
+    Write-Host ""
+    Write-Host "  ！ 没有 data\assets\license_public.pem（授权公钥）" -ForegroundColor Yellow
+    Write-Host "    构建继续，但这个包装到客户机上用不了：启动就报" -ForegroundColor Yellow
+    Write-Host "    “程序缺少内置公钥，无法校验许可证（安装包可能不完整）”。" -ForegroundColor Yellow
+    Write-Host "    要交付的话：把签发方的 license_public.pem 放到" -ForegroundColor Yellow
+    Write-Host "      data\assets\license_public.pem" -ForegroundColor Yellow
+    Write-Host "    再重跑本脚本。（私钥千万别放进来：它一泄露，谁都能自己签授权。）" -ForegroundColor Yellow
+    Write-Host ""
+}
+
+# ---------------------------------------------------------------------------
 # 4. 测试
 # ---------------------------------------------------------------------------
 Write-Step "跑测试（pytest python -q；红的代码不许打包）"
