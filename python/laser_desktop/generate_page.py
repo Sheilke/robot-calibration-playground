@@ -1411,7 +1411,7 @@ class GeneratePage(QtWidgets.QWidget):
         return scroll
 
     def _build_preview_card(self) -> QtWidgets.QGroupBox:
-        """预览卡片：体积 / 格点 / 总点数 / 设计条件数 / 欧拉约定 + 报错原文。
+        """预览卡片：边长 / 格点 / 总点数 / 设计条件数 / 欧拉约定 + 报错原文。
 
         S6c 两处收口：
 
@@ -1715,7 +1715,7 @@ class GeneratePage(QtWidgets.QWidget):
         self.error_label.hide()
         grid = result["grid"]
         over = int(result["point_count"]) > POINT_COUNT_WARN
-        self.metric_labels["volume"].setText(f"{result['volume_m3']:.3f} m³")
+        self.metric_labels["edges"].setText(page_layout.edge_text(result))
         insert = (f" + {grid['zs'] * grid['z_insert']} 插点"
                   if grid["z_insert"] else "")
         self.metric_labels["grid"].setText(

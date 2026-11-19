@@ -272,7 +272,8 @@ class WidgetDefaultsTest(PageTest):
 
     def test_initial_preview_is_the_fifty_point_sample(self):
         self.assertEqual(self.page.total.count, 50)
-        self.assertEqual(self.page.metric_labels["volume"].text(), "0.442 m³")
+        self.assertEqual(self.page.metric_labels["edges"].text(),
+                         "0.550 × 1.200 × 0.670 m")
         self.assertEqual(self.page.metric_labels["grid"].text(), "2×5×5")
         self.assertTrue(self.page.generate_button.isEnabled())
 
@@ -396,7 +397,7 @@ class InvalidInputTest(PageTest):
         self.assertFalse(page.generate_button.isEnabled())
         # 预览卡片的数值全部退回 —；网格组的"总点数"仍按公式直算（与网页版一致：
         # 域非法不影响"这组格点会生成多少点"这件事本身）
-        for key in ("volume", "grid", "points", "design", "euler"):
+        for key in ("edges", "grid", "points", "design", "euler"):
             self.assertEqual(page.metric_labels[key].text(), "—", key)
         self.assertEqual(page.total.count, 50)
         self.assertEqual(page.total_value.text(), "50 点（2×5×5 格点）")
@@ -409,7 +410,8 @@ class InvalidInputTest(PageTest):
         page.fields["x_min"].setValue(750.0)
         self.assertTrue(page.error_label.isHidden())
         self.assertTrue(page.generate_button.isEnabled())
-        self.assertEqual(page.metric_labels["volume"].text(), "0.442 m³")
+        self.assertEqual(page.metric_labels["edges"].text(),
+                         "0.550 × 1.200 × 0.670 m")
 
     def test_zero_perturbation_is_rejected_by_core(self):
         """扰动半宽 0 是界面填得出来的值，判定仍归 core（不在这里写规则）。"""
@@ -569,7 +571,7 @@ class PreviewFailureTest(PageTest):
         self.assertTrue(page.error_label.text())
         self.assertIs(page.preview_result()["ok"], False)
         self.assertFalse(page.generate_button.isEnabled())
-        for key in ("volume", "grid", "points", "design", "euler"):
+        for key in ("edges", "grid", "points", "design", "euler"):
             self.assertEqual(page.metric_labels[key].text(), "—", key)
         self.assertIsNone(page.total.count)
         self.assertEqual(page.total.text, "—")

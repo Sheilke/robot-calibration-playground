@@ -208,9 +208,10 @@ points_text = page.metric_labels["points"].text()
 step("预览卡片有总点数", "点" in points_text and page.total.count == 50,
      f"卡片={points_text!r} 网格组={page.total_value.text()!r} "
      f"格点={page.metric_labels['grid'].text()!r}")
-step("预览卡片体积/条件数", "m³" in page.metric_labels["volume"].text()
+step("预览卡片边长/条件数", page.metric_labels["edges"].text().endswith(" m")
+     and page.metric_labels["edges"].text().count("×") == 2
      and page.metric_labels["design"].text() != "—",
-     f"体积={page.metric_labels['volume'].text()!r} "
+     f"边长={page.metric_labels['edges'].text()!r} "
      f"条件数={page.metric_labels['design'].text()!r}")
 step("生成按钮可用（参数合法）", page.generate_button.isEnabled(),
      f"enable={page.generate_button.isEnabled()}")

@@ -273,9 +273,10 @@ def preview_domain(params: dict) -> dict:
     bounds = [float(args.x_min), float(args.x_max),
               float(args.y_min), float(args.y_max),
               float(args.z_min), float(args.z_max)]
-    volume_mm3 = ((args.x_max - args.x_min)
-                  * (args.y_max - args.y_min)
-                  * (args.z_max - args.z_min))
+    spans_mm = (args.x_max - args.x_min,
+                args.y_max - args.y_min,
+                args.z_max - args.z_min)
+    volume_mm3 = spans_mm[0] * spans_mm[1] * spans_mm[2]
     # _resolve_grid 已归一化网格；target_count 模式下 choose_grid 已在其中执行。
     grid = {"xs": int(args.xs), "ys": int(args.ys), "zs": int(args.zs),
             "z_insert": int(args.z_insert or 0)}
@@ -287,6 +288,9 @@ def preview_domain(params: dict) -> dict:
 
     return {"ok": True,
             "bounds": bounds,
+            # 三边长度（米）：预览卡显示的是"这个盒子多大"，比体积直观 ——
+            # 0.550 × 1.200 × 0.670 立刻能对上现场的卷尺，0.442 m³ 不能。
+            "edges_m": [round(span / 1000.0, 3) for span in spans_mm],
             "volume_m3": round(volume_mm3 / _MM3_PER_M3, 3),
             "grid": grid,
             "point_count": int(point_count),

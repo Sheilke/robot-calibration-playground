@@ -7,7 +7,7 @@
 2. 两点式与六数式的预览结果完全一致；
 3. ``target_count=50`` 的网格与 ``choose_grid`` 的真实返回值一致；
 4. 非法输入返回 ``ok: False`` + 报错原文，不抛异常；
-5. 体积与手算一致；
+5. 体积与手算一致（界面上显示的是三边长度，体积仍留在结果里）；
 6. ``form_to_namespace`` 的缺失项填的是 CLI 默认值。
 """
 
@@ -140,6 +140,8 @@ class PreviewDomainTest(unittest.TestCase):
         expected = 550.0 * 1200.0 * 670.0 / 1e9
         self.assertAlmostEqual(result["volume_m3"], expected, delta=1e-3)
         self.assertAlmostEqual(result["volume_m3"], 0.4422, delta=1e-3)
+        # 预览卡显示三边（米）而不是体积：现场拿卷尺量的是 X/Y/Z
+        self.assertEqual(result["edges_m"], [0.55, 1.2, 0.67])
 
     def test_invalid_inputs_return_error_without_raising(self):
         """非法输入返回 ok=False 与 CLI 报错原文，绝不抛异常。"""

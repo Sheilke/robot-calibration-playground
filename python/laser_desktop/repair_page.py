@@ -11,7 +11,7 @@
    job=job, on_progress=job.set_progress))``，进度 / 日志 / 取消 / 终态全部走
    :class:`laser_desktop.job_bridge.JobBridge` 的三条信号（与 S3 同一套线程模型）；
 3. **结果区**：``QTabWidget`` 五页签——定位（判定徽标 + 段定位表）/ 修复
-   （模式、边界 before→after、体积损失、局部改动、前后指标、候选日志）/ 计划
+   （模式、边界 before→after、采样域缩小、局部改动、前后指标、候选日志）/ 计划
    （统计行 + 路点表）/ 段诊断（修复后计划的段裕度，S6 从「计划」拆出来）/ 日志；
 4. **导出**：``scan.json`` / ``joints.txt`` / ``plot.png`` / ``repair.json`` 从
    ``run_dir`` **复制**（文件名带 ``<run_id>-`` 前缀），与生成页同一个实现
@@ -793,7 +793,7 @@ class RepairPage(QtWidgets.QWidget):
 
     # -------------------------------------------------------- 右侧：预览 + 结果
     def _build_preview_card(self) -> QtWidgets.QGroupBox:
-        """预览卡片：体积 / 格点 / 总点数 / 设计条件数 / 欧拉约定 + 报错原文。
+        """预览卡片：边长 / 格点 / 总点数 / 设计条件数 / 欧拉约定 + 报错原文。
 
         S6c 两处收口（与生成页同一份做法）：
 
@@ -954,7 +954,7 @@ class RepairPage(QtWidgets.QWidget):
         return scroll
 
     def _build_compare_page(self) -> QtWidgets.QScrollArea:
-        """「修复」页：模式徽标 / 体积损失 / 边界表 / 局部改动 / 前后指标 / 候选日志。"""
+        """「修复」页：模式徽标 / 采样域缩小 / 边界表 / 局部改动 / 前后指标 / 候选日志。"""
         content = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1217,7 +1217,7 @@ class RepairPage(QtWidgets.QWidget):
             return
         self.error_label.hide()
         grid = result["grid"]
-        self.preview_labels["volume"].setText(f"{result['volume_m3']:.3f} m³")
+        self.preview_labels["edges"].setText(page_layout.edge_text(result))
         insert = (f" + {grid['zs'] * grid['z_insert']} 插点"
                   if grid["z_insert"] else "")
         self.preview_labels["grid"].setText(
@@ -1486,7 +1486,7 @@ class RepairPage(QtWidgets.QWidget):
 
     # ------------------------------------------------------------ 修复结果渲染
     def _render_compare(self, repair: dict) -> None:
-        """模式徽标 / 体积损失 / 边界 before→after / 局部改动 / 前后指标。"""
+        """模式徽标 / 采样域缩小 / 边界 before→after / 局部改动 / 前后指标。"""
         mode = repair.get("mode")
         self.mode_badge.setText(mode_text(mode))
         self.mode_badge.setStyleSheet(
@@ -1494,12 +1494,12 @@ class RepairPage(QtWidgets.QWidget):
             "border-radius:8px; padding:2px 10px; font-weight:bold;")
         self.mode_badge.show()
         self.label_value.setText(str(repair.get("label") or "—"))
-        # 没有体积损失数据就写「—」，不把“没数据”说成“0 损失”。
+        # 没有"缩小了多少"的数据就写「—」，不把“没数据”说成“0 损失”。
         # 百分比要用 ``.2%``（0.1234 -> 12.34%），所以不能直接套 :func:`_fmt`
         # 的定点格式（那会把 0.1234 写成 0.12）。
         loss = repair.get("volume_loss")
         self.volume_label.setText(
-            "体积损失 —" if loss is None else f"体积损失 {float(loss):.2%}")
+            "采样域缩小 —" if loss is None else f"采样域缩小 {float(loss):.2%}")
         # ``mode=none`` = 一整份都没动：前后必然相同的 6 行数字没有任何信息，
         # 换成一句说明（其它模式照旧出表）
         unchanged = mode == "none"

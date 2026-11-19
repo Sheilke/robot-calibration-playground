@@ -104,7 +104,7 @@ PLOT_RESULT_RATIOS = (45, 55)
 
 #: 生成 / 修复两页预览卡里的五项数值（同一份，别两边各写一套）：
 #: ``设计条件数`` 是判断"可行 / 不可行"的依据，必须在首屏就能看到。
-PREVIEW_METRICS = (("volume", "体积"), ("grid", "格点 X×Y×Z"),
+PREVIEW_METRICS = (("edges", "边长 X×Y×Z"), ("grid", "格点 X×Y×Z"),
                    ("points", "总点数"), ("design", "设计条件数"),
                    ("euler", "欧拉约定"))
 
@@ -1360,3 +1360,23 @@ def _parse_ratios(raw, count: int = 3, default=DEFAULT_SPLIT_RATIOS):
     if any(value <= 0 for value in values):
         return None
     return _normalize(values, count, default)
+
+
+def edge_text(result: dict) -> str:
+    """预览卡里的盒子尺寸：``0.550 × 1.200 × 0.670 m``。
+
+    为什么显示三边而不是体积：``0.442 m³`` 没人能在现场对照，三边长度却能直接
+    和卷尺量到的 X/Y/Z 行程对上。体积仍在 ``core.preview_domain`` 的结果里
+    （修复页要用它算"收缩了多少"），只是不再占预览卡的一行。
+
+    Args:
+        result: ``core.preview_domain`` 的返回值（用其 ``edges_m``）。
+
+    Returns:
+        str: 形如 ``0.550 × 1.200 × 0.670 m``；数据缺失时给 ``—``（绝不显示 0，
+            那会让人以为盒子是平的）。
+    """
+    edges = result.get("edges_m")
+    if not edges or len(edges) != 3 or any(edge is None for edge in edges):
+        return "—"
+    return " × ".join(f"{float(edge):.3f}" for edge in edges) + " m"

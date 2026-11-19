@@ -6,7 +6,7 @@
 
 * 判定徽标：``kind`` -> 中文名（``_KIND_LABEL``）、有效阈值、禁区数量；
 * 段定位表：行数 = profiles 数、**报告段黄底**、越界段**红底**；
-* 修复前后对比：``mode`` 徽标文案、边界表里变化的轴高亮、体积损失百分比、
+* 修复前后对比：``mode`` 徽标文案、边界表里变化的轴高亮、采样域缩小百分比、
   局部修复的 ``GP`` / ``delta_rpy`` / ``q`` 前后、``before/after`` 指标对照；
 * 候选日志：行数、失败行红字；
 * 计划：路点表 / 段诊断表 / 统计标签（复用生成页的渲染器）；
@@ -349,7 +349,7 @@ class RepairRenderTest(PageCase):
         self.assertEqual(self.page.mode_badge.text(), "局部修复（只换端点姿态）")
         self.assertFalse(self.page.mode_badge.isHidden())
         self.assertEqual(self.page.label_value.text(), "重采 GP4 的姿态")
-        self.assertEqual(self.page.volume_label.text(), "体积损失 0.00%")
+        self.assertEqual(self.page.volume_label.text(), "采样域缩小 0.00%")
 
         # 局部修复：GP / delta_rpy / q 前后
         self.assertFalse(self.page.local_group.isHidden())
@@ -374,7 +374,7 @@ class RepairRenderTest(PageCase):
         self.page.render_result(result)
 
         self.assertEqual(self.page.mode_badge.text(), "整体挪动采样域")
-        self.assertEqual(self.page.volume_label.text(), "体积损失 12.34%")
+        self.assertEqual(self.page.volume_label.text(), "采样域缩小 12.34%")
         table = self.page.bound_table
         changed = color_name(repair_page._CHANGED_BG)
         highlighted = [row for row in range(6)
@@ -544,16 +544,16 @@ class DataGapTest(PageCase):
         repair = make_repair(mode="domain", moved=True)
         repair["volume_loss"] = None
         self.page.render_repair(repair)
-        self.assertEqual(self.page.volume_label.text(), "体积损失 —")
+        self.assertEqual(self.page.volume_label.text(), "采样域缩小 —")
         self.assertNotIn("0.00%", self.page.volume_label.text())
         repair.pop("volume_loss")               # 键干脆不存在也一样
         self.page.render_repair(repair)
-        self.assertEqual(self.page.volume_label.text(), "体积损失 —")
+        self.assertEqual(self.page.volume_label.text(), "采样域缩小 —")
 
     def test_zero_volume_loss_still_reads_zero(self):
         """真的 0 损失还是 0.00%（“没数据”与“零损失”不能混为一谈）。"""
         self.page.render_repair(make_repair(mode="local"))
-        self.assertEqual(self.page.volume_label.text(), "体积损失 0.00%")
+        self.assertEqual(self.page.volume_label.text(), "采样域缩小 0.00%")
 
     def test_missing_delta_rpy_does_not_crash(self):
         repair = make_repair(mode="local")

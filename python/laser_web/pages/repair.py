@@ -7,7 +7,7 @@
    有效阈值、窗口剖面表与一句话结论——这一步**不改任何参数、不落盘**；
 2. **修复**：``jobs.submit("repair", ...)`` 起后台任务（``core.run_repair``），
    进度条 / 日志 / 取消沿用 M2 的那套轮询；
-3. **结果区**：修复前后对比（模式、边界、体积损失、局部改的是哪个 GP）、候选
+3. **结果区**：修复前后对比（模式、边界、采样域缩小、局部改的是哪个 GP）、候选
    日志（默认收起）、以及「修复后的计划」（统计卡 + 3D 图 + 路点表 + 段诊断）。
 
 M2 的渲染器（路点行 / 段行 / 3D 图 / 表格列定义 / 失败行模板）直接从
@@ -228,6 +228,14 @@ def _result_mode(located, result, locate_error) -> str:
     return "empty" if located is None else "ok"
 
 
+def _edge_text(result: dict) -> str:
+    """盒子三边长度（米）；与生成页同一口径。"""
+    edges = result.get("edges_m")
+    if not edges or len(edges) != 3:
+        return "—"
+    return " × ".join(f"{float(edge):.3f}" for edge in edges) + " m"
+
+
 def render() -> None:
     """渲染奇异修复页（表单 + 定位 / 修复 + 结果区）。"""
     defaults = default_form_values()
@@ -324,7 +332,7 @@ def render() -> None:
 
     @ui.refreshable
     def preview_card() -> None:
-        """预览卡片：体积 / 网格 / 点数（复用 ``core.preview_domain``）。"""
+        """预览卡片：边长 / 网格 / 点数（复用 ``core.preview_domain``）。"""
         result = core.preview_domain(collect())
         with ui.card().classes("w-full gap-1"):
             ui.label("采样域预览（不跑 IK）").classes("text-subtitle1")
@@ -334,8 +342,8 @@ def render() -> None:
                 return
             grid = result["grid"]
             with ui.grid(columns=2).classes("w-full gap-x-4"):
-                ui.label("体积").classes("text-grey-7")
-                ui.label(f"{result['volume_m3']:.3f} m³")
+                ui.label("边长 X×Y×Z").classes("text-grey-7")
+                ui.label(_edge_text(result))
                 ui.label("格点 X×Y×Z").classes("text-grey-7")
                 ui.label(f"{grid['xs'] + 1}×{grid['ys'] + 1}×{grid['zs'] + 1}")
                 ui.label("点数").classes("text-grey-7")
@@ -712,7 +720,7 @@ def render() -> None:
             table.add_slot("body-row", _PROFILE_ROW_SLOT)
 
     def _compare_card(repair: dict) -> None:
-        """修复前后对比：模式 / label / 边界 / 体积损失 / 局部改动。"""
+        """修复前后对比：模式 / label / 边界 / 采样域缩小 / 局部改动。"""
         mode = repair.get("mode")
         mode_color = {"none": "grey-7", "local": "teal-7",
                       "domain": "indigo-7"}.get(mode, "grey-7")
@@ -723,7 +731,7 @@ def render() -> None:
                 ui.label("修复结果").classes("text-subtitle1")
                 ui.chip(mode_text, icon="build", color=mode_color)
                 ui.label(repair.get("label") or "—").classes("text-body1")
-            ui.label(f"体积损失 {float(repair.get('volume_loss') or 0.0):.2%}"
+            ui.label(f"采样域缩小 {float(repair.get('volume_loss') or 0.0):.2%}"
                      ).classes("text-caption text-grey-7")
             ui.table(
                 columns=[{"name": "axis", "label": "边界", "field": "axis",

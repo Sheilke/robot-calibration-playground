@@ -6,7 +6,7 @@
 
 * **主操作按钮被裁**：修复页「定位段」「修复」被预览卡的上边缘切掉半截
   （生成页「生成并解算」也是半截），ISO 页「生成五点」在表单滚动区里滚出去；
-* **预览卡内容看不到**：`体积` 之后，`格点 / 总点数 / 设计条件数 / 欧拉约定`
+* **预览卡内容看不到**：`边长` 之后，`格点 / 总点数 / 设计条件数 / 欧拉约定`
   全部要滚动才出现——而「设计条件数」正是判断"可行 / 不可行"的依据。
 
 根因是同一个：按钮和数值都住在**可滚动的预览卡**里，卡片又被
@@ -44,10 +44,10 @@ _APP = None
 #: 导航下标（``main_window.PAGES`` 的顺序）。
 NAV_ROW = {"generate": 0, "repair": 1, "iso": 2}
 
-#: 预览卡里的五项数值：生成 / 修复 = 体积…欧拉约定；ISO = 立方体…截面。
+#: 预览卡里的五项数值：生成 / 修复 = 边长…欧拉约定；ISO = 立方体…截面。
 METRIC_KEYS = {
-    "generate": ("volume", "grid", "points", "design", "euler"),
-    "repair": ("volume", "grid", "points", "design", "euler"),
+    "generate": ("edges", "grid", "points", "design", "euler"),
+    "repair": ("edges", "grid", "points", "design", "euler"),
     "iso": ("cube", "apothem", "center", "layout", "plane"),
 }
 

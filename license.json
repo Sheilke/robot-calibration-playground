@@ -1,0 +1,16 @@
+{
+  "payload": {
+    "v": 1,
+    "licensee": "内部开发机",
+    "serial": "DEV-0001",
+    "issued": "2026-11-19",
+    "expires": "2027-12-31",
+    "fingerprints": [
+      "7fee1a02efc75994aa0d39eb313e6dae",
+      "983ccc886790fcaaf2058395ddb725ee"
+    ],
+    "min_match": 1,
+    "features": []
+  },
+  "sig": "qWMecfX+yMiUq0PzsYQBvFySFkVEB9pbOyRfmmjjXA47H0NLweeTuTuygdrUR+g88bvdDb2v4PujJJlwfA6yAQ=="
+}

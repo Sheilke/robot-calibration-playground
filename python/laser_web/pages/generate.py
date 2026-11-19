@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """生成页：机器人模型 + 采样域表单 + 即时预览 + **后台解算与结果渲染**。
 
-M1 只做「改动即刷新」的只读预览（体积 / 网格 / 点数 / 设计条件数，约 1 ms）；
+M1 只做「改动即刷新」的只读预览（边长 / 网格 / 点数 / 设计条件数，约 1 ms）；
 M2 把两个按钮接上真活儿（设计文档 §5.1 / §8）：
 
 * 「生成并解算」→ ``jobs.submit`` 起后台任务（``core.run_scan``），
@@ -175,6 +175,14 @@ def _figure_for(result: dict, color_by: str):
         all_ok=bool(result["meta"].get("skip_ik")))
 
 
+def _edge_text(result: dict) -> str:
+    """盒子三边长度（米）。显示边长而不是体积：现场拿卷尺量的是 X/Y/Z。"""
+    edges = result.get("edges_m")
+    if not edges or len(edges) != 3:
+        return "—"
+    return " × ".join(f"{float(edge):.3f}" for edge in edges) + " m"
+
+
 def render() -> None:
     """渲染生成页（含 M2 的后台解算与结果区）。"""
     defaults = default_form_values()
@@ -308,7 +316,7 @@ def render() -> None:
 
     @ui.refreshable
     def preview_card() -> None:
-        """预览卡片：体积 / 网格 / 点数 / 设计条件数，或一行红字报错。"""
+        """预览卡片：边长 / 网格 / 点数 / 设计条件数，或一行红字报错。"""
         result = _preview()
         with ui.card().classes("w-full gap-1"):
             ui.label("预览（不跑 IK）").classes("text-subtitle1")
@@ -321,8 +329,8 @@ def render() -> None:
             insert = (f" + {grid['zs'] * grid['z_insert']} 插点"
                       if grid["z_insert"] else "")
             with ui.grid(columns=2).classes("w-full gap-x-4"):
-                ui.label("体积").classes("text-grey-7")
-                ui.label(f"{result['volume_m3']:.3f} m³")
+                ui.label("边长 X×Y×Z").classes("text-grey-7")
+                ui.label(_edge_text(result))
                 ui.label("格点 X×Y×Z").classes("text-grey-7")
                 ui.label(f"{cells}{insert}")
                 ui.label("点数").classes("text-grey-7")
