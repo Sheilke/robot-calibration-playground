@@ -22,3 +22,10 @@ nohup.out
 
 # 桌面版/网页版的运行时缓存（plotly.min.js 等，可删可重建）
 .cache/
+
+# 许可证与密钥：签发方资产，不进仓库
+# - license.json 每台机器一份（绑定物理网卡指纹），属于交付物而不是代码；
+# - license_public.pem 由签发方生成、随安装包分发；仓库里留的是"构建机上的那一份"
+#   的副本很容易被误当成权威版本，所以不入库（打包脚本缺它时会明确提示）。
+license.json
+license_public.pem
