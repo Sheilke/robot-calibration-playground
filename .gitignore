@@ -32,3 +32,7 @@ license_public.pem
 
 # 打包时由 packaging/desktop.spec 生成的"编进代码的公钥"（构建产物）
 python/laser_desktop/_embedded_key.py
+
+# 崩溃日志（运行期产物，不进仓库）
+crash.log
+python/laser_desktop/_embedded_key.py
