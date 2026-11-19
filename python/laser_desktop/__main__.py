@@ -85,6 +85,7 @@ def main(argv=None) -> int:
 
     configure_webengine_environment()      # 必须在建 QApplication 之前
     paths.ensure_writable_roots()
+    _install_crash_log()                   # 建窗口之前装好：之后的异常都有落点
 
     app = QtWidgets.QApplication(args)
     family = apply_chinese_font(app)
@@ -96,6 +97,35 @@ def main(argv=None) -> int:
           + ("（仅供本地验证）" if DEV_ONLY_BINDING else "")
           + f"，中文字体 {family}；许可证 {gate.message}")
     return app.exec()
+
+
+def _install_crash_log() -> None:
+    """未捕获异常写进 ``data_root()/crash.log``。
+
+    为什么必须有：冻结包是 ``--windowed``，没有控制台，入口脚本又把 stdout/stderr
+    接到了 ``os.devnull``。于是任何 Traceback 都**凭空消失**——现场只能看到
+    "点了一下，没反应"，我们这边连是哪一行都不知道（``ModuleNotFoundError:
+    No module named 'unittest'`` 就是这样报过来的：只有一行字，没有栈）。
+
+    写文件而不是弹框为主：文件能在电话里让对方直接把内容发过来；弹框会挡住
+    界面，而且长 Traceback 在 QMessageBox 里读不了。
+    """
+    import traceback
+
+    def _write(exc_type, exc_value, exc_tb) -> None:
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            target = paths.data_root() / "crash.log"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write("\n==== " + BINDING + " 崩溃 ====\n" + text)
+            where = str(target)
+        except Exception:                   # noqa: BLE001 - 连写日志都失败就算了
+            where = "(日志也写不出来)"
+        _LOGGER.error("未捕获异常，已写入 %s\n%s", where, text)
+        sys.stderr.write(f"程序出错，详情已写入 {where}\n")
+
+    sys.excepthook = _write
 
 
 def _print_paths() -> None:

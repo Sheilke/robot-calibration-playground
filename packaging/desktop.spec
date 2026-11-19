@@ -337,7 +337,11 @@ excludes = [
     "nicegui",
     # 标准库里体积大且完全用不到的部分
     "tkinter", "_tkinter", "turtle", "turtledemo",
-    "test", "unittest", "doctest", "pydoc", "idlelib", "lib2to3",
+    "test", "idlelib", "lib2to3",
+    # **不排除 unittest / doctest**：它们只有几百 KB，但很多库会在某条分支里
+    # 延迟 import 它（`unittest.mock` 尤其常见）。排除掉换来的体积可以忽略，
+    # 代价是"平时跑得好好的，走到某个按钮才 ModuleNotFoundError"。实测就撞过：
+    # 打出来的包在某条路径上报 `No module named 'unittest'`。
     # 只在开发/测试时用的
     "pytest", "_pytest", "IPython", "Sphinx",
     # 反向确认：**不要**两套 Qt 绑定同时进包（PyInstaller 的

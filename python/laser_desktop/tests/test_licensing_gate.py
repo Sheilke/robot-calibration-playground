@@ -603,3 +603,22 @@ class PublicKeySwallowTest(GateTestBase):
         """源码运行不受影响（开发机不该为了跑界面先造密钥对）。"""
         with mock.patch.object(gate.paths, "is_frozen", return_value=False):
             self.assertTrue(gate.public_key())
+
+
+class CrashLogTest(unittest.TestCase):
+    """未捕获异常必须留下 ``crash.log``（冻结包没有控制台，否则什么都看不到）。"""
+
+    def test_excepthook_writes_the_traceback(self):
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        from laser_desktop import __main__ as entry
+        with mock.patch.object(entry.paths, "data_root", return_value=tmp):
+            entry._install_crash_log()
+            try:
+                raise RuntimeError("故意制造的异常")
+            except RuntimeError:
+                sys.excepthook(*sys.exc_info())
+        log = tmp / "crash.log"
+        self.assertTrue(log.is_file(), "没有写出 crash.log")
+        text = log.read_text(encoding="utf-8")
+        self.assertIn("RuntimeError: 故意制造的异常", text)
+        self.assertIn("Traceback", text)
