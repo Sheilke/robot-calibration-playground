@@ -30,8 +30,12 @@
 ; 没有就用 /DChineseISL=0 关掉中文，只装英文向导——不会因为缺一个翻译文件
 ; 就编译失败。手工编译时若报"无法读取 Languages\ChineseSimplified.isl"，
 ; 同样加 /DChineseISL=0。
+; **默认关**。理由：默认开会让"手工跑一次 ISCC"直接编译失败（报"无法读取
+; Languages\ChineseSimplified.isl"），而那种失败看起来像 .iss 写错了，实际只是
+; 少一个可选翻译文件。默认关 = 缺文件也能出英文向导包；build_windows.ps1 检查到
+; 有这个文件时自己传 /DChineseISL=1 打开中文。
 #ifndef ChineseISL
-  #define ChineseISL 1
+  #define ChineseISL 0
 #endif
 
 #define AppName "标定路点工具"
