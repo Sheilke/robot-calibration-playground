@@ -276,8 +276,23 @@ def check_license_key(dist: Path, internal: Path, rep: Report) -> None:
                "冻结运行时只用编进代码的那把；是否编进去了由 --self-check 的第 7 项判定")
 
     # 私钥泄露是灾难级的：拿到它就能自己签任意授权，而且无法撤销。
+    #
+    # 判据要**准**而不是广：早先"文件名里有 private 就算"直接误报了三个真文件——
+    #   api-ms-win-crt-private-l1-1-0.dll（Windows CRT 的私有 API 库）
+    #   QmlAssetDownloaderPrivateplugin_init.cpp.obj（Qt 的编译中间产物）
+    # 名字里带 private 的合法二进制太多了。现在只认两类：
+    #   1) 内容像 PEM 私钥（扫前 64 KB 找 "PRIVATE KEY-----"）——这是硬证据；
+    #   2) 扩展名是 .pem/.key 且文件名带 private/id_rsa/id_ed25519——这才是我们的私钥命名。
     files = [path for path in dist.rglob("*") if path.is_file()]
-    by_name = sorted({p for p in files if "private" in p.name.lower()})
+
+    def _private_by_name(path: Path) -> bool:
+        name = path.name.lower()
+        if path.suffix.lower() not in (".pem", ".key"):
+            return False
+        return ("private" in name or name.startswith("id_rsa")
+                or name.startswith("id_ed25519") or "privkey" in name)
+
+    by_name = sorted({p for p in files if _private_by_name(p)})
     by_content = sorted({p for p in files if _looks_like_private_key(p)})
     leaked = sorted(set(by_name) | set(by_content))
     if leaked:
@@ -287,7 +302,8 @@ def check_license_key(dist: Path, internal: Path, rep: Report) -> None:
                  + " —— 私钥泄露等于签发权泄露，这个包不能用，改完 spec 重打")
     else:
         rep.ok("没有私钥",
-               f"扫了 {len(files)} 个文件：文件名无 private、内容无 “PRIVATE KEY”")
+               f"扫了 {len(files)} 个文件：没有 PEM 私钥内容、"
+               f"也没有 *.pem/*.key 的私钥命名")
 
 
 # ---------------------------------------------------------------------------
@@ -307,13 +323,26 @@ def check_forbidden(dist: Path, rep: Report) -> None:
         rep.ok("没有 data/configs/robot_sim/", "仿真器控制器 JSON 不属于交付资产")
 
     # tests 目录 / 测试模块：+几 MB 而且会把用户的运行目录搞混。
-    test_dirs = [p for p in dist.rglob("*")
-                 if p.is_dir() and p.name in ("tests", "test", "testing")]
+    #
+    # 只认**我们自己的** tests：第三方库自带 `matplotlib/testing`、`plotly/testing`
+    # 这类目录是它们的正常组成部分，不是"打包漏了排除"。早先按目录名匹配，于是
+    # `_internal/matplotlib/testing` 被当成我们的测试目录，报了一条假 FAIL。
+    ours = {"laser_web", "laser_desktop", "excitation_trajectory",
+            "robot_model", "handeye", "licensing"}
+    test_dirs = []
+    for path in dist.rglob("*"):
+        if not path.is_dir() or path.name not in ("tests", "test"):
+            continue
+        parts = [part.lower() for part in path.relative_to(dist).parts]
+        # 顶层 tests/（仓库根拷进来的）或 _internal/<我们的包>/tests
+        if "tests" == parts[-1] or "test" == parts[-1]:
+            if len(parts) == 1 or parts[0] in ours or any(p in ours for p in parts):
+                test_dirs.append(path)
     if test_dirs:
         rep.fail("tests/ 被打进去了",
                  "、".join(str(p.relative_to(dist)) for p in test_dirs[:3]))
     else:
-        rep.ok("没有 tests/ 目录", "")
+        rep.ok("没有 tests/ 目录", "包括 matplotlib/testing 这类第三方自带目录也不算")
 
     test_modules = [p for p in dist.rglob("@test_*.pyc")] + \
                    [p for p in dist.rglob("test_*.pyc")]

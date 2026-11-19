@@ -417,7 +417,15 @@ def _slim(toc, label):
         path = str(entry[1]).replace("\\", "/")
         base = os.path.basename(name or path)
         drop = False
-        if path.endswith(".debug.pak") or path.endswith(".debug.bin"):
+        # Qt 的 wheel 里带着 **对象文件与调试构建目录**：`objects-Debug/`、
+        # `objects-RelWithDebInfo/`、`*.obj`。它们是编译中间产物，运行期一个都
+        # 用不到，但会占几十 MB（实测解压目录比预期多 30+ MB），而且 `*.obj`
+        # 里带着 "PRIVATE" 字样，会让"包里有没有私钥"这类名字扫描误报。
+        if (".obj" in base.lower() or "/objects-debug/" in path.lower()
+                or "/objects-relwithdebinfo/" in path.lower()
+                or "/objects-release/" in path.lower()):
+            drop = True
+        elif path.endswith(".debug.pak") or path.endswith(".debug.bin"):
             drop = True
         elif "qtwebengine_devtools_resources" in base:
             drop = True
