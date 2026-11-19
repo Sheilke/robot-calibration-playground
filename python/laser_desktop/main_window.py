@@ -31,7 +31,7 @@ from . import page_layout, paths
 from .generate_page import GeneratePage, build_preview_figure
 from .iso_page import IsoPage
 from .plot_view import PlotHost
-from .qt_compat import BINDING, DEV_ONLY_BINDING, Qt, QtWidgets
+from .qt_compat import BINDING, DEV_ONLY_BINDING, Qt, QtCore, QtWidgets
 from .repair_page import RepairPage
 from .tools_page import ToolsPage
 
@@ -48,6 +48,36 @@ def _short_path(path) -> str:
     if home and text.startswith(home) and text != home:
         return "~" + text[len(home):]
     return text
+
+
+class _NavHolder(QtWidgets.QWidget):
+    """导航列的容器：由它回答「我想多宽」，而不是让 ``QListWidget`` 回答。
+
+    问题出在 ``QListWidget.sizeHint``：它对任何列表都报 256 px，而导航只需要
+    92 px。``QSplitter`` 按子控件的 sizeHint 分初始槽位，于是导航右边白白空出
+    164 px，表单和图各少拿 164 px。
+
+    所以导航不直接进分割器，而是套一层：holder 的 ``sizeHint`` 报我们真正想要
+    的宽度（最长项宽度，或用户上次拖到的宽度）。导航自己的 ``minimumWidth``
+    守住「不许窄到切字」，而 ``maximumWidth`` **不设**——不设才能继续拖宽。
+    """
+
+    def __init__(self, nav: QtWidgets.QListWidget, width: int) -> None:
+        super().__init__()
+        self._width = max(0, int(width))
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(nav)
+
+    def set_preferred_width(self, width: int) -> None:
+        """记住新的「首选宽度」（用户拖完之后调用，下次打开就用它）。"""
+        self._width = max(0, int(width))
+        self.updateGeometry()
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt 接口
+        hint = super().sizeHint()
+        return QtCore.QSize(self._width, hint.height())
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -76,29 +106,44 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.nav = QtWidgets.QListWidget()
         self.nav.addItems(PAGES)
-        # 宽度不能钉死：NAV_WIDTH 是 96 dpi 下量的，字体一大就切字（见 _nav_width）
-        self.nav.setFixedWidth(self._nav_width())
-        # 宽度就是按最长一项算的，横滚条只会在字体量不准时冒出来白占高度
+        # 宽度：**下限**是不切字的宽度，上限不限 —— 用户想拖宽就拖宽（见 _on_nav_moved）。
+        # 不能 setFixedWidth：那会把侧边栏钉死，往右拖没反应，往左拖到极限时
+        # 整块被压成 0（用户看到的就是"缩小时直接消失"）。
+        fitted = self._nav_width()
+        self.nav.setMinimumWidth(fitted)
+        # 宽度下限就是按最长一项算的，横滚条只会在字体量不准时冒出来白占高度
         self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.stack = QtWidgets.QStackedWidget()
 
         # 导航不能直接 addWidget 进分割器：``QListWidget.sizeHint()`` 是 256 px，
-        # ``QSplitter`` 按 sizeHint 分槽位，而控件被 ``setFixedWidth`` 钉在 92——
-        # 实测槽位 256 / 控件 92，导航右边空出 164 px（截图里导航与表单之间
-        # 那块白），表单和图各少拿 164 px。套一层 holder：布局按子控件的
-        # ``maximumWidth`` 收窄，holder 的 sizeHint 就等于导航真实宽度，
-        # 分割器分的槽位才对得上（实测 [92, 1504]）。
-        nav_holder = QtWidgets.QWidget()
-        nav_layout = QtWidgets.QHBoxLayout(nav_holder)
-        nav_layout.setContentsMargins(0, 0, 0, 0)
-        nav_layout.setSpacing(0)
-        nav_layout.addWidget(self.nav)
+        # 而 ``QSplitter`` 按 sizeHint 分初始槽位 —— 直接把导航放进去，实测槽位
+        # 256 / 内容只有 92，导航右边空出 164 px，表单和图各少拿 164 px。
+        # 套一层 holder，由它回答"想要多宽"（最长项或用户上次拖到的宽度）。
+        self._nav_key = "nav_width"
+        want = fitted
+        stored = self._settings.value(self._nav_key)
+        if stored is not None:
+            try:
+                width = int(stored)
+            except (TypeError, ValueError):
+                width = 0
+            # 换过字体/DPI 后旧宽度可能比新下限还小 —— 那就用下限，别切字
+            if width >= fitted:
+                want = width
+        nav_holder = _NavHolder(self.nav, want)
 
         splitter = QtWidgets.QSplitter()
         splitter.addWidget(nav_holder)
         splitter.addWidget(self.stack)
+        # 多余宽度全给右侧页面，导航保持自己那份（不被 stretch 拉宽）
+        splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        # 不允许被拖到 0：侧边栏一消失，用户找不到把页面切回去的地方
+        splitter.setChildrenCollapsible(False)
+        splitter.splitterMoved.connect(self._on_nav_moved)
         self.setCentralWidget(splitter)
+        self._nav_splitter = splitter
+        self._nav_holder = nav_holder
 
         self.plot = PlotHost(on_webgl=self._on_webgl)
         #: 上一次真推给图控件的那个 Figure（按**对象身份**判重）：切页时同一张图
@@ -126,6 +171,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.nav.currentRowChanged.connect(self._on_nav_changed)
         self.nav.setCurrentRow(0)
+
+    def _on_nav_moved(self, _pos: int, _index: int) -> None:
+        """用户拖完导航列：把宽度存下来（下次打开还是这么宽）。
+
+        存像素而不是比例：导航是"够用就行"的窄条，跟着窗口一起缩放只会把表单
+        挤窄。下限由 :meth:`_nav_width` 守着，所以存下来的值不会小到切字。
+
+        **不**把最大宽度钉死 —— 钉了就等于又变成 ``setFixedWidth``，第二次拖动
+        就没反应了。只告诉 holder "以后初始宽度是这个"，用户随时还能继续拖。
+        """
+        width = int(self.nav.width())
+        if width <= 0:
+            return
+        self._nav_holder.set_preferred_width(width)
+        self._settings.setValue(self._nav_key, width)
 
         self._refresh_status()
 

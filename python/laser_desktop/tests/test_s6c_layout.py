@@ -561,3 +561,93 @@ class FlowRowHeightTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# 导航列：能拖宽、不能拖没、宽度记得住
+# ---------------------------------------------------------------------------
+class NavWidthTest(_MainWindowCase):
+    """用户要求：最左侧边栏要能拖宽；拖窄时不许整个消失。
+
+    这一条踩过两次：先是 ``setFixedWidth(92)``（往右拖没反应、字体一大就切字），
+    改成 ``setMinimumWidth`` 后默认宽度又变成 ``QListWidget`` 的 256 px（导航右
+    边空出一条白、表单和图各少拿 164 px）。所以断言要同时钉住三件事：默认贴紧、
+    可拖宽、拖到 0 仍停在最低宽度。
+    """
+
+    def _window(self):
+        window = main_window.MainWindow(settings=self.settings)
+        window.resize(1600, 950)
+        window.show()
+        wait(200)
+        return window
+
+    def test_default_width_fits_the_longest_item(self):
+        """默认宽度 = ``max(NAV_WIDTH, 最长项宽)``，不是 QListWidget 的 256 px。
+
+        注意不是「等于最长项」：96 dpi 下最长项只有 74，而下限是 92，所以实际
+        取 92（与旧版视觉一致，不因这一项改动而变）。要守住的是「不小于最长项」
+        ——小了就切字。
+        """
+        window = self._window()
+        needed = max(
+            window.nav.sizeHintForIndex(window.nav.model().index(row, 0)).width()
+            for row in range(window.nav.count()))
+        padding = 2 * int(window.nav.frameWidth())
+        expected = max(int(page_layout.NAV_WIDTH), needed + padding)
+        self.assertEqual(window.nav.width(), expected,
+                         f"默认导航宽 {window.nav.width()} != 期望 {expected}"
+                         "（说明 QListWidget 的 sizeHint 又生效了）")
+        self.assertGreaterEqual(window.nav.width(), needed,
+                                "导航比最长项还窄，会切字")
+        self.assertEqual(window._nav_splitter.sizes()[0], window.nav.width(),
+                         f"分割器槽位 {window._nav_splitter.sizes()} 与导航宽不符")
+        window.close()
+
+    def test_dragging_widens_the_nav(self):
+        """往右拖要真的变宽，而且第二次还能继续拖（没被重新钉死）。"""
+        window = self._window()
+        splitter = window._nav_splitter
+        for width in (200, 300):
+            total = sum(splitter.sizes())
+            splitter.setSizes([width, total - width])
+            wait(60)
+            window._on_nav_moved(width, 1)
+            wait(60)
+            self.assertEqual(window.nav.width(), width,
+                             f"拖到 {width} 后导航宽 {window.nav.width()}")
+        window.close()
+
+    def test_cannot_be_dragged_away(self):
+        """拖到 0 时停在最低宽度，控件仍可见（用户找得到怎么切回去）。"""
+        window = self._window()
+        splitter = window._nav_splitter
+        floor = window.nav.minimumWidth()
+        splitter.setSizes([0, sum(splitter.sizes())])
+        wait(80)
+        self.assertGreaterEqual(window.nav.width(), floor)
+        self.assertTrue(window.nav.isVisible())
+        window.close()
+
+    def test_width_is_remembered(self):
+        """拖宽后重开窗口，宽度还是上次那个。"""
+        window = self._window()
+        splitter = window._nav_splitter
+        total = sum(splitter.sizes())
+        splitter.setSizes([280, total - 280])
+        wait(60)
+        window._on_nav_moved(280, 1)
+        wait(60)
+        window.close()
+
+        again = self._window()
+        self.assertEqual(again.nav.width(), 280,
+                         f"重开后导航宽 {again.nav.width()}（应为 280）")
+        again.close()
+
+    def test_too_small_stored_width_falls_back_to_floor(self):
+        """换字体/DPI 后旧宽度可能比新下限还小 —— 那时用下限，不许切字。"""
+        self.settings.setValue("nav_width", 10)
+        window = self._window()
+        self.assertGreaterEqual(window.nav.width(), window.nav.minimumWidth())
+        window.close()
