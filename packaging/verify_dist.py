@@ -32,12 +32,20 @@ import subprocess
 import sys
 from pathlib import Path
 
-#: 解压目录的体积预期（MB）。计划 §5.4：瘦身后 395–490 MB。
-EXPECTED_MIN_MB = 395
-EXPECTED_MAX_MB = 490
-#: 安装包的体积预期（MB）：155–200 MB（lzma2，压缩比按 webengine wheel 实测推算）。
-INSTALLER_MIN_MB = 155
-INSTALLER_MAX_MB = 200
+#: 解压目录的体积预期（MB）。
+#:
+#: **2026-11-19 在 Windows 上实测 520.9 MB**（PySide6 6.12 + Python 3.13，去掉
+#: Qt 的 .obj 之后）。早先按 wheel 体积推算的是 395–490，偏低了 30 MB —— 推算
+#: 只算了 Qt6WebEngineCore 与 resources，漏了 opengl32sw.dll（19.7 MB）与 numpy
+#: 带的 OpenBLAS（19.6 MB）这类"间接依赖的 DLL"。区间改成实测值上下浮动。
+EXPECTED_MIN_MB = 450
+EXPECTED_MAX_MB = 560
+#: 安装包的体积预期（MB）。实测 144.5 MB（lzma2，520.9 → 144.5，压缩比 3.6×）。
+#:
+#: 注意：安装包**比预期小不是问题**，压缩比高是好事。只有小到不合理（低于解压
+#: 目录的 15%）才值得怀疑"漏文件了"——这个判据在下面按比例算，不写死绝对值。
+INSTALLER_MIN_MB = 60
+INSTALLER_MAX_MB = 260
 #: 孑进程用的 Chromium 内核 dll，正常 203.5 MB；小于这个数说明包被裁过头了。
 WEBENGINE_CORE_MIN_MB = 180
 #: 保留的 locale 上限（zh-CN / zh-TW / en-US）。
@@ -440,11 +448,18 @@ def check_sizes(dist: Path, internal: Path, installer: Path | None,
         rep.fail("安装包体积", f"没有 {installer}")
         return
     size_mb = mb(installer.stat().st_size)
-    detail = f"{size_mb:.0f} MB，预期 {INSTALLER_MIN_MB}–{INSTALLER_MAX_MB} MB"
-    if size_mb > INSTALLER_MAX_MB:
-        rep.warn("安装包偏大", detail + "；先看解压目录是不是也偏大")
-    elif size_mb < INSTALLER_MIN_MB:
-        rep.warn("安装包偏小", detail + "；可疑，确认解压目录是完整的")
+    dist_mb = mb(sum(path.stat().st_size for path in dist.rglob("*")
+                     if path.is_file()))
+    ratio = (size_mb / dist_mb) if dist_mb else 0.0
+    detail = (f"{size_mb:.1f} MB（解压 {dist_mb:.0f} MB，压缩比 "
+              f"{(dist_mb / size_mb):.1f}×），预期 {INSTALLER_MIN_MB}–{INSTALLER_MAX_MB} MB")
+    # 关键判据是**比例**，不是绝对体积：lzma2 对 QtWebEngine 那种大 dll 压得很狠
+    # （实测 520.9 → 144.5，3.6×）。安装包"比预期小"通常只是压得好，不是漏文件；
+    # 真正该怀疑的是它小到不合理（< 解压目录的 12%），那才说明大半内容没进去。
+    if ratio < 0.12:
+        rep.warn("安装包偏小", detail + "；压缩比异常高，确认解压目录是完整的")
+    elif ratio > 0.60:
+        rep.warn("安装包偏大", detail + "；压缩比偏低，检查 Inno 的 Compression 设置")
     else:
         rep.ok("安装包体积", detail)
 

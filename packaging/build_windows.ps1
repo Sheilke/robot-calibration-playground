@@ -618,11 +618,11 @@ if ($SkipInstaller) {
 Write-Step "产物"
 $distBytes = Get-DirSizeBytes $DistDir
 Write-Host ("  解压目录 : " + $DistDir)
-Write-Host ("             体积 " + (Format-MB $distBytes) + "（预期 395–490 MB）")
+Write-Host ("             体积 " + (Format-MB $distBytes) + "（实测约 520 MB）")
 Write-Host ("  主程序   : " + $exePath + "（" + (Format-MB (Get-Item -LiteralPath $exePath).Length) + "）")
 if ($installerPath -and (Test-Path -LiteralPath $installerPath)) {
     $instSize = (Get-Item -LiteralPath $installerPath).Length
-    Write-Host ("  安装包   : " + $installerPath + "（" + (Format-MB $instSize) + "，预期 155–200 MB）")
+    Write-Host ("  安装包   : " + $installerPath + "（" + (Format-MB $instSize) + "，实测约 145 MB）")
     Write-Host ("  安装包哈希: Get-FileHash -Algorithm SHA256 '" + $installerPath + "'")
 } else {
     Write-Host "  安装包   : （本次没打）"
