@@ -54,10 +54,15 @@ def repo_root() -> Path:
 
 
 def asset_root() -> Path:
-    """**只读**资产根：模型配置、随包的 plotly.min.js 等。"""
-    if is_frozen():
-        return bundle_root() / BUNDLE_ASSETS
-    return repo_root()
+    """**只读**资产根：模型配置、随包的 plotly.min.js 等。
+
+    转调 :func:`laser_web.paths.asset_root`：只读资产根只在那边定义一次。
+    ``core`` 也要用它拼模型路径，两边各算一遂迟早算出两种答案（曾经就是
+    这样：桌面端算对了， ``core._REPO_ROOT`` 却在冻结后指向安装目录）。
+    """
+    from laser_web import paths as web_paths
+
+    return web_paths.asset_root()
 
 
 def data_root() -> Path:

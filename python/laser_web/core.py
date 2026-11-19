@@ -40,9 +40,14 @@ from excitation_trajectory import avoid_singularity as avoid
 from excitation_trajectory import iso9283_cube as iso
 
 from . import jobs
+from .paths import asset_root as _asset_root
 
-#: 仓库根（``<repo>/python/laser_web/core.py`` 往上两级）。
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+#: 只读资产根（仓库根；冻结后是 ``<_MEIPASS>/assets``）。
+#: 不要写成 ``Path(__file__).resolve().parents[2]``：打包后模块的 ``__file__`` 是
+#: ``<_MEIPASS>/laser_web/core``（无 ``.py``），数出来是安装目录而不是资产根，
+#: 于是每个模型的相对路径都拼错、一点解算就 FileNotFoundError。见
+#: :mod:`laser_web.paths`。
+_REPO_ROOT = _asset_root()
 #: 机器人模型目录（相对仓库根）。
 CONFIG_DIR = Path("data") / "configs"
 #: 体积换算：1 m³ = 1e9 mm³。
