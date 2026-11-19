@@ -29,3 +29,6 @@ nohup.out
 #   的副本很容易被误当成权威版本，所以不入库（打包脚本缺它时会明确提示）。
 license.json
 license_public.pem
+
+# 打包时由 packaging/desktop.spec 生成的"编进代码的公钥"（构建产物）
+python/laser_desktop/_embedded_key.py

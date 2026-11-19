@@ -550,3 +550,56 @@ class MainWiringTest(GateTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublicKeySwallowTest(GateTestBase):
+    """7b. 换掉随包公钥 + 自签一张证，不能通过。
+
+    这条守的是一条**实测可用**的绕过：随包公钥原本是 ``assets/license_public.pem``
+    这种普通文件，攻击者把它换成自己的、再用自己的私钥签一张 2099 年的证，
+    校验就通过了——一行代码都没改。现在冻结运行只认编进代码的公钥。
+    """
+
+    def _forged_license(self):
+        """用攻击者自己的密钥签一张 expires 很远的证（绑定本机指纹）。"""
+        priv = self.tmp / "attacker-private.pem"
+        pub = self.tmp / "attacker-public.pem"
+        lic.generate_keypair(priv, pub)
+        payload = lic.build_payload("联想开发机", "LENOVO-DEV-2601", [LOCAL_A],
+                                         expires="2099-12-30")
+        forged = self.tmp / "forged.json"
+        forged.write_bytes(lic.sign_payload(payload,
+                                            lic.load_private_key(priv)))
+        return forged, pub.read_bytes()
+
+    def test_swapped_asset_public_key_is_ignored_when_frozen(self):
+        forged, attacker_pem = self._forged_license()
+        assets = self.tmp / "assets"
+        assets.mkdir()
+        (assets / "license_public.pem").write_bytes(attacker_pem)
+        real_pem = gate.public_key()
+        self.assertTrue(real_pem)
+        with mock.patch.object(gate.paths, "is_frozen", return_value=True), \
+                mock.patch.object(gate.paths, "asset_root", return_value=assets), \
+                mock.patch.object(gate, "EMBEDDED_PUBLIC_KEY_PEM", real_pem):
+            result = gate.check(forged, local_fingerprints=[LOCAL_A], today=TODAY)
+        self.assertFalse(result.ok, "换掉随包公钥后自签的证竟然通过了")
+        self.assertIn("签名", result.message)
+
+    def test_frozen_without_embedded_key_says_package_is_incomplete(self):
+        """冻结包没编进公钥时不能退回读文件，否则换文件又通了。"""
+        forged, attacker_pem = self._forged_license()
+        assets = self.tmp / "assets"
+        assets.mkdir()
+        (assets / "license_public.pem").write_bytes(attacker_pem)
+        with mock.patch.object(gate.paths, "is_frozen", return_value=True), \
+                mock.patch.object(gate.paths, "asset_root", return_value=assets), \
+                mock.patch.object(gate, "EMBEDDED_PUBLIC_KEY_PEM", None):
+            result = gate.check(forged, local_fingerprints=[LOCAL_A], today=TODAY)
+        self.assertFalse(result.ok)
+        self.assertIn("公钥", result.message)
+
+    def test_source_run_still_reads_the_file(self):
+        """源码运行不受影响（开发机不该为了跑界面先造密钥对）。"""
+        with mock.patch.object(gate.paths, "is_frozen", return_value=False):
+            self.assertTrue(gate.public_key())

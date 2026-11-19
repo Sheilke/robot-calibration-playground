@@ -332,8 +332,14 @@ Write-Host ("  [OK] plotly.min.js " + (Format-MB $assetSize)) -ForegroundColor G
 #
 # 这里**只提醒、不失败**：换一把私钥、或先出一个只给内测机的包，都是正常需求。
 # 把“缺公钥”做成硬失败，只会让人临时去注释掉检查；宁可把话说得足够大声。
-Write-Step "公钥检查（离线授权：data\assets\license_public.pem）"
-$pubKeyPath = Join-Path $RepoRoot 'data\assets\license_public.pem'
+Write-Step "公钥检查（离线授权：license_public.pem）"
+# 公钥会被 desktop.spec 写进 laser_desktop/_embedded_key.py 编进 PYZ——**不是**
+# 靠随包文件，因为那个文件可以被换成攻击者自己的公钥（实测能绕过）。这里找的是
+# 构建用的**源**公钥，两个位置都认（仓库根优先，兼容旧的 data\assets\）。
+$pubKeyPath = Join-Path $RepoRoot 'license_public.pem'
+if (-not (Test-Path -LiteralPath $pubKeyPath)) {
+    $pubKeyPath = Join-Path $RepoRoot 'data\assets\license_public.pem'
+}
 if (Test-Path -LiteralPath $pubKeyPath) {
     $keySize = (Get-Item -LiteralPath $pubKeyPath).Length
     # 只做最基本的形状检查：Ed25519 公钥（PEM）就是几十到一百多字节的文本。
@@ -347,11 +353,11 @@ if (Test-Path -LiteralPath $pubKeyPath) {
 } else {
     # 不画边框：中文是全角，手数的 # 永远对不齐，打印出来反而更像出了大事。
     Write-Host ""
-    Write-Host "  ！ 没有 data\assets\license_public.pem（授权公钥）" -ForegroundColor Yellow
+    Write-Host "  ！ 没有 license_public.pem（授权公钥）" -ForegroundColor Yellow
     Write-Host "    构建继续，但这个包装到客户机上用不了：启动就报" -ForegroundColor Yellow
     Write-Host "    “程序缺少内置公钥，无法校验许可证（安装包可能不完整）”。" -ForegroundColor Yellow
-    Write-Host "    要交付的话：把签发方的 license_public.pem 放到" -ForegroundColor Yellow
-    Write-Host "      data\assets\license_public.pem" -ForegroundColor Yellow
+    Write-Host "    要交付的话：把签发方的 license_public.pem 放到仓库根" -ForegroundColor Yellow
+    Write-Host "      license_public.pem" -ForegroundColor Yellow
     Write-Host "    再重跑本脚本。（私钥千万别放进来：它一泄露，谁都能自己签授权。）" -ForegroundColor Yellow
     Write-Host ""
 }

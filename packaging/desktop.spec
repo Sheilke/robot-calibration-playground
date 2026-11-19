@@ -148,13 +148,31 @@ _log("plotly.min.js %.2f MB -> assets/plotly" % (_js_size / 1024.0 / 1024.0))
 #
 # 私钥（*.pem 里带 PRIVATE KEY 的那个）**绝不能**出现在这里：它一泄露，谁都能
 # 自己签授权。仓库里也不应该有——签发在离线机器上做。
-_PUBLIC_KEY_SRC = os.path.join(REPO_ROOT, "data", "assets", "license_public.pem")
-if os.path.isfile(_PUBLIC_KEY_SRC):
-    datas.append((_PUBLIC_KEY_SRC, "assets"))
-    _log("授权公钥 %d B -> assets/license_public.pem"
-         % os.path.getsize(_PUBLIC_KEY_SRC))
+_PUBLIC_KEY_CANDIDATES = (
+    os.path.join(REPO_ROOT, "license_public.pem"),
+    os.path.join(REPO_ROOT, "data", "assets", "license_public.pem"),
+)
+_PUBLIC_KEY_SRC = next((path for path in _PUBLIC_KEY_CANDIDATES
+                        if os.path.isfile(path)), None)
+# **公钥编进代码**，不再只放成可替换的文件。
+#
+# 实测过的绕过：随包的 license_public.pem 是一个普通文件，攻击者把它换成自己的
+# 公钥、再用自己的私钥签一张 2099 年的证，校验就通过了——一行代码都不用改。
+# 所以构建时把公钥写进 laser_desktop/_embedded_key.py，它会进 PYZ；冻结运行时
+# licensing.public_key() 只认这一份，不读 assets 下的文件。
+_EMBEDDED_KEY_MODULE = os.path.join(REPO_ROOT, "python", "laser_desktop",
+                                    "_embedded_key.py")
+if _PUBLIC_KEY_SRC:
+    with open(_PUBLIC_KEY_SRC, "rb") as _fp:
+        _pem = _fp.read()
+    with open(_EMBEDDED_KEY_MODULE, "w", encoding="utf-8") as _fp:
+        _fp.write("# 由 packaging/desktop.spec 生成，不要手改、不要提交。\n"
+                  "# 冻结运行时 licensing.public_key() 只读这一份。\n"
+                  "PUBLIC_KEY_PEM = %r\n" % _pem)
+    _log("授权公钥 %d B -> laser_desktop/_embedded_key.py（编进代码，%s）"
+         % (len(_pem), os.path.basename(_PUBLIC_KEY_SRC)))
 else:
-    _log("!! 没有 data/assets/license_public.pem：这个包将不含授权公钥，"
+    _log("!! 没有 license_public.pem（仓库根或 data/assets/）：这个包将不含公钥，"
          "客户机上启动会直接报「程序缺少内置公钥」（只适合内测包）")
 
 # ---------------------------------------------------------------------------

@@ -69,9 +69,23 @@ PROGRAM_DATA_APP = "LaserCalibration"
 #: 许可证校验失败时的退出码。与普通错误 1 区分，运维看到 3 就知道是授权问题。
 EXIT_LICENSE = 3
 
-#: 内嵌公钥（PEM 字节）。打包时若把公钥写死在 PYZ 里就填这里；留 ``None``
-#: 时退回到读 ``asset_root()/license_public.pem``（spec 默认走文件这条路）。
+#: 内嵌公钥（PEM 字节）。**冻结包里必须非空**，由 ``packaging/desktop.spec``
+#: 在构建时读仓库根的 ``license_public.pem`` 生成 ``laser_desktop/_embedded_key.py``
+#: 注入；源码运行时留 ``None``，退回读文件。
 EMBEDDED_PUBLIC_KEY_PEM: bytes | None = None
+
+
+def _embedded_public_key() -> bytes | None:
+    """构建期注入的公钥（``laser_desktop/_embedded_key.py``，不进仓库）。
+
+    惰性导入而不是模块级导入：源码树里若残留一份旧的生成模块，模块级导入会让
+    开发机静默用上"上一把公钥"，症状是"明明重签了却验不过"。
+    """
+    try:
+        from ._embedded_key import PUBLIC_KEY_PEM   # noqa: WPS433 - 构建期产物
+    except Exception:                               # noqa: BLE001
+        return None
+    return bytes(PUBLIC_KEY_PEM) if PUBLIC_KEY_PEM else None
 
 #: 找不到许可证时的话术（``%s`` 是它应该在的位置）。
 #: 找不到许可证时的话术。
@@ -198,13 +212,24 @@ def public_key_candidates() -> list[Path]:
 
 
 def public_key() -> bytes | None:
-    """内嵌公钥（PEM 字节）；内嵌常量与随包文件**两者都取不到时返回 ``None``**。
+    """内嵌公钥（PEM 字节）；取不到时返回 ``None``。
 
     返回 ``None`` 不是异常：调用方要据此说"安装包可能不完整，请重新安装"，
     这比抛一个 ``FileNotFoundError`` 有用得多。
+
+    **冻结（打包）后只认"编进代码里的"那把**，不再读随包文件。原因是一条实测
+    可用的绕过：随包公钥是一个可替换的**文件**，攻击者把自己的公钥拷进去
+    （`_internal/assets/license_public.pem`），再用自己的私钥签一张 2099 年的
+    许可证，校验就会通过——整个过程没碰一行代码。公钥编进字节码后，同样的目的
+    就得先去改代码，那是另一个门槛（见 ``docs/开发参考.md`` §4.6.3）。
+
+    源码运行时仍允许读文件：开发机不该为了跑一次界面就先去生成密钥对。
     """
     if EMBEDDED_PUBLIC_KEY_PEM:
         return EMBEDDED_PUBLIC_KEY_PEM
+    if paths.is_frozen():
+        # 冻结包只认编进代码的公钥；缺了就是构建漏了一步，不退回读文件
+        return _embedded_public_key()
     for candidate in public_key_candidates():
         try:
             if candidate.is_file():
