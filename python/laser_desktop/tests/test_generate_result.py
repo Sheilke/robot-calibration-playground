@@ -188,10 +188,36 @@ class ResultRenderTest(unittest.TestCase):
         self.assertEqual(labels["feasible"].text(), "可行")
 
     def test_feasible_label_turns_red_when_infeasible(self):
+        """不可行时判词要带**原因**：光写"不可行"会和"成功 n/n"自相矛盾。
+
+        ``make_result(feasible=False)`` 里有一个点没解出来，所以原因应当是
+        "有点无解"——即使参数再漂亮，先报"根本解不出来"才是现场该看到的那句。
+        """
         self.page.render_result(make_result(self.run_dir, feasible=False))
         label = self.page.stat_labels["feasible"]
-        self.assertEqual(label.text(), "不可行")
+        self.assertEqual(label.text(), "不可行·有点无解")
         self.assertIn("color:#c0392b", label.styleSheet())
+
+    def test_verdict_names_the_actual_reason(self):
+        """四种不可行的原因各自成词，别都笼统写成"不可行"。"""
+        cases = [
+            ({"solved": 3, "total": 4}, "不可行·有点无解"),
+            ({"guard_violations": 2}, "不可行·奇异裕度不足"),
+            ({"j3_crossings": 1}, "不可行·段内奇异"),
+            ({"design_cond": 14.4}, "不可行·激励不足"),
+        ]
+        for stats, expected in cases:
+            merged = {"solved": 4, "total": 4, "feasible": False}
+            merged.update(stats)
+            self.assertEqual(generate_page.feasible_text(merged), expected, merged)
+
+    def test_reason_is_absent_when_feasible(self):
+        self.assertEqual(
+            generate_page.feasible_text({"solved": 4, "total": 4,
+                                         "design_cond": 4.0, "feasible": True}),
+            "可行")
+        self.assertEqual(generate_page.verdict_reason({"solved": 4, "total": 4,
+                                                      "design_cond": 4.0}), "")
 
     def test_all_solved_turns_the_counter_green(self):
         result = make_result(self.run_dir)

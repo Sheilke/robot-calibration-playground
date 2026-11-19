@@ -183,6 +183,42 @@ def _edge_text(result: dict) -> str:
     return " × ".join(f"{float(edge):.3f}" for edge in edges) + " m"
 
 
+#: 条件数门禁的兜底值（与 ``aabb_snake_scan.DEFAULT_COND_MAX`` 同源）。
+_DEFAULT_COND_MAX = 9.0
+
+
+def _verdict_reason(stats: dict) -> str:
+    """判"不可行"的真实原因（顺序即优先级）。
+
+    Args:
+        stats: ``core.run_scan`` 的 ``stats``。
+
+    Returns:
+        str: ``""`` / ``"有点无解"`` / ``"奇异裕度不足"`` / ``"段内奇异"`` /
+            ``"激励不足"``。
+    """
+    solved = int(stats.get("solved") or 0)
+    total = int(stats.get("total") or 0)
+    if total and solved < total:
+        return "有点无解"
+    if int(stats.get("guard_violations") or 0):
+        return "奇异裕度不足"
+    if int(stats.get("j3_crossings") or 0) or int(stats.get("j5_crossings") or 0):
+        return "段内奇异"
+    design = stats.get("design_cond")
+    if design is not None and float(design) > _DEFAULT_COND_MAX:
+        return "激励不足"
+    return ""
+
+
+def _feasible_text(stats: dict) -> str:
+    """统计行的判词：``可行`` 或 ``不可行·激励不足``。"""
+    if stats.get("feasible") is not False:
+        return "可行"
+    reason = _verdict_reason(stats)
+    return f"不可行·{reason}" if reason else "不可行"
+
+
 def render() -> None:
     """渲染生成页（含 M2 的后台解算与结果区）。"""
     defaults = default_form_values()
@@ -586,7 +622,9 @@ def render() -> None:
                     ui.chip(f"post_ik {_fmt(stats['post_ik_cond'])}",
                             icon="science")
                     feasible = stats.get("feasible")
-                    ui.chip("可行" if feasible else "不可行",
+                    # 判词要带原因：``成功 51/51`` 与 ``不可行`` 并排会让人以为
+                    # 程序自相矛盾，其实"点都能解、但姿态激励不足以标定参数"。
+                    ui.chip(_feasible_text(stats),
                             icon="verified" if feasible else "report",
                             color="green" if feasible else "red")
             for line in result.get("warnings") or []:

@@ -995,6 +995,64 @@ def make_table(headers) -> QtWidgets.QTableWidget:
     return table
 
 
+#: 判词阈值：条件数门禁（与 ``aabb_snake_scan.DEFAULT_COND_MAX`` 同源，
+#: 页面上的「门禁」输入框可以改，这里只做兜底）。
+_DEFAULT_COND_MAX = 9.0
+
+#: 判词文案：``(不可行的原因, 颜色)``。顺序就是判定的优先级 —— 先报"有点根本
+#: 解不出来"，再报奇异，最后才是"点都能走、但姿态激励不足以标定参数"。
+_VERDICT_BY_REASON = (
+    ("无解", "不可行·有点无解"),
+    ("守卫", "不可行·奇异裕度不足"),
+    ("穿零", "不可行·段内奇异"),
+    ("条件数", "激励不足"),
+)
+
+
+def verdict_reason(stats: dict) -> str:
+    """这次判"不可行"到底是因为哪一条（可复用于状态栏与提示）。
+
+    为什么要分开说：``成功 51/51`` 与 ``不可行`` 并排出现时，读的人会以为程序
+    自相矛盾。真实情况是两件事——**路点全都解得出来**，但**姿态激励不足**，
+    按这样的点位标出来的参数辨识不准。把原因写清楚，现场才知道该改什么
+    （加大姿态扰动或增加点位），而不是去怀疑解算失败。
+
+    Args:
+        stats: ``core.run_scan`` 的 ``stats``。
+
+    Returns:
+        str: ``""``（没有不可行的原因）/ ``"有点无解"`` / ``"奇异裕度不足"`` /
+            ``"段内奇异"`` / ``"激励不足"``。
+    """
+    solved = int(stats.get("solved") or 0)
+    total = int(stats.get("total") or 0)
+    if total and solved < total:
+        return "有点无解"
+    if int(stats.get("guard_violations") or 0):
+        return "奇异裕度不足"
+    if int(stats.get("j3_crossings") or 0) or int(stats.get("j5_crossings") or 0):
+        return "段内奇异"
+    design = stats.get("design_cond")
+    if design is not None and float(design) > _DEFAULT_COND_MAX:
+        return "激励不足"
+    return ""
+
+
+def feasible_text(stats: dict) -> str:
+    """统计行最后那个判词（代替笼统的"可行 / 不可行"）。
+
+    Args:
+        stats: 见 :func:`verdict_reason`。
+
+    Returns:
+        str: ``"可行"`` 或形如 ``"不可行·激励不足"`` 的短语。
+    """
+    if stats.get("feasible") is not False:
+        return "可行"
+    reason = verdict_reason(stats)
+    return f"不可行·{reason}" if reason else "不可行"
+
+
 def fill_stat_labels(labels: dict, stats: dict) -> None:
     """统计标签：成功 n/N、构型切换、ΣdqL2、|J5|/|J3| 最小值、条件数、可行。
 
@@ -1025,7 +1083,7 @@ def fill_stat_labels(labels: dict, stats: dict) -> None:
         labels["feasible"].setText("—")
         labels["feasible"].setStyleSheet("")
     else:
-        labels["feasible"].setText("可行" if feasible else "不可行")
+        labels["feasible"].setText(feasible_text(stats))
         labels["feasible"].setStyleSheet(
             _GREEN_BOLD if feasible else _RED_BOLD)
     # 文字一变，每张卡的宽度也变了：让容器重排一次（行数可能少一行）
@@ -2044,7 +2102,11 @@ class GeneratePage(QtWidgets.QWidget):
             # 出结果但不可行：原因已经在 core 的 warnings 里拼好了（“姿态激励
             # 条件数未达标：…”、“段内奇异…”、“N 个路点无解”），不能只把结论
             # 撂在这儿——现场得知道该改哪个参数。
-            head = "完成" if feasible is not False else "完成（不可行）"
+            # 判词要说出**原因**：``成功 51/51`` 与 ``不可行`` 并排会让人以为程序
+            # 自相矛盾，其实是"点都能解，但姿态激励不足以标定参数"。
+            reason = verdict_reason(stats) if feasible is False else ""
+            head = f"完成（不可行·{reason}）" if reason else (
+                "完成（不可行）" if feasible is False else "完成")
             text = (f"{head}：成功 {stats.get('solved')}/{stats.get('total')} 点，"
                     f"运行 {result.get('run_id')} → {result.get('run_dir')}")
             warnings = [str(line) for line in (result.get("warnings") or [])]
@@ -2059,7 +2121,7 @@ class GeneratePage(QtWidgets.QWidget):
                 f"解算完成：{stats.get('solved')}/{stats.get('total')} 点，"
                 f"{result.get('run_id')}"
                 + ("" if feasible is not False
-                   else "（不可行，原因见结果区）"))
+                   else f"（{reason or '不可行'}，原因见结果区）"))
             return
 
         if state == "cancelled":
