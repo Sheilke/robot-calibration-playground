@@ -396,19 +396,44 @@ if ($SkipTests) {
     Write-Host "  已按 -SkipTests 跳过 —— 这一版没有测试背书。" -ForegroundColor Yellow
 } else {
     $env:PYTHONPATH = $PySrc
+    # 测试进程里**不建** QWebEngineView（见 python/laser_desktop/plot_view.py 的
+    # PlotStub）。Windows 上反复建/拆真视图会把整个 pytest 进程带走：
+    #   Windows fatal exception: code 0x80000003
+    #   Failed to make current / context is marked as lost（GPU 上下文反复丢）
+    # 这是测试环境的限制，不是产品行为：真 WebEngine 由 verify_dist.py 的
+    # --self-check 在**建好的 exe** 上验——那才是交付物要验的东西，而且是
+    # 单独一个进程、一套 GPU 上下文。
+    $env:LASER_NO_WEBENGINE = "1"
     $pytestCode = 0
+    # 输出同时落盘：进程若崩（Windows 上 WebEngine 测试可能触发 0x80000003），
+    # 控制台只留下尾巴，失败清单就丢了。完整日志留在这里，排查时直接看文件。
+    $testLog = Join-Path $RepoRoot 'build\tests.log'
+    New-Item -ItemType Directory -Force -Path (Split-Path $testLog) | Out-Null
     Push-Location $RepoRoot
     try {
-        & $VenvPython -m pytest python -q
-        $pytestCode = $LASTEXITCODE
+        & $VenvPython -m pytest python -q --tb=short 2>&1 | Tee-Object -FilePath $testLog
+        # Tee 会把管道退出码盖掉，所以从日志尾部判断：有 FAILED 行就算红。
+        $failed = @(Select-String -Path $testLog -Pattern '^(FAILED|ERROR) ' -ErrorAction SilentlyContinue)
+        $pytestCode = if ($failed.Count -gt 0 -or $LASTEXITCODE -ne 0) { 1 } else { 0 }
     } finally {
         Pop-Location
         Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
+        Remove-Item Env:\LASER_NO_WEBENGINE -ErrorAction SilentlyContinue
     }
     if ($pytestCode -ne 0) {
-        Fail -Message ("pytest 退出码 " + $pytestCode + "（照上面最后几行改代码）。") -Hints @(
+        $names = @(Select-String -Path $testLog -Pattern '^(FAILED|ERROR) ' |
+                   ForEach-Object { $_.Line }) | Select-Object -First 15
+        Write-Host ""
+        Write-Host ("  失败项（前 15 条，完整见 " + $testLog + "）：") -ForegroundColor Yellow
+        if ($names.Count -eq 0) {
+            Write-Host "    （日志里没有 FAILED 行：pytest 可能是被信号/崩溃终止的）" -ForegroundColor Yellow
+        } else {
+            $names | ForEach-Object { Write-Host ("    " + $_) -ForegroundColor Yellow }
+        }
+        Fail -Message "测试没通过。" -Hints @(
             "不许拿红的代码打包：打出来的 exe 修不了，只能重装。",
-            "确认是环境问题而不是代码问题，再考虑 -SkipTests。")
+            ("完整输出： " + $testLog),
+            "单独重跑某个文件： build\venv-desktop\Scripts\python.exe -m pytest <文件> -q")
     }
     Write-Host "  [OK] 测试全绿" -ForegroundColor Green
 }

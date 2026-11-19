@@ -24,6 +24,7 @@ S6 补上的两件事
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -61,6 +62,31 @@ WEBCHANNEL_JS_NAME = "qwebchannel.js"
 BRIDGE_NAME = "plotBridge"
 #: 选中点的 marker 边长（像素）；未选中用图里原来的大小。
 SELECT_SIZE = 12
+
+#: 测试 / 无 GPU 模式的开关：环境变量设成 ``1`` 时 :meth:`PlotHost.ensure`
+#: **不建** ``QWebEngineView``，只给一个轻量替身（:class:`PlotStub`）。
+#:
+#: 为什么需要：测试反复建/拆真 ``QWebEngineView`` 时，Windows 上会把整个进程
+#: 带走（``Windows fatal exception: code 0x80000003``，前面跟着一堆
+#: ``Failed to make current / context is marked as lost``——GPU 上下文反复丢）。
+#: 这是**测试环境**的问题，不是产品行为，所以默认值不变（生产照旧建真视图），
+#: 只在跑 GUI 单测时打开；真正要验的 WebEngine 行为由 ``verify_dist.py
+#: --self-check`` 在建好的 exe 上验（那里只有一个进程、一套 GPU 上下文）。
+NO_WEBENGINE_ENV = "LASER_NO_WEBENGINE"
+
+#: 环境变量里算“开”的写法（大小写不敏感）。
+_NO_WEBENGINE_ON = ("1", "true", "yes", "on")
+
+
+def webengine_disabled() -> bool:
+    """``LASER_NO_WEBENGINE=1`` 时为 ``True``：不要建 ``QWebEngineView``。
+
+    Returns:
+        bool: 环境变量是 ``1/true/yes/on``（大小写不敏感）时为 ``True``。
+    """
+    return (os.environ.get(NO_WEBENGINE_ENV, "").strip().lower()
+            in _NO_WEBENGINE_ON)
+
 
 #: 壳页模板：``{{PLOTLY_JS}}`` / ``{{QWEBCHANNEL_JS}}`` 换成相对路径，
 #: ``window.__setFigure`` 是换图入口。
@@ -426,7 +452,118 @@ class _PlotBridge(QtCore.QObject):
                 view._last_error = "图 → 表联动处理失败（已忽略，界面照常）"
 
 
-class PlotView(QWebEngineView):
+class _FigureSink:
+    """「图落子口」的共用部分：同一张图只推一次。
+
+    :class:`PlotView`（真壳页）与 :class:`PlotStub`（``LASER_NO_WEBENGINE=1`` 的
+    替身）**共用同一个** :meth:`set_figure`：所以“同一张图不重推”在测试里断言
+    的就是生产里跑的那一段代码，不是另写一份假实现。
+    """
+
+    #: 能不能接图；没就绪时 ``set_figure`` 只把图记进 ``_pending``。
+    loaded = False
+
+    def set_figure(self, figure) -> None:
+        """换图：首图用 ``Plotly.newPlot``，之后走 ``Plotly.react``（视角保留）。
+
+        **同一张图不重复推**：三个页面都往这一个视图推图（切页时主窗口推、
+        页面自己去抖也推），而 ``Plotly.react`` 会把相机视角与 marker 尺寸重置
+        回原值。同一对象再推一次只会把现场调好的视角/高亮打回默认值，所以
+        直接跳过。
+
+        Args:
+            figure: ``plotly.graph_objects.Figure``。
+        """
+        if not self.loaded:                     # 壳页还没就绪：排队等回调
+            self._pending = figure
+            return
+        if getattr(self, "_shutting_down", False):
+            return
+        if figure is self._last_figure:          # 已经推过这一张
+            return
+        self._last_figure = figure
+        self._run_figure(figure, None)
+
+    def _run_figure(self, figure, token):       # pragma: no cover - 抽象
+        """真正把图落到画布上（子类实现）。"""
+        raise NotImplementedError
+
+
+class PlotStub(_FigureSink, QtWidgets.QWidget):
+    """``LASER_NO_WEBENGINE=1`` / ``allow_webengine=False`` 时的轻量替身。
+
+    只做三件事：记下推过去/选中的东西供测试断言、把信号名对住 ``PlotView``
+    （``PlotHost`` 会转发）、**绝不**创建 ``QWebEngineView``。
+
+    Attributes:
+        figures: 推过来的图（按顺序；判重是 :meth:`_FigureSink.set_figure` 干的）。
+        selected: 历次高亮的键（``list[list[str]]``）。
+        loaded: 永远 ``True``（没有真壳页要等）。
+        load_count: 固定 ``1``（语义同 ``PlotView.load_count``：壳页“加载”一次）。
+    """
+
+    loadFinished = Signal(bool)
+    pointClicked = Signal(object)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.loaded = True
+        self.load_count = 1
+        self.figures = []
+        self.selected = []
+        self._pending = None
+        self._last_figure = None
+        self._selected = []
+        self._shutting_down = False
+
+    # ------------------------------------------------------------ 图
+    def _run_figure(self, figure, token=None) -> None:
+        """“画图” = 记一笔，供测试断言。"""
+        self.figures.append(figure)
+
+    def select_points(self, keys, notify: bool = False) -> None:
+        """记下这次要高的键（与 ``PlotView.select_points`` 同参）。"""
+        payload = [str(key) for key in keys]
+        self._selected = payload
+        self.selected.append(payload)
+
+    def measure_react(self, figure, callback=None, timeout_s: float = 5.0):
+        """没有 JS 可计：拉一次图并立刻回调 ``0.0`` 毫秒。"""
+        self.set_figure(figure)
+        if callback is not None:
+            callback(0.0)
+        return 0
+
+    def check_webgl(self, callback=None) -> None:
+        """没有 WebGL 可检：不回调（与真视图“还没查完”同一个观察值）。"""
+        return None
+
+    # ------------------------------------------------------------ 与 PlotView 同名
+    def page(self):
+        """没有 ``QWebEnginePage``（替身不跑壳页）。"""
+        return None
+
+    def shutdown(self) -> None:
+        """空实现：替身没有任何 GPU/进程资源要拆。"""
+        return None
+
+    @property
+    def webgl_ok(self):
+        """替身无 GPU：保持 ``None``（“还没查/不适用”），不谎报不可用。"""
+        return None
+
+    @property
+    def webgl_renderer(self) -> str:
+        """无渲染器名。"""
+        return ""
+
+    @property
+    def last_error(self):
+        """替身不会出错。"""
+        return None
+
+
+class PlotView(_FigureSink, QWebEngineView):
     """一个 Plotly 视图控件：``load_shell()`` 后即可反复 ``set_figure()``。
 
     Signals:
@@ -608,27 +745,7 @@ class PlotView(QWebEngineView):
             self.check_webgl(pending_callback)
 
     # ------------------------------------------------------------------ 换图
-    def set_figure(self, figure) -> None:
-        """换图：首图用 ``Plotly.newPlot``，之后走 ``Plotly.react``（视角保留）。
-
-        **同一张图不重复推**：三个页面都往这一个视图推图（切页时主窗口推、
-        页面自己去抖也推），而 ``Plotly.react`` 会把相机视角与 marker 尺寸重置
-        回原值。同一对象再推一次只会把现场调好的视角/高亮打回默认值，所以
-        直接跳过。
-
-        Args:
-            figure: ``plotly.graph_objects.Figure``。
-        """
-        if not self.loaded:                     # 壳页还没就绪：排队等回调
-            self._pending = figure
-            return
-        if getattr(self, "_shutting_down", False):
-            return
-        if figure is self._last_figure:          # 已经推过这一张
-            return
-        self._last_figure = figure
-        self._run_figure(figure, None)
-
+    # ``set_figure`` 在 :class:`_FigureSink` 里与 ``PlotStub`` 共用（判重只有一份）。
     def _run_figure(self, figure, token) -> None:
         """真正把图推给壳页（``token`` 有值时壳页会记下这次耗时）。"""
         payload = figure_payload(figure)
@@ -787,17 +904,23 @@ class PlotHost(QtWidgets.QWidget):
     loadFinished = Signal(bool)
     pointClicked = Signal(object)
 
-    def __init__(self, parent=None, on_webgl=None) -> None:
+    def __init__(self, parent=None, on_webgl=None, allow_webengine=None) -> None:
         """建容器。
 
         Args:
             parent: 父控件。
             on_webgl: WebGL 自检回调 ``callback(ok, renderer)``；在视图真正
-                创建后调用一次。
+                创建后调用一次（替身模式下不调，因为无 WebGL 可检）。
+            allow_webengine: 是否允许创建真 ``QWebEngineView``。``None``（默认）
+                跟随环境变量 ``LASER_NO_WEBENGINE``；传 ``False`` 则**无论环
+                境如何**都用替身（测试想要确定性时用这个）。
         """
         super().__init__(parent)
         self._view = None
         self._on_webgl = on_webgl
+        self._allow_webengine = (not webengine_disabled()
+                                 if allow_webengine is None
+                                 else bool(allow_webengine))
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self._placeholder = QtWidgets.QLabel(
@@ -807,10 +930,30 @@ class PlotHost(QtWidgets.QWidget):
         self._placeholder.setStyleSheet("color:#888")
         layout.addWidget(self._placeholder)
 
-    def ensure(self) -> "PlotView":
-        """确保 ``PlotView`` 存在（创建 + 加载壳页），返回它。"""
+    @property
+    def allow_webengine(self) -> bool:
+        """本容器是否会建真 ``QWebEngineView``（``False`` = 替身模式）。"""
+        return bool(self._allow_webengine)
+
+    def ensure(self):
+        """确保图控件存在（创建 + 加载壳页），返回它。
+
+        替身模式（``LASER_NO_WEBENGINE=1`` / ``allow_webengine=False``）下返回
+        :class:`PlotStub`：同样的接口、同样的判重代码，**不建** ``QWebEngineView``。
+
+        Returns:
+            PlotView | PlotStub: 图控件。
+        """
         if self._view is not None:
             return self._view
+        if not self._allow_webengine:
+            view = PlotStub(self)
+            view.loadFinished.connect(self.loadFinished.emit)
+            view.pointClicked.connect(self.pointClicked.emit)
+            self.layout().addWidget(view)
+            self._placeholder.hide()
+            self._view = view
+            return view
         view = PlotView(self)
         view.loadFinished.connect(self.loadFinished.emit)
         view.pointClicked.connect(self.pointClicked.emit)
@@ -824,7 +967,7 @@ class PlotHost(QtWidgets.QWidget):
 
     @property
     def view(self):
-        """已创建的 ``PlotView``（没创建时为 ``None``，不会触发创建）。"""
+        """已创建的图控件（没创建时为 ``None``，不会触发创建）。"""
         return self._view
 
     def shutdown(self) -> None:
@@ -844,7 +987,7 @@ class PlotHost(QtWidgets.QWidget):
 
     @property
     def created(self) -> bool:
-        """是否已经建了真视图（P5 的断言点）。"""
+        """是否已经建了图控件（P5 的断言点：替身模式也算“建过”）。"""
         return self._view is not None
 
     def set_figure(self, figure) -> None:

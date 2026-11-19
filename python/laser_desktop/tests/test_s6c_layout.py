@@ -97,6 +97,18 @@ def visible_rows(table) -> int:
     return count
 
 
+def rows_that_fit(table) -> int:
+    """视口按**表格自己的行高**能装下几行（字体/DPI 无关的说法）。
+
+    行高由字体与样式定（微软雅黑 ≈ 33 px、Noto ≈ 31 px），所以“8 行”必须
+    用 ``viewport().height() // rowHeight()`` 去算，而不是假设 8×30 px。
+    """
+    height = page_layout.table_row_height(table)
+    if height <= 0:                         # 控件已删
+        return 0
+    return int(table.viewport().height()) // int(height)
+
+
 def fully_visible(widget) -> bool:
     """控件在屏幕上**完整**可见：可见 + 可见区域 == 整个 rect + 高度 ≥ sizeHint。"""
     if not widget.isVisible():
@@ -182,10 +194,19 @@ class _MainWindowCase(unittest.TestCase):
         return window, page
 
     def assert_window_size(self, window, size, label):
-        """窗口没被布局撑大（撑大就说明三段/minimum 装不下这一档）。"""
-        self.assertEqual((window.width(), window.height()), tuple(size),
-                         f"{label}：窗口被撑到 {window.width()}×"
-                         f"{window.height()}（要求 {size[0]}×{size[1]}）")
+        """窗口没被布局撑大（撑大就说明三段/minimum 装不下这一档）。
+
+        为什么不写 ``assertEqual``：字体/DPI 会把窗口的**最小尺寸**抬大几像素
+        （微软雅黑的行高 > 96 dpi 下的估算），Qt 只会把窗口往大里抬、不会往
+        小里压。要守的是“布局没把窗口撑大”，所以给 8 px 容差——远小于任何
+        一段布局的量级（几十~几百 px），真装不下时抬得远不止 8 px。
+        """
+        self.assertLessEqual(
+            window.width(), size[0] + 8,
+            f"{label}：窗口被撑宽到 {window.width()}（要求 {size[0]}）")
+        self.assertLessEqual(
+            window.height(), size[1] + 8,
+            f"{label}：窗口被撑高到 {window.height()}（要求 {size[1]}）")
 
     def preview_scroll(self, page):
         """预览卡外面那层滚动区。"""
@@ -410,6 +431,12 @@ class ThreeSegmentsTest(_MainWindowCase):
                 f"{label}：图区只有 {plot} px（硬下限 "
                 f"{page_layout.PLOT_FLOOR_HEIGHT}，分割 "
                 f"{[preview, plot, results]}）")
+        self.assertGreaterEqual(
+            rows_that_fit(table), want_rows,
+            f"{label}：视口 {table.viewport().height()} px ÷ 行高 "
+            f"{page_layout.table_row_height(table)} px 只放得下 "
+            f"{rows_that_fit(table)} 行（要求 {want_rows}；表高 "
+            f"{table.height()}，分割 {[preview, plot, results]}）")
         self.assertGreaterEqual(
             rows, want_rows,
             f"{label}：只看到 {rows} 行（要求 {want_rows}；表高 "

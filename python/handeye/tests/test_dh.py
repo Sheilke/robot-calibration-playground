@@ -118,10 +118,17 @@ class FkDifferenceTest(unittest.TestCase):
         candidate = RobotKinematics(URDF, DhOverride.from_base(URDF), label="new")
         report = fk_difference(self.reference, candidate, self.q_samples)
         self.assertEqual(report["n"], len(self.q_samples))
-        self.assertEqual(report["position_max_mm"], 0.0)
-        self.assertEqual(report["position_rms_mm"], 0.0)
-        self.assertEqual(report["rotation_max_deg"], 0.0)
-        self.assertEqual(report["rotation_rms_deg"], 0.0)
+        # 两个模型是同一组 DH（同一次从 URDF 反解），所以差异只该是舍入噪声。
+        # 这里断言“小于 1e-9 mm”而不是“正好等于 0.0”：两条独立的浮点计算路径
+        # （一个是基准参数、一个是覆盖参数）在 libm/BLAS 不同的平台上，最后
+        # 一位可以不同（Windows 的 CRT/MKL 与 Linux 的 glibc/OpenBLAS 不保证逐
+        # 位一致）。位姿本身是 2×10^3 mm 量级，1e-9 mm 已是 1e-12 的相对量，
+        # 远小于任何测量/建模意义；把“平台逐位一致”当断言是平台假设，不是
+        # 这条用例的意图（意图是“同一组参数不该有差”）。
+        self.assertAlmostEqual(report["position_max_mm"], 0.0, delta=1e-9)
+        self.assertAlmostEqual(report["position_rms_mm"], 0.0, delta=1e-9)
+        self.assertAlmostEqual(report["rotation_max_deg"], 0.0, delta=1e-9)
+        self.assertAlmostEqual(report["rotation_rms_deg"], 0.0, delta=1e-9)
         self.assertEqual(len(report["per_sample"]), len(self.q_samples))
         self.assertEqual(report["per_sample"][0]["index"], 0)
 
@@ -130,8 +137,16 @@ class FkDifferenceTest(unittest.TestCase):
         override.d[0] += 10.0
         report = fk_difference(
             self.reference, RobotKinematics(URDF, override), self.q_samples)
-        self.assertAlmostEqual(report["position_max_mm"], 10.0, places=9)
-        self.assertAlmostEqual(report["position_rms_mm"], 10.0, places=9)
+        # d[0] += 10 mm 就是把整条臂沿基座 z 轴平移 10 mm，位置差**理论值**
+        # 正好是 10.0。但它是“两个 ~2×10^3 mm 的坐标相减再取模”算出来的，
+        # 结果带几位舍入（1 ulp @ 2100 mm ≈ 4.5e-13，实测末位就是 10.0000000000005）。
+        # 所以容差按量级给：1e-9 × max(1, 期望值) = 1e-8 mm。原来写
+        # ``places=9``（= 绝对 5e-10）把“能算出 10 mm”和“浮点逐位恰好等于
+        # 10.0”绑在一起，换个 libm 就可能红。
+        for key in ("position_max_mm", "position_rms_mm"):
+            tolerance = 1e-9 * max(1.0, abs(10.0))
+            self.assertAlmostEqual(report[key], 10.0, delta=tolerance,
+                                   msg=f"{key}={report[key]}（期望 10.0 mm）")
         self.assertLess(report["rotation_max_deg"], 1e-6)
 
     def test_link_length_perturbation_is_same_order(self):

@@ -66,6 +66,15 @@ def wait(ms: int) -> None:
         time.sleep(0.005)
 
 
+#: ``LASER_NO_WEBENGINE=1`` 时这些断言要真壳页（JS / WebGL / QWebEnginePage），
+#: 在那套模式下跳过：真实 WebEngine 行为由 ``smoke_offscreen.py`` 与打包后
+#: ``verify_dist.py --self-check`` 验（那里只有一个进程、一套 GPU 上下文）。
+NEEDS_WEBENGINE = unittest.skipIf(
+    plot_view.webengine_disabled(),
+    "LASER_NO_WEBENGINE=1：这条断言要真 WebEngine 壳页"
+    "（见 packaging/verify_dist.py --self-check）")
+
+
 def visible_rows(table) -> int:
     """表格视口里**完整**可见的行数。
 
@@ -83,6 +92,20 @@ def visible_rows(table) -> int:
         if rect.top() >= region.top() and rect.bottom() < region.bottom():
             count += 1
     return count
+
+
+def rows_that_fit(table) -> int:
+    """视口按**表格自己的行高**能装下几行（字体/DPI 无关的说法）。
+
+    为什么不直接断言 ``viewport().height() >= 8 * 30``：30 是 96 dpi 下 Noto 的
+    行高，Windows 的微软雅黑是 33——同一条断言在两种字体下表达的不是同一个
+    意思。用 ``table.rowHeight(0)``（或样式给的默认行高）去除视口高度，才是
+    “这张表能露几行”本身。
+    """
+    height = page_layout.table_row_height(table)
+    if height <= 0:                         # 控件已删：当成一行也没有
+        return 0
+    return int(table.viewport().height()) // int(height)
 
 
 def run_js(view, script: str, timeout_s: float = 10.0):
@@ -269,18 +292,29 @@ class ResultRowsVisibleTest(unittest.TestCase):
         wait(200)
         table = getattr(page, attr)
         rows = visible_rows(table)
+        # 表自己的最小高度：表壳 + 5 行 × **当前行高**（随字体变）。不要拿
+        # ``RESULT_TABLE_MIN_HEIGHT`` 这个 96 dpi 下的兜底值当判据。
         self.assertGreaterEqual(
-            table.height(), page_layout.RESULT_TABLE_MIN_HEIGHT,
-            f"{label}: 表高 {table.height()} 小于最小高度")
+            table.height(), page_layout.result_table_min_height(table),
+            f"{label}: 表高 {table.height()} 小于按行高算出的最小高度 "
+            f"{page_layout.result_table_min_height(table)}")
+        self.assertGreaterEqual(
+            rows_that_fit(table), want_rows,
+            f"{label}（{size[0]}×{size[1]}）: 视口 {table.viewport().height()} px "
+            f"÷ 行高 {page_layout.table_row_height(table)} px 只放得下 "
+            f"{rows_that_fit(table)} 行（要求 {want_rows}）")
         self.assertGreaterEqual(
             rows, want_rows,
             f"{label}（{size[0]}×{size[1]}）: 只看到 {rows} 行（要求 {want_rows}；"
             f"表高 {table.height()}，viewport {table.viewport().height()}，"
             f"表里共 {table.rowCount()} 行）")
-        self.assertEqual(window.width(), size[0],
-                         f"{label}: 窗口被撑宽到 {window.width()}")
-        self.assertEqual(window.height(), size[1],
-                         f"{label}: 窗口被撑高到 {window.height()}")
+        # 窗口尺寸：本意是“布局没把窗口撑大”。字体/DPI 会让最小尺寸比名义值大
+        # 几像素（Qt 只会往上抬、不会往下压），所以给 8 px 容差：远小于任何一段
+        # 布局的量级（几十~几百 px），真被撑大照样看得见。
+        self.assertLessEqual(window.width(), size[0] + 8,
+                             f"{label}: 窗口被撑宽到 {window.width()}")
+        self.assertLessEqual(window.height(), size[1] + 8,
+                             f"{label}: 窗口被撑高到 {window.height()}")
         window.close()
         page.deleteLater()
 
@@ -698,7 +732,12 @@ class WindowStrategyTest(unittest.TestCase):
 
         window = main_window.MainWindow(settings=self.settings)
         self.assertEqual(page_layout.DEFAULT_WINDOW_SIZE, (1600, 950))
-        self.assertEqual((window.width(), window.height()), (1600, 950))
+        # 常量就是常量；**窗口实际尺寸**给 8 px 容差：字体/DPI 会把窗口的最小
+        # 尺寸抬大几像素，Qt 只会往上抬（布局真装不下时抬得远不止 8 px）。
+        self.assertLessEqual(window.width(), 1600 + 8,
+                             f"窗口被撑宽到 {window.width()}")
+        self.assertLessEqual(window.height(), 950 + 8,
+                             f"窗口被撑高到 {window.height()}")
         self.assertEqual(page_layout.MINIMUM_WINDOW_SIZE, (1280, 800))
         self.assertEqual((window.minimumWidth(), window.minimumHeight()),
                          (1280, 800))
@@ -741,7 +780,16 @@ class WindowStrategyTest(unittest.TestCase):
         window.close()
 
     def test_last_window_size_is_remembered(self):
-        """关窗时的尺寸写进 QSettings，下次开窗照它摆回来。"""
+        """关窗时的尺寸写进 QSettings，下次开窗照它摆回来。
+
+        量的是“**记住的逻辑尺寸**”，不是“1480×930 这个请求值”：窗口能不能真的
+        取到 1480×930 取决于当时的字体/DPI（最小尺寸会把它抬大），`restoreGeometry`
+        存的也是逻辑几何。所以先量下第一次的真实尺寸，再看第二次是不是同一个数
+        （±1 px：Qt 在 DPI 换算里会取整）。
+
+        原来那条 ``assertEqual((w, h), (1480, 930))`` 隐含了“1480×930 一定能
+        取到”——在字体更大的 Windows 上就变成了失败。
+        """
         from laser_desktop import main_window
 
         first = main_window.MainWindow(settings=self.settings)
@@ -749,11 +797,17 @@ class WindowStrategyTest(unittest.TestCase):
         wait(80)
         first.resize(1480, 930)
         wait(120)
+        remembered = (first.width(), first.height())
         first.close()
 
         second = main_window.MainWindow(settings=self.settings)
-        self.assertEqual((second.width(), second.height()), (1480, 930),
-                         "上次关窗时的尺寸没被记住")
+        restored = (second.width(), second.height())
+        self.assertLessEqual(
+            abs(restored[0] - remembered[0]), 1,
+            f"上次关窗时宽 {remembered[0]}，重开变成 {restored[0]}")
+        self.assertLessEqual(
+            abs(restored[1] - remembered[1]), 1,
+            f"上次关窗时高 {remembered[1]}，重开变成 {restored[1]}")
         second.close()
 
     def test_tiny_saved_geometry_falls_back_to_the_default(self):
@@ -938,6 +992,7 @@ class FormNoHorizontalClippingTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # P5：关闭时序（先删 page 再删 view；5 次开关不崩）
 # ---------------------------------------------------------------------------
+@NEEDS_WEBENGINE
 class PlotShutdownTest(unittest.TestCase):
     """P5：``QWebEnginePage`` 必须比 profile 先没，否则 Qt 报 "Expect troubles !"。"""
 
@@ -1032,8 +1087,13 @@ class PlotShutdownTest(unittest.TestCase):
         root = str(Path(__file__).resolve().parents[3])
         env["PYTHONPATH"] = root + os.pathsep + os.path.join(root, "python")
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        # 子进程的 stdout/stderr 按 utf-8 写，父进程也按 utf-8 读：Windows 的默认
+        # cp936 一旦碰上非 ASCII 路径（用户名中文）就会 mojibake 或直接抛
+        # UnicodeDecodeError，报出来与“profile 告警”毫无关系。
+        env["PYTHONIOENCODING"] = "utf-8"
         result = subprocess.run([sys.executable, "-c", script], env=env,
                                 capture_output=True, text=True, timeout=180,
+                                encoding="utf-8", errors="replace",
                                 check=False)
         self.assertIn("done", result.stdout, result.stderr[-800:])
         self.assertNotIn("not deleted", result.stderr,
@@ -1043,6 +1103,7 @@ class PlotShutdownTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # P3：1000 点的 Plotly.react 计时（真 WebEngine，离屏）
 # ---------------------------------------------------------------------------
+@NEEDS_WEBENGINE
 class ReactTimingTest(unittest.TestCase):
     """1000 点换图 < 1.5 s（本机实测 60~170 ms；阈值只为防 CI 抖动）。"""
 
@@ -1099,6 +1160,7 @@ class ReactTimingTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # S6 评审 R1：图上高亮只增不减（restyle 就地改写 marker.size）
 # ---------------------------------------------------------------------------
+@NEEDS_WEBENGINE
 class PlotHighlightTest(unittest.TestCase):
     """R1：选 3 → 只有第 3 个点 12；再选 7 → 只有第 7 个 12；清空 → 全部回 5。
 
@@ -1169,6 +1231,7 @@ class PlotHighlightTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # S6 评审建议 3：壳页没加载时 measure_react 不能让调用方永久等待
 # ---------------------------------------------------------------------------
+@NEEDS_WEBENGINE
 class PendingMeasureTest(unittest.TestCase):
     """``measure_react`` 在加载前被调 → 加载完成后必须回调。"""
 
@@ -1201,6 +1264,7 @@ class PendingMeasureTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # S6 评审建议 4：桥的载荷校验 + 槽里不能抛异常
 # ---------------------------------------------------------------------------
+@NEEDS_WEBENGINE
 class BridgePayloadTest(unittest.TestCase):
     """坏载荷只忽略、不崩；只留 ``str``/``int`` 键。"""
 
@@ -1335,6 +1399,16 @@ class StatusBarTest(unittest.TestCase):
         if message:
             self.assertTrue(message.startswith("ISO："), message)
 
+    def _wait_selected(self, stub, keys, timeout_s: float = 2.0) -> bool:
+        """等图上收到这次高亮（表格→图是排队过去的，固定 sleep 不够稳）。"""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if stub.selected and stub.selected[-1] == list(keys):
+                return True
+            app().processEvents()
+            time.sleep(0.01)
+        return bool(stub.selected) and stub.selected[-1] == list(keys)
+
     def test_tables_rows_are_restored_on_the_plot_when_switching_back(self):
         """R2c：切回来时表格当前行必须重新点亮到图上。"""
         window = self.window
@@ -1346,14 +1420,13 @@ class StatusBarTest(unittest.TestCase):
         page = window.generate
         page.render_result(scan_result(8))
         page.waypoint_table.setCurrentCell(2, 0)    # 第 3 行
-        wait(60)
-        self.assertEqual(stub.selected[-1], ["3"])
+        self.assertTrue(self._wait_selected(stub, ["3"]),
+                        f"选中第 3 行后图上没收到高亮：{stub.selected}")
         stub.selected.clear()
         window.nav.setCurrentRow(1)                 # 切走
         window.nav.setCurrentRow(0)                 # 切回
-        wait(60)
-        self.assertEqual(stub.selected[-1], ["3"],
-                         "切回本页后图上的高亮没补回来")
+        self.assertTrue(self._wait_selected(stub, ["3"]),
+                        f"切回本页后图上的高亮没补回来：{stub.selected}")
         self.assertEqual(page.waypoint_table.currentRow(), 2)
 
 
@@ -1414,7 +1487,13 @@ class HiddenPageSelectionTest(unittest.TestCase):
 
 
 class FigurePushTest(unittest.TestCase):
-    """建议 1：同一张图不重复推；空页推空图（壳页重新显示「还没有数据」）。"""
+    """建议 1：同一张图不重复推；空页推空图（壳页重新显示「还没有数据」）。
+
+    这里只断言“推了哪几张图”，用不着真 Chromium；而真 ``QWebEngineView`` 反复
+    建/拆正是 Windows 上让整个测试进程崩掉的元凶（``0x80000003`` +
+    ``Failed to make current``）。所以：格子里的图落子一律走替身（``_StubHost``
+    / ``PlotHost(allow_webengine=False)``），判重逻辑本身仍是生产里那一份。
+    """
 
     def setUp(self):
         from laser_desktop import main_window
@@ -1435,6 +1514,15 @@ class FigurePushTest(unittest.TestCase):
         self.window.close()
         wait(30)
 
+    def _drain(self) -> None:
+        """把排队中的去抖/切页动作跑完。
+
+        切页与表单改动都是 ``QTimer`` 去抖的：不 drain 就直接清空再断言，排队的
+        那把推图会在断言之后（或刚好在断言前）才落地，数出来的张数就不稳了——
+        Windows 的事件循环比 Linux 慢一拍，这里最先暴露。
+        """
+        wait(150)
+
     def test_the_same_figure_is_pushed_only_once(self):
         window = self.window
         window.nav.setCurrentRow(0)
@@ -1443,6 +1531,7 @@ class FigurePushTest(unittest.TestCase):
         window.nav.setCurrentRow(0)
         window.nav.setCurrentRow(1)
         window.nav.setCurrentRow(0)
+        self._drain()                               # 排队中的推图先跑完
         self.stub.figures.clear()
         window._last_pushed = window.generate.current_figure()
         window._show_page_figure(window.generate)   # 同一张图：不该再推
@@ -1453,6 +1542,7 @@ class FigurePushTest(unittest.TestCase):
         """没出过图的页要推空图，而不是把上一页的图留在那里。"""
         window = self.window
         window.nav.setCurrentRow(0)
+        self._drain()                               # 先让去抖的预览图落地
         window.generate.last_figure = None          # 一张图都还没出过
         window._last_pushed = None
         self.stub.figures.clear()
@@ -1462,19 +1552,25 @@ class FigurePushTest(unittest.TestCase):
         self.assertEqual(len(page_layout.empty_figure().data), 0)
 
     def test_plot_view_skips_the_same_figure(self):
-        """判重做在 PlotView 里：页面的 ``_push_figure`` 也走这一道。"""
-        view = plot_view.PlotView()
-        self.addCleanup(view.shutdown)
-        view.loaded = True                          # 不真起壳页
-        calls = []
-        view._run_figure = lambda figure, token: calls.append((figure, token))
+        """判重做在图落子层（``_FigureSink``）：页面的 ``_push_figure`` 也走这一道。
+
+        用 ``allow_webengine=False`` 的替身：它和 ``PlotView`` **共用同一个
+        ``_FigureSink.set_figure``**（不是另写一份假实现），所以这条断言测的仍是
+        生产代码，只是不拉 Chromium。
+        """
+        host = plot_view.PlotHost(allow_webengine=False)
+        self.addCleanup(host.shutdown)
+        view = host.ensure()
+        self.assertTrue(view.loaded, "替身应该一建好就是已加载状态")
         figure = page_layout.empty_figure()
         view.set_figure(figure)
         view.set_figure(figure)
         view.set_figure(page_layout.empty_figure())  # 同一个单例也算同一张
-        self.assertEqual(len(calls), 1, f"同一张图推了 {len(calls)} 次")
+        self.assertEqual(len(view.figures), 1,
+                         f"同一张图推了 {len(view.figures)} 次")
 
 
+@NEEDS_WEBENGINE
 class EmptyFigureShellTest(unittest.TestCase):
     """建议 1：空图推下去之后，壳页的「还没有数据」要重新看得见。"""
 

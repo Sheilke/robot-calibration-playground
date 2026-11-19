@@ -407,8 +407,13 @@ class ConditioningGateTest(unittest.TestCase):
         self.assertNotIn("实测", output)
 
     def test_single_point_grid_serializes_infinite_condition_as_null(self):
-        """1 点网格：非 strict 运行可加载，conditioning 内无 Infinity。"""
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        """1 点网格：非 strict 运行可加载，conditioning 内无 Infinity。
+
+        临时目录用 ``tempfile`` 默认位置（**不写** ``dir="/tmp"``）：在 Windows
+        上 ``/tmp`` 会落到当前盘的 ``\\tmp``，一般不存在（也不一定可写），于是
+        ``main`` 连输出文件都建不出来——报出来的却是一个和条件数毫无关系的错。
+        """
+        with tempfile.TemporaryDirectory(prefix="snake-scan-") as tmp:
             out = Path(tmp) / "one_point.json"
             png = Path(tmp) / "one_point.png"
             with redirect_stdout(io.StringIO()):
@@ -432,7 +437,7 @@ class ConditioningGateTest(unittest.TestCase):
 
     def test_skip_ik_outputs_not_run_conditioning(self):
         """--skip-ik: 同构 conditioning（status=not_run）+ meta 三键。"""
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        with tempfile.TemporaryDirectory(prefix="snake-scan-") as tmp:
             out = Path(tmp) / "skip.json"
             png = Path(tmp) / "skip.png"
             with redirect_stdout(io.StringIO()):
@@ -471,7 +476,7 @@ class EulerConventionOptionTest(unittest.TestCase):
 
     def test_default_is_xyz_intrinsic_and_alias_matches(self):
         """默认就是 xyz-intrinsic（定轴已移除），--intrinsic 别名与显式给值一致。"""
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        with tempfile.TemporaryDirectory(prefix="snake-scan-") as tmp:
             root = Path(tmp)
             default = self._run([], root / "a.json", root / "a.png")
             intrinsic_flag = self._run(["--intrinsic"], root / "c.json",

@@ -99,8 +99,15 @@ class WriteTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
+    """CLI 端到端：临时目录一律用 ``tempfile`` 的默认位置。
+
+    旧写法是 ``TemporaryDirectory(dir="/tmp")``：在 Windows 上 ``/tmp`` 会解析成
+    当前盘的 ``\\tmp``，那个目录通常不存在，于是三个用例全部在``建临时目录``
+    这一步红掉（与 GP 导出逻辑无关）。
+    """
+
     def test_end_to_end(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        with tempfile.TemporaryDirectory(prefix="gp-export-") as tmp:
             root = Path(tmp)
             scan = root / "scan.json"
             scan.write_text(json.dumps(_scan_payload(50)), encoding="utf-8")
@@ -120,7 +127,7 @@ class CliTest(unittest.TestCase):
                              _template())
 
     def test_missing_ik_results(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        with tempfile.TemporaryDirectory(prefix="gp-export-") as tmp:
             root = Path(tmp)
             scan = root / "scan.json"
             scan.write_text(json.dumps({"meta": {}}), encoding="utf-8")
@@ -130,7 +137,7 @@ class CliTest(unittest.TestCase):
                 main([str(scan), str(tpl), "-o", str(root / "o.json")])
 
     def test_load_scan_points_skips_failures(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        with tempfile.TemporaryDirectory(prefix="gp-export-") as tmp:
             scan = Path(tmp) / "s.json"
             scan.write_text(json.dumps(_scan_payload(3)), encoding="utf-8")
             points = load_scan_points(scan)

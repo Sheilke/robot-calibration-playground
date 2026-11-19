@@ -21,7 +21,10 @@ S3–S5 是各页自己摆 ``QVBoxLayout`` + 两段 ``QSplitter``，结果在 11
   S6b 把按钮放在预览卡里，卡片被压矮后按钮就跟着滚出/被切半截；
 * :class:`MetricGrid` / :class:`StatsGrid`：预览数值与统计卡按需换行
   （宽度不够就换行，既不切字也不白占一行）。
-* :func:`mark_result_table`：结果表统一 ``minimumHeight``（表头 + 5 行）；
+* :func:`mark_result_table` / :func:`result_table_target_height`：结果表的
+  ``minimumHeight`` 按**当前字体的行高**算（壳 + 5 行），"8 点一屏看全"则由
+  :func:`result_table_target_height` 给出目标高度，交给 ``expand_result_area``
+  去争（不写死像素，也不把窗口最小高度顶破 800）；
 * :func:`table_key` / :func:`find_row` / :func:`gp_label`：表格第一列与图上
   ``customdata[0]`` 用的是同一个键（生成/修复 = GP 号，ISO = 点名 P1..P5），
   两侧互查都靠这三个函数，避免各页各写一套字符串比较。
@@ -56,19 +59,33 @@ NAV_WIDTH = 92
 #: ``QSettings`` 里存窗口几何的键（尺寸 + 位置一起存，见 ``saveGeometry``）。
 GEOMETRY_KEY = "window/geometry"
 
-#: 结果表的最小高度（px）：表头 + 5 行左右。低于这个数，一屏只能看到表头。
+#: 结果表至少要露出的行数（表头之外）：低于这个数，一屏只能看到表头。
+RESULT_TABLE_MIN_ROWS = 5
+
+#: 可见区域的实测损耗（px）：``viewport().visibleRegion()`` 比 ``viewport()`` 矮
+#: 这么一点。不给这点余量，“刚好 5 行高”的表在屏幕上只能看到 4 行。
+RESULT_TABLE_SLACK = 4
+
+#: 结果行数不多时（≤ 这个数）按**实际行数**算目标高度：8 点结果要能整屏看全。
+RESULT_TABLE_MAX_ROWS = 8
+
+#: 结果表最小高度的**兜底值**（px，96 dpi 下“表壳 + 5 行”的实测值）。
+#:
+#: 真正生效的是 :func:`result_table_min_height`（表壳 + 5 行 × **当前行高**）：
+#: 行高随字体/DPI 变（微软雅黑 12 pt ≈ 33 px、Noto 12 pt ≈ 31 px），写成常数
+#: 只在大字体的机器上就成了“表头 + 4 行”。这个常数只在量不出行高时用。
 RESULT_TABLE_MIN_HEIGHT = 200
 
-#: 结果区（右栏第三段）至少占的高度（px）：表 200 + 页签条 + 统计 + 状态/进度/
-#: 导出。低于它，表就被页签裁掉（**表控件**自己的高度仍是 200，最容易被骗）。
+#: 结果区（右栏第三段）至少占的高度（px）：表 + 页签条 + 统计 + 状态/进度/导出。
+#: 低于它，表就被页签裁掉（**表控件**自己的高度仍可能够，最容易被骗）。
 RESULT_MIN_HEIGHT = 300
 
 
-#: 结果页签的最小高度（px）说明：``QTabWidget`` 的 ``minimumSizeHint`` 只算
-#: **当前页**（Qt 的行为）。不显式定高的话，结果区的最小高度会随"当前点开哪个
-#: 页签"变：切到「计划」时页签要比它已分配的高度高，Qt 就把表裁掉——实测表自己
-#: 还是 200 高，屏幕上只剩 3 行（最容易被"表高够了"骗过去）。所以每页在建完
-#: 页签后给一个固定的最小高度（见各页的 ``TABS_MIN_HEIGHT``）。
+#: 结果页签的最小高度：``QTabWidget`` 的 ``minimumSizeHint`` 只算**当前页**
+#: （Qt 的行为）。不显式定高的话，结果区的最小高度会随"当前点开哪个页签"变：
+#: 切到「计划」时页签要比它已分配的高度高，Qt 就把表裁掉——实测表自己还是够高，
+#: 屏幕上只剩 3 行（最容易被"表高够了"骗过去）。所以每页建完页签后调
+#: :func:`mark_tabs_min_height`，按**最高的那一页**定高（不再写常数）。
 
 #: 图区在**默认窗口**下必须达到的高度（px）：3D 图是这个工具的核心产物，
 #: 120 px 只能看到一条缝（S6 第一版就是这么退化的）。
@@ -208,10 +225,178 @@ def save_window_geometry(window, settings=None) -> None:
     settings.sync()
 
 
+def table_row_height(table) -> int:
+    """表格**自己的**行高（px，含网格线）；量不出来返回 ``0``。
+
+    为什么必须从表里问而不是写常数：行高由字体与样式定（微软雅黑比 Noto 高
+    2–3 px），同一份布局在 Windows 与 Linux 上装得下的行数就不一样。
+
+    Args:
+        table: ``QTableWidget``。
+
+    Returns:
+        int: 行高（px）；表已被删/不是表时 ``0``。
+    """
+    try:
+        header = table.verticalHeader()
+        section = int(header.sectionSize(0) or 0)
+        if section > 0:                     # 已经排过版：最准
+            return section
+        default = int(header.defaultSectionSize() or 0)
+        if default > 0:                     # 还没排过版：样式给的默认行高
+            return default
+        if table.rowCount():
+            return max(1, int(table.sizeHintForRow(0) or 0))
+    except (AttributeError, RuntimeError):  # 控件已被删
+        return 0
+    return 0
+
+
+def result_table_chrome(table) -> int:
+    """表格的“壳”高度（px）：表头 + 边框 + 横向滚动条（+ 左侧行号列的边框）。
+
+    优先用**实测值**（``height() - viewport().height()``）：它连横向滚动条
+    （实测 14 px ≈ 半行）都算进去了——漏掉这条，按行高算出的高度就比视口真正
+    需要的少 14 px，大字体下“8 行”又变成 7 行（Windows 上就是这么差一行）。
+    还没排过版时（刚建出来）退回“表头 + 边框”的估算。
+
+    Args:
+        table: ``QTableWidget``。
+
+    Returns:
+        int: 壳高度（px）；量不出来返回 ``0``。
+    """
+    try:
+        # 还没排过版时 height() 是 0，measured 会算成负数，只能靠估算。估算里必须
+        # 把**横向滚动条**算进去：表比列宽窄时它一直显示，实测占 14 px（≈半行）。
+        # 漏掉它，按行高算出的最小高度就少半行，1280×800 下“5 行”变 4 行。
+        scrollbar = int(table.horizontalScrollBar().sizeHint().height())
+        estimate = (int(table.horizontalHeader().sizeHint().height())
+                    + 2 * int(table.frameWidth()) + scrollbar + 2)
+        measured = int(table.height()) - int(table.viewport().height())
+    except (AttributeError, RuntimeError):  # 控件已被删
+        return 0
+    return max(estimate, measured)
+
+
+def result_table_height(table, rows) -> int:
+    """露出 ``rows`` 行需要的表高：**壳 + rows × 行高**（按当前字体实测）。
+
+    Args:
+        table: 结果表（``QTableWidget``）。
+        rows: 要露出的行数。
+
+    Returns:
+        int: 高度（px）。量不出行高时返回 ``0``。
+    """
+    row_height = table_row_height(table)
+    if row_height <= 0:                     # 量不出来（控件已删/还没建）
+        return 0
+    # +RESULT_TABLE_SLACK：``viewport().visibleRegion()`` 比视口本身矮几像素
+    # （实测 4 px，边框/滚动条把上下各削掉一点）。只按 “壳 + N×行高” 算，表刚好
+    # N 行高时可见区域仍差几像素，屏幕上就是 N-1 行。
+    return (result_table_chrome(table)
+            + max(0, int(rows)) * row_height + RESULT_TABLE_SLACK)
+
+
+def result_table_min_height(table) -> int:
+    """结果表的**下限**高度：**壳 + RESULT_TABLE_MIN_ROWS（5）行 × 行高**。
+
+    为什么不按“实际行数”给下限：表的 ``minimumHeight`` 会一路传到窗口的
+    ``minimumSizeHint``（分段最小高度之和）。按 8 行给，1280×800 的最小窗口就
+    被顶到 853 px（实测），现场那台 1280×800 的笔记本连窗口都缩不回去。所以
+    **下限只保 5 行**，8 行是 :func:`result_table_target_height` 的**目标**，
+    由 ``expand_result_area`` 在默认窗口里争出来（争不到就滚动，不会撒谎）。
+
+    旧版是常数 200 px（= 96 dpi 下的“表头 + 5 行”）：字体一大，200 px 只装得下
+    4 行，且与行高无关——这才是 Windows 上“表高够、屏幕少一行”的根源。
+
+    Args:
+        table: 结果表（``QTableWidget``）。
+
+    Returns:
+        int: 最小高度（px）。量不出行高时退回 :data:`RESULT_TABLE_MIN_HEIGHT`。
+    """
+    height = result_table_height(table, RESULT_TABLE_MIN_ROWS)
+    return height or RESULT_TABLE_MIN_HEIGHT
+
+
+def result_table_target_height(table, rows=None) -> int:
+    """结果表的**目标**高度：结果不多（≤ 8 行）时按实际行数，否则按 8 行。
+
+    “8 点结果一屏看全”这个意图由 :func:`laser_desktop.generate_page.expand_result_area`
+    用它去争结果区高度；行高随字体变，所以这里也全是实测值。
+
+    Args:
+        table: 结果表（``QTableWidget``）。
+        rows: 想露出的行数；``None`` 时取
+            ``min(RESULT_TABLE_MAX_ROWS, max(RESULT_TABLE_MIN_ROWS, rowCount()))``。
+
+    Returns:
+        int: 目标高度（px）。量不出行高时返回 ``0``。
+    """
+    if rows is None:
+        rows = max(RESULT_TABLE_MIN_ROWS,
+                   min(RESULT_TABLE_MAX_ROWS, int(table.rowCount() or 0)))
+    rows = max(1, min(RESULT_TABLE_MAX_ROWS, int(rows)))
+    return result_table_height(table, rows)
+
+
 def mark_result_table(table) -> None:
-    """给结果表定下最小高度（表头 + 5 行），返回同一个表方便链式调用。"""
-    table.setMinimumHeight(RESULT_TABLE_MIN_HEIGHT)
+    """给结果表定下最小高度（壳 + 5 行 × 当前行高），返回同一个表。
+
+    Args:
+        table: 结果表（``QTableWidget``）。
+
+    Returns:
+        同一个 ``table``，方便链式调用。
+    """
+    table.setMinimumHeight(result_table_min_height(table))
     return table
+
+
+def tabs_min_height(tabs) -> int:
+    """页签控件的最小高度：**最高的那一页** + 页签条/边框（按字体实测）。
+
+    为什么不能写常数（旧版是各页的 ``TABS_MIN_HEIGHT``，生成页 246、修复页 315）：
+    各页的最小高度现在随表格行高变（:func:`mark_result_table`）。写死 246 时，
+    大字体下当前页要 280 px，页签控件却只给 246——表格被裁掉半截，屏幕上只剩
+    5 行，而“表自己的高度”看上去仍然够（最容易骗过测试的那种）。
+
+    “页签条 + 边框”这样量，不猜像素：``tabs.minimumSizeHint()`` 至少是
+    “最高那一页 + 页签条”，两者相减就是页签条/边框；万一 Qt 只按当前页算
+    （不同版本行为不一致），退回到 ``tabBar().sizeHint()`` 加边框。
+
+    Args:
+        tabs: ``QTabWidget``。
+
+    Returns:
+        int: 最小高度（px）；一页都没有时返回 ``0``。
+    """
+    tallest = 0
+    for index in range(tabs.count()):
+        page = tabs.widget(index)
+        if page is None:
+            continue
+        tallest = max(tallest, int(page.minimumSizeHint().height()))
+    if tallest <= 0:
+        return 0
+    chrome = int(tabs.minimumSizeHint().height()) - tallest
+    if chrome <= 0:                         # 只按当前页算：退回页签条实测高度
+        chrome = (int(tabs.tabBar().sizeHint().height())
+                  + 2 * int(tabs.frameWidth()))
+    return tallest + chrome
+
+
+def mark_tabs_min_height(tabs) -> None:
+    """把页签控件的最小高度定到“最高的那一页”（切页签不再改结果区高度）。
+
+    Args:
+        tabs: ``QTabWidget``。
+    """
+    height = tabs_min_height(tabs)
+    if height > 0:
+        tabs.setMinimumHeight(height)
 
 
 #: 「一张图都没有」时推给壳页的那张空图（同一个对象，主窗口才能按身份去重）。

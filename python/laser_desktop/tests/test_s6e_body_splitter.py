@@ -235,13 +235,19 @@ class BodySplitterDragTest(_MainWindowCase):
             splitter = self.body(page)
             start = splitter.sizes()[0]
             left_min = splitter.widget(0).minimumWidth()
+            # “还有余量可拖”用**它自己的最小宽度**表达，不写 “+20 px”：20 px 是
+            # 96 dpi 下的手感，字体一大（微软雅黑比 Noto 宽）表单的自然宽度就
+            # 接近 41% 那一份，同样布局的余量只剩几像素——但“能拖”这件事仍
+            # 成立。真贴住下限（start == left_min）时这条依旧会红。
             self.assertGreater(
-                start, left_min + 20,
-                f"{kind}：默认左栏 {start} 与最小值 {left_min} 差不多，拖不动")
+                start, left_min,
+                f"{kind}：默认左栏 {start} 已经贴住最小值 {left_min}，拖不动")
             self.drag_to(splitter, 1)
             sizes = splitter.sizes()
             self.assertLessEqual(sizes[0], left_min + 2,
                                  f"{kind}：拖到最左后 {sizes}")
+            self.assertLess(sizes[0], start,
+                            f"{kind}：拖到最左却没变窄（{start} -> {sizes[0]}）")
             self.assertGreaterEqual(sizes[1], splitter.widget(1).minimumWidth())
             window.close()
 
@@ -471,14 +477,21 @@ class VerticalSplitterUnaffectedTest(_MainWindowCase):
         wait(240)
         after = list(vertical.sizes())
         ratios_after = tuple(vertical.live_ratios())
+        # 容差按**总高度**算（1%）：横拖之后右栏变宽，预览卡里的数值网格可能少
+        # 换一行、告警文字可能少折一行，内容高度变了 Qt 就会按最小尺寸重排几
+        # 像素——那是布局自己算的，不是“程序把竖分割重算了一遍”。真被重算的话
+        # 差的是几十~上百 px（R3 那个 bug 是 84 px），1% 依旧拦得住。
+        tolerance = max(4.0, 0.01 * float(sum(before)))
         for index, (old, new) in enumerate(zip(before, after)):
             self.assertAlmostEqual(
-                float(new), float(old), delta=4.0,
+                float(new), float(old), delta=tolerance,
                 msg=f"{label}：横拖之后竖分割第 {index} 段 {new}（原 {old}，"
                     f"分割 {before} -> {after}）")
-        self.assertEqual(ratios_after, ratios_before,
-                         f"{label}：竖分割比例变了 {ratios_before} -> "
-                         f"{ratios_after}")
+        # 比例本身（千分比）同样只允许 1% 的容差变动。
+        for old, new in zip(ratios_before, ratios_after):
+            self.assertAlmostEqual(
+                float(new), float(old), delta=10.0,
+                msg=f"{label}：竖分割比例变了 {ratios_before} -> {ratios_after}")
         self.assertFalse(vertical.user_moved,
                          f"{label}：横拖把“用户拖过竖分割条”给置上了")
         self.assertFalse(vertical.protect_plot(),
@@ -507,7 +520,11 @@ class VerticalSplitterUnaffectedTest(_MainWindowCase):
         self.assertEqual(tuple(body.live_ratios()), dragged,
                          f"缩小窗口后横向比例变了 {dragged} -> "
                          f"{body.live_ratios()}")
-        expected = left_before * self.usable(body) / float(usable_before)
+        # 期望值 = 按比例缩的那份，但**不低于左段自己的最小宽度**：字体大时
+        # 比例算出来的宽度可能已经小于表单的最小宽度，那时 Qt 把左段抬到最小值
+        # 才是对的（原版只按比例算，在大字体机器上会误判）。
+        proportional = left_before * self.usable(body) / float(usable_before)
+        expected = max(proportional, float(body.widget(0).minimumWidth()))
         self.assertAlmostEqual(
             float(body.sizes()[0]), expected, delta=12.0,
             msg=f"缩小窗口后左段 {body.sizes()[0]}（按比例应 ~{expected:.0f}）")

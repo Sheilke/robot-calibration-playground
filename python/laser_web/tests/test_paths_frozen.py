@@ -18,6 +18,7 @@ PyInstaller 冻结后模块的 ``__file__`` 是 ``<_MEIPASS>/laser_web/core``（
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -39,14 +40,25 @@ def _run_frozen(code: str) -> str:
     proc = subprocess.run(
         [sys.executable, "-c", prelude + code],
         cwd=str(REPO), capture_output=True, text=True,
-        env={"PYTHONPATH": str(REPO / "python"), "PATH": "/usr/bin:/bin",
-             "HOME": str(Path.home())},
+        env=_child_env(),
         timeout=300,
     )
     if proc.returncode != 0:
         raise AssertionError(
             f"子进程失败（{proc.returncode}）：\n{proc.stdout}\n{proc.stderr}")
     return proc.stdout.strip()
+
+
+def _child_env() -> dict:
+    """子进程环境：**继承当前环境**，只把 PYTHONPATH 指到仓库的 python/。
+
+    不要手写 ``{"PATH": "/usr/bin:/bin"}``：在 Windows 上那样会让子进程找不到
+    系统目录，导入链里一旦碰到需要它们的东西就整段失败，报出来的却是一个
+    和被测逻辑无关的错（本文件最初就是这么写的，在 Linux 上永远看不出来）。
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO / "python")
+    return env
 
 
 class FrozenAssetRootTest(unittest.TestCase):
@@ -82,8 +94,7 @@ class FrozenAssetRootTest(unittest.TestCase):
             [sys.executable, "-c",
              "from laser_web import paths; print(paths.asset_root())"],
             cwd=str(REPO), capture_output=True, text=True,
-            env={"PYTHONPATH": str(REPO / "python"), "PATH": "/usr/bin:/bin",
-                 "HOME": str(Path.home())},
+            env=_child_env(),
             timeout=300,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -97,8 +108,7 @@ class FrozenAssetRootTest(unittest.TestCase):
              "from laser_desktop import paths as desktop;"
              "print(paths.asset_root() == desktop.asset_root())"],
             cwd=str(REPO), capture_output=True, text=True,
-            env={"PYTHONPATH": str(REPO / "python"), "PATH": "/usr/bin:/bin",
-                 "HOME": str(Path.home())},
+            env=_child_env(),
             timeout=300,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)

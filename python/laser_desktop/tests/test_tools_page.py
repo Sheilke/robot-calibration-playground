@@ -330,16 +330,30 @@ class TemplateBlockTest(PageCase):
         self.assertEqual(self.page.template_file["sha256"], before)
 
     def test_missing_template_shows_dash(self):
-        """找不到模板时显示 ``—``、搜索路径与环境变量名，不谎报一个 sha256。"""
+        """找不到模板时显示 ``—``、搜索路径与环境变量名，不谎报一个 sha256。
+
+        断言用 ``str(Path(...))`` 而不是手写 ``"/nonexistent/x.json"``：同一个
+        ``Path`` 在 Windows 上渲染成 ``\\nonexistent\\x.json``，拿 POSIX 字符串去
+        ``assertIn`` 必红——那测的是“测试跑在哪个系统”，不是“提示里有没有这条
+        搜索路径”。提示语也只匹配关键片段（“找不到” + 环境变量名），不整句比。
+        """
+        missing = Path("/nonexistent/x.json")      # 只是路径对象，不碰磁盘
         with mock.patch.object(tools_page, "template_candidates",
-                               return_value=[Path("/nonexistent/x.json")]):
+                               return_value=[missing]):
             info = self.page.refresh_template_block()
+        size_text = self.page.template_size_label.text()
+        sha_text = self.page.template_sha_label.text()
+        path_text = self.page.template_path_label.text()
         self.assertFalse(info["exists"])
-        self.assertIn("—", self.page.template_size_label.text())
-        self.assertIn("—", self.page.template_sha_label.text())
-        self.assertIn("/nonexistent/x.json", self.page.template_path_label.text())
-        self.assertIn(tools_page.TEMPLATE_ENV,
-                      self.page.template_path_label.text())
+        self.assertIsNone(info["sha256"], "找不到模板却报了一个 sha256")
+        self.assertIsNone(info["size_bytes"])
+        self.assertEqual(info["path"], "", "找不到模板却报了一个路径")
+        self.assertIn("—", size_text)
+        self.assertIn("—", sha_text)
+        self.assertNotRegex(sha_text, r"[0-9a-f]{32,}", "缺值却打了一串摘要")
+        self.assertIn("找不到", path_text)
+        self.assertIn(str(missing), path_text)
+        self.assertIn(tools_page.TEMPLATE_ENV, path_text)
 
     def test_candidates_have_no_home_documents_fallback(self):
         """搜索路径只有三处（环境变量 / 数据目录 / configs），不再兜底
@@ -355,9 +369,10 @@ class TemplateBlockTest(PageCase):
         self.assertFalse(any("Documents" in str(path) for path in candidates),
                          candidates)
         with mock.patch.dict(os.environ,
-                             {tools_page.TEMPLATE_ENV: "/tmp/x.json"}):
+                             {tools_page.TEMPLATE_ENV: str(self.files / "x.json")}):
             self.assertEqual(tools_page.template_candidates()[0],
-                             Path("/tmp/x.json"), "环境变量仍然排第一")
+                             Path(str(self.files / "x.json")),
+                             "环境变量仍然排第一")
 
 
 class GpExportTest(PageCase):

@@ -35,10 +35,12 @@ from laser_web import core, jobs
 REPO_ROOT = Path(__file__).resolve().parents[3]
 #: 现场的真模板（**只读**引用，不复制进仓库；文档里明确它是现场备份）。
 TEMPLATE_PATH = Path("/home/infoli/Documents/backup/position_R1_template.json")
-#: 跑 CLI 用的解释器：优先仓库的 venv（与自检命令一致），否则退回当前解释器。
-PYTHON = str(REPO_ROOT / ".venv" / "bin" / "python")
-if not Path(PYTHON).exists():                       # pragma: no cover - 环境兜底
-    PYTHON = sys.executable
+#: 跑 CLI 用的解释器：**就是跑 pytest 的这一个**。
+#:
+#: 不要写成 ``"python"``/``"python3"`` 字符串（Windows 上可能指向另一个 Python
+#: 或根本不存在），也不要猜 venv 路径（``.venv/bin/python`` 在 Windows 上是
+#: ``.venv\Scripts\python.exe``）。
+PYTHON = sys.executable
 
 #: 8 点小案子（与 ``test_run_scan`` 同一份参数，1 s 内跑完）。
 BASE_PARAMS = {"robot": "data/configs/ch2000_origin.urdf",
@@ -99,7 +101,8 @@ def _run_export_gp(*argv: str) -> Path:
         os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     completed = subprocess.run(
         [PYTHON, "-m", "excitation_trajectory.export_gp", *argv],
-        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, check=False)
+        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", check=False)
     if completed.returncode != 0:                    # pragma: no cover - 失败才走
         raise AssertionError(f"CLI 失败（{completed.returncode}）：\n"
                              f"{completed.stdout}\n{completed.stderr}")
@@ -117,6 +120,10 @@ class RunOnceMixin:
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.TemporaryDirectory()
+        # CLI 的输出另外放一个临时目录：**不写** ``/tmp``（Windows 上那是当前盘
+        # 的 ``\tmp``，一般不存在，CLI 会写不出来），也不写进 ``runs/``（否则
+        # “运行列表 / 清理”的用例会把它数成一次运行）。
+        cls._cli_tmp = tempfile.TemporaryDirectory(prefix="laser-web-cli-")
         cls._previous_runs = os.environ.get(jobs.RUNS_ENV)
         os.environ[jobs.RUNS_ENV] = cls._tmp.name
         cls.scan_result = core.run_scan(_params())
@@ -128,6 +135,12 @@ class RunOnceMixin:
         else:
             os.environ[jobs.RUNS_ENV] = cls._previous_runs
         cls._tmp.cleanup()
+        cls._cli_tmp.cleanup()
+
+    @classmethod
+    def cli_out(cls, name: str) -> str:
+        """本组用例专用的 CLI 输出路径（平台无关的临时目录）。"""
+        return str(Path(cls._cli_tmp.name) / name)
 
 
 class GpExportTest(RunOnceMixin, unittest.TestCase):
@@ -168,7 +181,7 @@ class GpExportTest(RunOnceMixin, unittest.TestCase):
     def test_fields_match_cli(self):
         """8 个 GP × 14 个字段与 CLI ``--first 1`` 逐个相等。"""
         cli_out = _run_export_gp(str(self.scan_json), str(TEMPLATE_PATH),
-                                 "-o", "/tmp/laser_web_test_gp_cli.json",
+                                 "-o", self.cli_out("gp_cli.json"),
                                  "--first", "1")
         mine = _registers(Path(self.zero["path"]))
         theirs = _registers(cli_out)
@@ -189,7 +202,7 @@ class GpExportTest(RunOnceMixin, unittest.TestCase):
                               "first": 11, "flag": 1})
         self.assertTrue(mine["ok"], mine.get("error"))
         cli_out = _run_export_gp(str(self.scan_json), str(TEMPLATE_PATH),
-                                 "-o", "/tmp/laser_web_test_gp_cli_flag.json",
+                                 "-o", self.cli_out("gp_cli_flag.json"),
                                  "--first", "11", "--flag", "1")
         self.assertEqual((mine["first"], mine["last"]), (11, 18))
         mine_regs, cli_regs = _registers(Path(mine["path"])), _registers(cli_out)
@@ -238,7 +251,7 @@ class GpExportTest(RunOnceMixin, unittest.TestCase):
                               "euler": "xyz-intrinsic"})
         self.assertTrue(mine["ok"], mine.get("error"))
         cli_out = _run_export_gp(str(self.scan_json), str(TEMPLATE_PATH),
-                                 "-o", "/tmp/laser_web_test_gp_cli_fk.json",
+                                 "-o", self.cli_out("gp_cli_fk.json"),
                                  "--first", "1", "--cartesian", "fk",
                                  "--cart-units", "rad",
                                  "--euler", "xyz-intrinsic")

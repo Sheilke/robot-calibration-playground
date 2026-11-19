@@ -26,6 +26,10 @@ from pathlib import Path
 
 from laser_web import core, jobs
 
+#: 仓库根（``<repo>/python/laser_web/tests/test_run_scan.py`` 往上三级）。
+#: 子进程跑 CLI 时要显式 ``cwd`` 到这里（``--urdf`` 用的是仓库内的相对路径）。
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
 #: 8 点小案子：域 200 x 200 x 200 mm，够小到 1 s 内跑完。
 SMALL_DOMAIN = {"point_min": [900.0, -100.0, 500.0],
                 "point_max": [1100.0, 100.0, 700.0]}
@@ -275,9 +279,27 @@ class GuardParityTest(unittest.TestCase):
     }
 
     def test_scan_matches_cli_while_guard_resamples(self):
+        """CLI 与 ``core.run_scan`` 逐字段对照（子进程按跨平台写法起）。
+
+        这里每一条都是踩过的坑，写在一处方便以后照抄：
+
+        * **临时路径**：用 ``tempfile``（``TemporaryDirectory``），不写
+          ``/tmp/...``——Windows 上 ``/tmp`` 是当前盘的 ``\\tmp``，那个目录一般
+          不存在，CLI 写不出 json 就直接 exit 1（报出来是个和算法无关的
+          ``CalledProcessError``）；
+        * **解释器**：``sys.executable``，不用 ``"python"`` 字符串（Windows 上
+          那个名字可能指向另一个 Python，或者根本没有）；
+        * **cwd**：显式给仓库根，``--urdf`` 用的是相对路径，不假设调用者的 cwd；
+        * **环境**：继承 ``os.environ``，只覆盖 ``PYTHONPATH``（绝对值）——手写
+          一个只有 PATH/PYTHONPATH 的环境在 Windows 上会让子进程找不到系统目录；
+        * **编码**：显式 ``utf-8`` + ``errors="replace"``。Windows 的子进程默认按
+          cp936 解码，只要 CLI 输了中文/特殊字符就炸。
+        """
         import json
+        import os
         import subprocess
         import sys
+        import tempfile
         from pathlib import Path
 
         result = core.run_scan(dict(self.PARAMS))
@@ -286,20 +308,29 @@ class GuardParityTest(unittest.TestCase):
         self.assertGreater(len(web["singularity_guard"]["resampled"]), 0,
                            "本用例必须真的触发重采，否则测不到回归")
 
-        cli_out = Path("/tmp") / "laser_web_guard_parity.json"
-        subprocess.run(
-            [sys.executable, "-m", "excitation_trajectory.aabb_snake_scan",
-             "900", "1100", "-100", "100", "500", "700",
-             "--target-count", "8",
-             "--urdf", "data/configs/hyundai_general6s.urdf",
-             "--rpy", "3", "73", "-167", "--euler", "xyz-intrinsic",
-             "--perturb-deg", "20", "20", "35", "--j5-min", "88",
-             "--q-seed", "43,-30,-36,42,-89,-1", "--seed", "0",
-             "--cond-max", "99", "--seg-mode", "cartesian",
-             "--seg-samples", "11",
-             "--out", str(cli_out), "--plot", "/tmp/laser_web_guard_parity.png"],
-            check=True, capture_output=True)
-        cli = json.loads(cli_out.read_text("utf-8"))
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(REPO_ROOT / "python") + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        # 子进程也按 utf-8 写：其 stdout 上的中文日志与 Windows 的 cp936 默认值
+        # 对不上时，失败信息会变成乱码（真正的原因就看不见了）。
+        env["PYTHONIOENCODING"] = "utf-8"
+        with tempfile.TemporaryDirectory(prefix="laser-web-parity-") as tmp:
+            cli_out = Path(tmp) / "laser_web_guard_parity.json"
+            cli_plot = Path(tmp) / "laser_web_guard_parity.png"
+            subprocess.run(
+                [sys.executable, "-m", "excitation_trajectory.aabb_snake_scan",
+                 "900", "1100", "-100", "100", "500", "700",
+                 "--target-count", "8",
+                 "--urdf", "data/configs/hyundai_general6s.urdf",
+                 "--rpy", "3", "73", "-167", "--euler", "xyz-intrinsic",
+                 "--perturb-deg", "20", "20", "35", "--j5-min", "88",
+                 "--q-seed", "43,-30,-36,42,-89,-1", "--seed", "0",
+                 "--cond-max", "99", "--seg-mode", "cartesian",
+                 "--seg-samples", "11",
+                 "--out", str(cli_out), "--plot", str(cli_plot)],
+                check=True, cwd=str(REPO_ROOT), env=env, capture_output=True,
+                text=True, encoding="utf-8", errors="replace")
+            cli = json.loads(cli_out.read_text("utf-8"))
         for key in ("conditioning", "perturbed_ik", "singularity_guard",
                     "segment_check", "waypoints"):
             self.assertEqual(web[key], cli[key], f"{key} 与 CLI 不一致")

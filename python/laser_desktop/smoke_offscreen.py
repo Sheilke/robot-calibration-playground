@@ -89,25 +89,31 @@ from laser_desktop import page_layout
 from laser_desktop import paths
 from laser_desktop import tools_page
 
+#: 截图目录：``tempfile`` 认定的临时目录。**不写死** ``/tmp``——Windows 上那是
+#: 当前盘的 ``\\tmp``，一般不存在，截图一张也落不了盘（脚本却在别处先报错）。
+SHOT_DIR = tempfile.gettempdir()
+
 #: 截图落盘位置（每次覆盖）。
-SHOT = "/tmp/desktop_s3.png"
+SHOT = os.path.join(SHOT_DIR, "desktop_s3.png")
 #: S4（奇异修复页）截图落盘位置。
-SHOT_S4 = "/tmp/desktop_s4.png"
+SHOT_S4 = os.path.join(SHOT_DIR, "desktop_s4.png")
 #: S5（ISO 五点页 / 工具页）截图落盘位置。
-SHOT_S5_ISO = "/tmp/desktop_s5_iso.png"
-SHOT_S5_TOOLS = "/tmp/desktop_s5_tools.png"
+SHOT_S5_ISO = os.path.join(SHOT_DIR, "desktop_s5_iso.png")
+SHOT_S5_TOOLS = os.path.join(SHOT_DIR, "desktop_s5_tools.png")
 #: S6b（默认窗口下的三页）截图落盘位置。
-SHOT_S6 = {"generate": "/tmp/desktop_s6b_generate.png",
-           "iso": "/tmp/desktop_s6b_iso.png",
-           "repair": "/tmp/desktop_s6b_repair.png"}
+SHOT_S6 = {"generate": os.path.join(SHOT_DIR, "desktop_s6b_generate.png"),
+           "iso": os.path.join(SHOT_DIR, "desktop_s6b_iso.png"),
+           "repair": os.path.join(SHOT_DIR, "desktop_s6b_repair.png")}
 #: S6b 的最小窗口（现场老笔记本）截图：证明左侧表单不被横向裁掉。
-SHOT_S6_SMALL = "/tmp/desktop_s6b_small.png"
+SHOT_S6_SMALL = os.path.join(SHOT_DIR, "desktop_s6b_small.png")
 #: S6d（S6 评审后）的六张截图：三页 × 两种窗口尺寸（文件名里带尺寸）。
-SHOT_S6C = {(kind, size_label): f"/tmp/desktop_s6d_{kind}_{size_label}.png"
+SHOT_S6C = {(kind, size_label): os.path.join(
+                SHOT_DIR, f"desktop_s6d_{kind}_{size_label}.png")
             for kind in ("generate", "iso", "repair")
             for size_label in ("1600", "1280")}
 #: S6e（三页的左右两栏横向可拖）的六张截图：默认 / 把左栏拖到最窄。
-SHOT_S6E = {(kind, label): f"/tmp/desktop_s6e_{kind}_{label}.png"
+SHOT_S6E = {(kind, label): os.path.join(
+                SHOT_DIR, f"desktop_s6e_{kind}_{label}.png")
             for kind in ("generate", "iso", "repair")
             for label in ("default", "dragged")}
 #: S6b 的**默认**窗口（= MainWindow 的默认尺寸）：一屏 8 行的口径。
@@ -739,6 +745,19 @@ def s6_report_rows(name, page, table, want_rows=None, size=None):
     want_rows = S6_MIN_ROWS if want_rows is None else int(want_rows)
     want_rows = min(want_rows, max(1, table.rowCount()))
     width, height = (S6_WIDTH, S6_HEIGHT) if size is None else size
+    # 量之前先切到**装这张表的页签**。修复页有 5 个页签，表格在「计划」里；
+    # 停在「定位」时那个页是隐藏的，`viewport().height()` 拿到的是上一次排版的
+    # 残留值（实测 202 px → 显示“4 行”），而真显示计划页时同一窗口能装 5 行。
+    # 不切就量，会把“没在看的那一页”判成布局问题。
+    page_for_tabs = getattr(page, "result_tabs", None)
+    if page_for_tabs is not None:
+        for index in range(page_for_tabs.count()):
+            candidate = page_for_tabs.widget(index)
+            if candidate is not None and table.isAncestorOf(candidate if hasattr(table, "isAncestorOf") else candidate):
+                pass
+            if candidate is not None and candidate.isAncestorOf(table):
+                page_for_tabs.setCurrentWidget(candidate)
+                break
     wait_events(0.35)                    # 刚切过页签/刚出结果：等布局落定
     rows = visible_rows(table)
     sizes = page._viewer_splitter.sizes()

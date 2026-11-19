@@ -104,9 +104,6 @@ FACE_LABELS = ("X− 面心", "X+ 面心", "Y− 面心", "Y+ 面心",
 EXPORTS = (("iso_json", "iso.json", "JSON (*.json);;所有文件 (*)"),
            ("plot", "iso.png", "PNG 图片 (*.png);;所有文件 (*)"))
 
-#: 结果区最小高度（px）：底栏 + 统计行 + 表各占一些（见 ``page_layout``）。
-TABS_MIN_HEIGHT = 262
-
 #: 两个页签（规格：路点 / 预览；日志页随任务机制一起删了）。
 TABS = ("路点", "预览")
 
@@ -885,9 +882,11 @@ class IsoPage(QtWidgets.QWidget):
         self.result_tabs = QtWidgets.QTabWidget()
         self.points_page = self._build_points_page()
         self.preview_page = self._build_preview_page()
-        self.result_tabs.setMinimumHeight(TABS_MIN_HEIGHT)
         self.result_tabs.addTab(self.points_page, TABS[0])
         self.result_tabs.addTab(self.preview_page, TABS[1])
+        # 最小高度按**最高的那一页**算（见 page_layout.tabs_min_height）：表格的
+        # 最小高度随行高变，写常数会让大字体下的表被页签裁掉半截。
+        page_layout.mark_tabs_min_height(self.result_tabs)
         # 切页签后重新撑一次（口径见 generate_page.expand_result_area）
         self.result_tabs.currentChanged.connect(
             lambda _index: self._expand_result_area())

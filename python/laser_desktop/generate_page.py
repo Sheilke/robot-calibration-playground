@@ -111,11 +111,6 @@ SEGMENT_AUTOFIT_LIMIT = 200
 #: :data:`SEGMENT_HEADERS`）。
 SEGMENT_COLUMN_WIDTHS = (110, 90, 90, 60, 210)
 
-#: 结果页签的最小高度（px）：``QTabWidget`` 只按**当前页**报最小尺寸，不定死
-#: 的话切到「段诊断」时结果区会把表裁掉（见 :mod:`laser_desktop.page_layout`
-#: 顶部的说明）。240 ≈ 页签条 + 表 200 + 少量边距。
-TABS_MIN_HEIGHT = 246
-
 #: 省略提示（``JobBridge`` 在源缓冲丢行时插的一行）的行首。
 OMISSION_PREFIX = "…已省略"
 
@@ -536,47 +531,69 @@ def _compact_result_layout(layout) -> None:
     layout.setSpacing(2)
 
 
+def _tabs_of_page(page):
+    """``page`` 所在的 ``QTabWidget``（不在页签里时返回 ``None``）。"""
+    parent = page.parentWidget() if page is not None else None
+    while parent is not None:
+        if isinstance(parent, QtWidgets.QTabWidget):
+            return parent
+        parent = parent.parentWidget()
+    return None
+
+
 def wanted_result_height(result_area, table,
-                         rows: int = RESULT_ROW_TARGET) -> int:
+                         rows: int = RESULT_ROW_TARGET, tabs=None) -> int:
     """要露出 ``rows`` 行，结果区得多高（按当前字体/样式实测，不拍脑袋）。
 
-    算法：表的视口高度 = 行高 × 行数（``sizeHintForRow``），再加上表自己的
-    "壳"（表头 + 边框 + 横向滚动条 = ``height - viewport.height()``）与结果区
-    里除表以外的东西（页签条 / 统计 / 状态 / 进度 / 导出 / 标题）。两者都是
-    现场量的，三页各不相同的部分（ISO 只有 5 个点、修复页多一行运行目录）
-    不需要在这里写分支。
+    三段相加，全是实测值：
+
+    1. **表**：壳（表头 + 边框 + 横滚条，:func:`page_layout.result_table_chrome`）
+       + ``rows`` 行 × 行高（:func:`page_layout.result_table_target_height`）；
+    2. **表所在页**里除表以外的东西（说明行、边距）：``页.minimumSizeHint()``
+       减去表的最小高度——两个都随字体变，差值是纯“别的控件”；
+    3. **页签条/边框** + 结果区里页签以外的东西（统计卡 / 状态 / 进度 / 导出）：
+       前者 = ``页签.minimumSizeHint() - 当前页.minimumSizeHint()``，后者 =
+       ``结果区.height() - 页签.height()``。
+
+    为什么**不用** ``结果区 - 表.height()`` 当“表以外占多少”：表被页签裁掉时
+    （大字体下正是这种情形）那个差值里裹着一块表根本拿不到的高度，算出来的
+    目标偏小，于是 :func:`expand_result_area` 以为“已经够了”、不动手——现场
+    看到的就是 7 行而不是 8 行。
 
     Args:
         result_area: 结果区 ``QGroupBox``（:attr:`GeneratePage.result_area`）。
         table: 结果表（生成/修复 = 路点表，ISO = 点表）。
         rows: 想露出的行数（不超过表里实际行数）。
+        tabs: 表所在的 ``QTabWidget``；``None`` 时沿父链自己找。
 
     Returns:
         int: 期望的结果区高度（px）。
     """
     if result_area is None or table is None:
         return RESULT_MIN_HEIGHT
+    wanted_table = page_layout.result_table_target_height(table, rows)
+    if wanted_table <= 0:                  # 控件已删 / 量不出行高
+        return RESULT_MIN_HEIGHT
     try:
-        row_count = max(0, table.rowCount())
-        section = int(table.verticalHeader().sectionSize(0) or 0)
-        table_height = int(table.height())
-        viewport_height = int(table.viewport().height())
         area_height = int(result_area.height())
+        table_height = int(table.height())
+        table_page = table.parentWidget()
+        if tabs is None:
+            tabs = _tabs_of_page(table)
+        extra = 0
+        if table_page is not None:
+            extra += max(0, int(table_page.minimumSizeHint().height())
+                         - int(table.minimumHeight()))
+        if tabs is not None and tabs.isVisible():
+            current = tabs.currentWidget()
+            if current is not None:
+                extra += max(0, int(tabs.minimumSizeHint().height())
+                             - int(current.minimumSizeHint().height()))
+            extra += max(0, area_height - int(tabs.height()))
+        else:                               # 没有页签（或还没展开）：退回“结果区 - 表”
+            extra += max(0, area_height - table_height)
     except RuntimeError:                   # 页面已被删：回到静态下限
         return RESULT_MIN_HEIGHT
-    count = min(int(rows), row_count)
-    # 行高用**表头段高**（``sizeHintForRow`` 报 26、实际行是 30 px，差 4 px
-    # 足以把第 8 行切掉半截——实测就是靠多露 2 px 才从 7 行变 8 行）。
-    row_height = section
-    if row_height <= 0 and row_count:
-        row_height = int(table.sizeHintForRow(0) or 0)
-    if row_height <= 0:
-        row_height = 30
-    # 行间还有 1 px 网格线，最后再留 4 px 余量（字体换一下不至于又少一行）
-    viewport = row_height * count + max(0, count - 1) + 4
-    table_shell = max(0, table_height - viewport_height)
-    wanted_table = viewport + table_shell
-    extra = max(0, area_height - table_height)
     return int(wanted_table + extra)
 
 
@@ -602,9 +619,17 @@ def expand_result_area(page) -> None:
         return
     table = getattr(page, "waypoint_table", None) or getattr(
         page, "point_table", None)
+    if table is not None:
+        # 下限与行高/表壳一起走（壳 + 5 行 × **当前行高**）：不再写死 200 px。
+        page_layout.mark_result_table(table)
+    tabs = getattr(page, "result_tabs", None)
+    if tabs is not None:
+        # 页签的最小高度跟着页走（最高的那一页）：否则表的下限长了，页签控件
+        # 仍按旧高度裁它——屏幕上看得到 5 行，而“表高”仍是够的。
+        page_layout.mark_tabs_min_height(tabs)
     try:
         target = max(RESULT_MIN_HEIGHT, wanted_result_height(
-            getattr(page, "result_area", None), table))
+            getattr(page, "result_area", None), table, tabs=tabs))
         sizes = list(splitter.sizes())
     except RuntimeError:                       # 页面/控件已被删
         return
@@ -1567,10 +1592,12 @@ class GeneratePage(QtWidgets.QWidget):
         self.waypoints_page = self._build_waypoints_page()
         self.segments_page = self._build_segments_page()
         self.log_page = self._build_log_page()
-        self.result_tabs.setMinimumHeight(TABS_MIN_HEIGHT)
         self.result_tabs.addTab(self.waypoints_page, "路点")
         self.result_tabs.addTab(self.segments_page, "段诊断")
         self.result_tabs.addTab(self.log_page, "日志")
+        # 最小高度按**最高的那一页**算（见 page_layout.tabs_min_height）：表格的
+        # 最小高度随**行高**变，写常数会让大字体下的表被页签裁掉半截。
+        page_layout.mark_tabs_min_height(self.result_tabs)
         # 切页签会改变「结果区最少要多高」（QTabWidget 只算当前页）：切到路点表
         # 就把结果区撑到够看 8 行（出结果那一刻当前页签可能还是日志）。
         self.result_tabs.currentChanged.connect(

@@ -127,10 +127,6 @@ EXPORTS = (("scan_json", "scan.json", "JSON (*.json);;所有文件 (*)"),
            ("plot", "plot.png", "PNG 图片 (*.png);;所有文件 (*)"),
            ("repair", "repair.json", "JSON (*.json);;所有文件 (*)"))
 
-#: 结果页签的最小高度（px）：这一页的「计划」页签里有统计(3 行) + 运行目录 +
-#: 路点表，是四页里最高的；不定死的话切到它就裁表（见 ``page_layout`` 的说明）。
-TABS_MIN_HEIGHT = 315
-
 #: 左侧表单列的宽度上限（px）。这一页的「现场信息」有 6 个关节角 + 「删除本组」，
 #: 是四页里最宽的一行；下限同样不写死，由 ``generate_page._form_scroll`` 量。
 REPAIR_FORM_MAX_WIDTH = 640
@@ -886,12 +882,14 @@ class RepairPage(QtWidgets.QWidget):
         self.plan_page = self._build_plan_page()
         self.segment_page = self._build_segment_page()
         self.log_page = self._build_log_page()
-        self.result_tabs.setMinimumHeight(TABS_MIN_HEIGHT)
         self.result_tabs.addTab(self.locate_page, "定位")
         self.result_tabs.addTab(self.compare_page, "修复")
         self.result_tabs.addTab(self.plan_page, "计划")
         self.result_tabs.addTab(self.segment_page, "段诊断")
         self.result_tabs.addTab(self.log_page, "日志")
+        # 最小高度按**最高的那一页**算（见 page_layout.tabs_min_height）：表格的
+        # 最小高度随行高变，写常数会让大字体下的表被页签裁掉半截。
+        page_layout.mark_tabs_min_height(self.result_tabs)
         # 切页签后重新撑一次（口径见 generate_page.expand_result_area）
         self.result_tabs.currentChanged.connect(
             lambda _index: self._expand_result_area())
@@ -1042,10 +1040,11 @@ class RepairPage(QtWidgets.QWidget):
         layout.addWidget(self.plan_status_label)
 
         # 路点表的说明放进 tooltip：这一页要同时放两张表，再加一行说明，结果区
-        # 的最小高度就把窗口最小高度顶破了（实测 837）。
+        # 的最小高度就把窗口最小高度顶破了（实测 837）。最小高度由
+        # ``mark_result_table`` 按行高算（表壳 + 5 行 × 行高），这里**不要**再
+        # 钉一个常数：那会把动态值改回 200 px，大字体下表就只露 4 行。
         self.waypoint_table = page_layout.mark_result_table(
             make_table(generate_page.WAYPOINT_HEADERS))
-        self.waypoint_table.setMinimumHeight(page_layout.RESULT_TABLE_MIN_HEIGHT)
         self.waypoint_table.setToolTip(
             "修复后的路点表：排序后失败行仍标红；选一行，图上的点会放大。")
         layout.addWidget(self.waypoint_table, 1)
