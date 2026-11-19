@@ -802,12 +802,30 @@ class WindowStrategyTest(unittest.TestCase):
 
         second = main_window.MainWindow(settings=self.settings)
         restored = (second.width(), second.height())
-        self.assertLessEqual(
-            abs(restored[0] - remembered[0]), 1,
-            f"上次关窗时宽 {remembered[0]}，重开变成 {restored[0]}")
-        self.assertLessEqual(
-            abs(restored[1] - remembered[1]), 1,
-            f"上次关窗时高 {remembered[1]}，重开变成 {restored[1]}")
+        # `restoreGeometry` 会把窗口**夹到当前屏幕可用区域**里：上次把窗口拉到比屏幕
+        # 还宽（或后来换了小屏/改了分辨率），重开时只能取到屏幕能容下的尺寸。这不是
+        # 丢记录，是 Qt 的正常行为——所以要跟 `min(记住的, 屏幕可用)` 比。
+        screen = second.screen().availableGeometry()
+        floor = page_layout.MINIMUM_WINDOW_SIZE
+        # 契约是两头夹住，而不是"一定等于某个数"：
+        #   上限 = 记住的尺寸（不许比上次更大）；
+        #   下限 = min(记住的, 屏幕可用, 最小窗口) 里最高的那个——
+        #         屏幕装不下会被 Qt 夹小，太小的旧记录会被最小尺寸抬起来。
+        # Linux offscreen 平台的"屏幕"只有 800×600 且不夹窗口（实测能取回 1480），
+        # Windows 真实屏幕会夹到 1280；两种都是对的，所以只断言这个区间。
+        upper = (remembered[0], remembered[1])
+        lower_w = min(remembered[0], max(screen.width(), floor[0]))
+        lower_h = min(remembered[1], max(screen.height(), floor[1]))
+        self.assertLessEqual(restored[0], upper[0] + 1,
+                             f"重开比记住的更宽：{remembered[0]} -> {restored[0]}")
+        self.assertLessEqual(restored[1], upper[1] + 1,
+                             f"重开比记住的更高：{remembered[1]} -> {restored[1]}")
+        self.assertGreaterEqual(restored[0], lower_w - 1,
+                                f"重开被压得太窄：{remembered[0]} -> {restored[0]}"
+                                f"（屏幕可用 {screen.width()}，最小 {floor[0]}）")
+        self.assertGreaterEqual(restored[1], lower_h - 1,
+                                f"重开被压得太矮：{remembered[1]} -> {restored[1]}"
+                                f"（屏幕可用 {screen.height()}，最小 {floor[1]}）")
         second.close()
 
     def test_tiny_saved_geometry_falls_back_to_the_default(self):

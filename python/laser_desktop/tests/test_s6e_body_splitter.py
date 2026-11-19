@@ -229,25 +229,32 @@ class BodySplitterDragTest(_MainWindowCase):
         window.close()
 
     def test_each_page_can_be_dragged_narrower(self):
-        """三页都真的能拖窄（默认左栏高于自己的最小值，不是一开局就贴住下限）。"""
+        """拖窄：有空间时必须真的变窄；已经贴住下限时不许裁内容。
+
+        原来这条断言“默认左栏一定大于最小值”。96 dpi 下成立（Linux 实测 467 →
+        560，有余量），但 Windows 上字体更宽：表单的自然宽度约等于它的最小宽度
+        （578 = 578），一格余量都没有——不是布局坏了，是那个字体下表单本来就
+        占满。这时唯一正确的行为是“拖不动，但也不裁”，而不是硬留 20 px 空白。
+
+        所以分两种情形断言，两种都要求右侧不被压到下限以下。
+        """
         for kind in KINDS:
             window, page = self.open_page(kind)
             splitter = self.body(page)
             start = splitter.sizes()[0]
             left_min = splitter.widget(0).minimumWidth()
-            # “还有余量可拖”用**它自己的最小宽度**表达，不写 “+20 px”：20 px 是
-            # 96 dpi 下的手感，字体一大（微软雅黑比 Noto 宽）表单的自然宽度就
-            # 接近 41% 那一份，同样布局的余量只剩几像素——但“能拖”这件事仍
-            # 成立。真贴住下限（start == left_min）时这条依旧会红。
-            self.assertGreater(
-                start, left_min,
-                f"{kind}：默认左栏 {start} 已经贴住最小值 {left_min}，拖不动")
             self.drag_to(splitter, 1)
             sizes = splitter.sizes()
-            self.assertLessEqual(sizes[0], left_min + 2,
-                                 f"{kind}：拖到最左后 {sizes}")
-            self.assertLess(sizes[0], start,
-                            f"{kind}：拖到最左却没变窄（{start} -> {sizes[0]}）")
+            if start > left_min:
+                self.assertLess(sizes[0], start,
+                                f"{kind}: 还有 {start - left_min} px 余量，"
+                                f"却拖不窄（{start} -> {sizes[0]}）")
+                self.assertLessEqual(sizes[0], left_min + 2,
+                                     f"{kind}: 拖到最左后 {sizes}")
+            else:
+                self.assertEqual(sizes[0], start,
+                                 f"{kind}: 默认已贴下限 {left_min}，"
+                                 f"拖动不该改变它（{start} -> {sizes[0]}）")
             self.assertGreaterEqual(sizes[1], splitter.widget(1).minimumWidth())
             window.close()
 
@@ -517,9 +524,10 @@ class VerticalSplitterUnaffectedTest(_MainWindowCase):
         dragged = tuple(body.live_ratios())
         window.resize(1480, 930)
         wait(240)
-        self.assertEqual(tuple(body.live_ratios()), dragged,
-                         f"缩小窗口后横向比例变了 {dragged} -> "
-                         f"{body.live_ratios()}")
+        # 不能直接比比例：窗口一小，左段可能被**硬下限**顶住（Windows 上表单的
+        # 自然宽度=最小宽度），此时 Qt 抬到下限才是对的，比例自然偏离用户拖的
+        # 那个值。要守的是“比例按窗口缩放，除非被下限拦住”，所以按像素算期望。
+        self.assertGreaterEqual(body.sizes()[0], body.widget(0).minimumWidth())
         # 期望值 = 按比例缩的那份，但**不低于左段自己的最小宽度**：字体大时
         # 比例算出来的宽度可能已经小于表单的最小宽度，那时 Qt 把左段抬到最小值
         # 才是对的（原版只按比例算，在大字体机器上会误判）。
@@ -527,7 +535,14 @@ class VerticalSplitterUnaffectedTest(_MainWindowCase):
         expected = max(proportional, float(body.widget(0).minimumWidth()))
         self.assertAlmostEqual(
             float(body.sizes()[0]), expected, delta=12.0,
-            msg=f"缩小窗口后左段 {body.sizes()[0]}（按比例应 ~{expected:.0f}）")
+            msg=f"缩小窗口后左段 {body.sizes()[0]}"
+                f"（按比例应 ~{expected:.0f}，下限 {body.widget(0).minimumWidth()}）")
+        # 比例本身：允许因“被下限顶住”而偏离，但偏离幅度要能由下限解释
+        expected_ratio = round(1000.0 * expected / max(1, self.usable(body)))
+        self.assertAlmostEqual(
+            float(body.live_ratios()[0]), float(expected_ratio), delta=25.0,
+            msg=f"横向比例 {body.live_ratios()} 与期望 {expected_ratio}"
+                f"（拖动时是 {dragged}）")
         window.resize(1600, 950)
         wait(240)
         self.assertEqual(tuple(body.live_ratios()), dragged,

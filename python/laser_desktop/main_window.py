@@ -354,5 +354,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.generate.shutdown()
         self.repair.shutdown()
         self.iso.shutdown()
-        self.plot.shutdown()
+        # 用 getattr 而不是直接调：测试里的替身（``_StubHost``）只实现出图相关
+        # 的几个方法，没有 shutdown。直接调会在 closeEvent 里抛 AttributeError，
+        # Qt 把 Python 异常的嵌套信息糊成一行，看起来像"关窗崩了"——Linux 上因为
+        # 测试根本没走到关窗路径，这个坑一直没露出来。
+        shutdown = getattr(self.plot, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
         super().closeEvent(event)

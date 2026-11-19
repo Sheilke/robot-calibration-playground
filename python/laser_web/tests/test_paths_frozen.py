@@ -27,7 +27,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 
 #: 模拟 PyInstaller onedir 的目录形状：``<app>/_internal`` 是 ``_MEIPASS``。
-_FAKE_MEIPASS = str(Path("/opt/LaserCalibration/_internal"))
+#:
+#: **用 Path 而不是字符串**：Windows 上 ``Path("/opt/x")`` 会变成 ``\opt\x``
+#: （盘符相对），再 ``resolve()`` 还会补上当前盘符（``D:\opt\x``）。测试比较的
+#: 若是一段手拼的字符串，它就只能在 POSIX 上通过——这已经踩过一次。
+_FAKE_MEIPASS = Path("/opt/LaserCalibration/_internal")
 
 
 def _run_frozen(code: str) -> str:
@@ -35,7 +39,7 @@ def _run_frozen(code: str) -> str:
     prelude = (
         "import sys, json\n"
         f"sys.frozen = True\n"
-        f"sys._MEIPASS = {_FAKE_MEIPASS!r}\n"
+        f"sys._MEIPASS = {str(_FAKE_MEIPASS)!r}\n"
     )
     proc = subprocess.run(
         [sys.executable, "-c", prelude + code],
@@ -68,7 +72,10 @@ class FrozenAssetRootTest(unittest.TestCase):
         out = _run_frozen(
             "from laser_web import paths\n"
             "print(paths.asset_root())\n")
-        self.assertEqual(out, f"{_FAKE_MEIPASS}/assets")
+        # 比“路径尾部”而不是整串：Windows 上 ``Path("/opt/x")`` 是盘符相对路径，
+        # 被 ``resolve()`` 之后会补成 ``D:\opt\x``，与不带盘符的期望值不相等。
+        # 这条用例要守的是“落在 _MEIPASS 下的 assets”，不是盘符。
+        self.assertEqual(Path(out).parts[-2:], ("_internal", "assets"))
 
     def test_core_repo_root_follows_asset_root(self):
         """这条是真正的回归点：`core._REPO_ROOT` 必须等于 `asset_root()`。"""
@@ -83,10 +90,10 @@ class FrozenAssetRootTest(unittest.TestCase):
         out = _run_frozen(
             "from laser_web import core\n"
             "print(core._resolve_model_path('data/configs/ch2000_origin.urdf'))\n")
-        self.assertEqual(
-            out,
-            f"{_FAKE_MEIPASS}/assets/data/configs/ch2000_origin.urdf",
-            "模型相对路径没有解到 _internal/assets 下")
+        self.assertTrue(
+            str(out).replace("\\", "/").endswith(
+                "_internal/assets/data/configs/ch2000_origin.urdf"),
+            f"模型相对路径没有解到 _internal/assets 下：{out}")
 
     def test_source_mode_unchanged(self):
         """源码模式必须仍等于仓库根（不能为了打包把开发路径改坏）。"""

@@ -69,12 +69,28 @@ def transform_points(transform: np.ndarray, points) -> np.ndarray:
 
 
 def rotation_angle_between(first: np.ndarray, second: np.ndarray) -> float:
-    """两个旋转矩阵的相对转角（deg）：acos(clip((tr(Ra^T Rb)-1)/2))。"""
+    """两个旋转矩阵的相对转角（deg）。
+
+    用 ``atan2(sin, cos)`` 而不是 ``acos(cos)``：**夹角接近 0 时 acos 会把舍入
+    误差放大到 ``sqrt(eps)`` 量级**。cos 只差 1e-16，acos 就给 1.4e-8 rad
+    （≈8e-7 deg）；两个"完全相同"的模型本该报 0，却报出 1e-6 deg 量级的假差异，
+    而且这个数在不同平台/不同 libm 上还不一样（Windows 与 glibc 各自给了不同的
+    假值）。``atan2`` 在 0 附近是良态的：``sin`` 项本身就是舍入量级，除掉噪声
+    就是 0。
+
+    这两个量正是工具报表里的 ``rotation_max_deg`` / ``rotation_rms_deg``，所以
+    这不只是让测试过——报给用户的那一列本来就不该带这种假读数。
+    """
     first = np.asarray(first, dtype=float)
     second = np.asarray(second, dtype=float)
     relative = first.T @ second
     cosine = (float(np.trace(relative)) - 1.0) / 2.0
-    return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+    # sin(theta) * 2 = ||[R32-R23, R13-R31, R21-R12]||
+    sine = 0.5 * math.sqrt(
+        (relative[2, 1] - relative[1, 2]) ** 2
+        + (relative[0, 2] - relative[2, 0]) ** 2
+        + (relative[1, 0] - relative[0, 1]) ** 2)
+    return math.degrees(math.atan2(sine, cosine))
 
 
 def validate_rigid(transform: np.ndarray, rigid_tolerance: float = _RIGID_TOLERANCE,
