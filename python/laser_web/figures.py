@@ -210,8 +210,23 @@ def _iso_hover(row: dict) -> str:
             f"<br>cfg {cfg} · ok {bool(row.get('ok'))}")
 
 
-def _iso_trace(rows, *, color: str, symbol: str, name: str) -> go.Scatter3d:
-    """一组 ISO 五点（可解 / 无解）的单个 trace（marker + 点名标签）。"""
+def _iso_position_hover(row: dict) -> str:
+    """ISO 五点的 hover（只有点名 / XYZ / 可达），**不带关节量**。"""
+    position = row.get("pos") or [None, None, None]
+    reachable = bool(row.get("reachable", row.get("ok")))
+    return (f"{row.get('name', '?')}"
+            f"<br>X {_fmt(position[0])} mm · Y {_fmt(position[1])} mm"
+            f" · Z {_fmt(position[2])} mm"
+            f"<br>{'可达' if reachable else '不可达'}")
+
+
+def _iso_trace(rows, *, color: str, symbol: str, name: str,
+               hover=_iso_hover) -> go.Scatter3d:
+    """一组 ISO 五点（可解 / 无解）的单个 trace（marker + 点名标签）。
+
+    ``hover`` 决定每一行的悬浮文案：旧接口（``iso_cube_figure``）带关节量与
+    cfg，只算坐标的页面（``iso_points_figure``）用 :func:`_iso_position_hover`。
+    """
     return go.Scatter3d(
         x=[float(row["pos"][0]) for row in rows],
         y=[float(row["pos"][1]) for row in rows],
@@ -222,7 +237,7 @@ def _iso_trace(rows, *, color: str, symbol: str, name: str) -> go.Scatter3d:
         text=[str(row.get("name", "?")) for row in rows],
         textposition="top center",
         textfont={"size": 11, "color": color},
-        hovertext=[_iso_hover(row) for row in rows],
+        hovertext=[hover(row) for row in rows],
         hovertemplate="%{hovertext}<extra></extra>",
         name=name,
     )
@@ -240,6 +255,53 @@ def _iso_scene() -> dict:
         "zaxis": {"title": "Z (mm)", "backgroundcolor": "#fafafa"},
         "aspectmode": "data",
     }
+
+
+def iso_points_figure(points, *, cube_center, side: float,
+                      height: int = 560) -> go.Figure:
+    """ISO 五点的 3D 图（**只有坐标**）：立方体 12 条棱 + P1~P5 两色。
+
+    与 :func:`iso_cube_figure` 的区别：这里没有任何关节量（悬停只有点名 / XYZ /
+    可达），因为 ISO 页面只算笛卡尔坐标、IK 只用来判可达。
+
+    Args:
+        points: ``core.iso_points()["points"]``（键 ``name`` / ``pos`` /
+            ``reachable``）；空列表返回空 figure（不抛异常）。
+        cube_center: 立方体中心 ``[x, y, z]``（mm）。
+        side: 立方体边长（mm）；``None`` 时只画点。
+        height: 画布高度（px）。
+
+    Returns:
+        plotly.graph_objects.Figure: 0~3 个 trace。
+    """
+    rows = [row for row in (points or []) if row.get("pos")]
+    figure = go.Figure()
+    if not rows:
+        figure.update_layout(height=height, margin={"l": 0, "r": 0, "t": 8,
+                                                    "b": 0})
+        return figure
+    cube = _cube_trace(cube_center, side)
+    if cube is not None:
+        figure.add_trace(cube)
+    good = [row for row in rows if row.get("reachable", row.get("ok"))]
+    bad = [row for row in rows if not row.get("reachable", row.get("ok"))]
+    if good:
+        figure.add_trace(_iso_trace(
+            good, color=_ISO_OK_COLOR, symbol="circle",
+            name=f"可达 {len(good)}/{len(rows)} 点",
+            hover=_iso_position_hover))
+    if bad:
+        figure.add_trace(_iso_trace(
+            bad, color=_ISO_BAD_COLOR, symbol="x",
+            name=f"不可达 {len(bad)} 点", hover=_iso_position_hover))
+    figure.update_layout(
+        height=height,
+        margin={"l": 0, "r": 0, "t": 8, "b": 0},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.0,
+                "xanchor": "left", "x": 0.0},
+        scene=_iso_scene(),
+    )
+    return figure
 
 
 def iso_cube_figure(points, *, cube_center, side: float, layout: str,

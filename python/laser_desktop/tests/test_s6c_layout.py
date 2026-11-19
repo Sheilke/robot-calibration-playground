@@ -48,7 +48,8 @@ NAV_ROW = {"generate": 0, "repair": 1, "iso": 2}
 METRIC_KEYS = {
     "generate": ("edges", "grid", "points", "design", "euler"),
     "repair": ("edges", "grid", "points", "design", "euler"),
-    "iso": ("cube", "apothem", "center", "layout", "plane"),
+    # ISO 页的「布点 / 截面」不再是可选项（固定 vertices / xz），卡片上没有这两行。
+    "iso": ("cube", "apothem", "center"),
 }
 
 #: 1600×950 下每页要露出的行数（ISO 只有 5 个点）。

@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ISO 五点页（S5）纯逻辑：表单 -> core 参数、两种立方体来源、布点联动。
+"""ISO 五点页（S5）纯逻辑：表单 -> core 参数、只有一种立方体来源、五点编号。
 
 对齐的基准是网页版 ``laser_web/pages/iso9283.py::collect()``：本文件把它的键
-集合**逐个写死**（``WEB_COMMON_KEYS`` / ``WEB_BOUNDS_KEYS`` / ``WEB_AUTO_KEYS``），
-再断言 :func:`laser_desktop.iso_page.form_to_params` 的产物与它**完全同集合**
-——两种 ``cube_mode`` 只提交激活那一组（``cube`` XOR ``search_box`` +
-``resolution`` + ``prefer_x_min``）。
+集合**逐个写死**（:data:`PAGE_KEYS`），再断言
+:func:`laser_desktop.iso_page.form_to_params` 的产物与它**完全同集合**。
 
-另外钉死网页版踩过的那类坑（commit ``32136c6``）：初始化时写死一个不存在的
-模式名，会让两组输入同时隐藏、页面看起来“没有输入框”。桌面版要求：
+ISO 9283 只定义了一种五点取法，所以页面上没有“立方体来源 / 布点 / 截面”这类
+切换控件（它们连同自动搜索整组一起删掉了）：
 
-1. 初始化后**始终恰有一组可见**；
-2. 两种模式各切 2 次，可见组仍然恰好 1 个；
-3. 切走再切回，之前填的数值还在（隐藏 ≠ 清空）。
+1. 只提交 ``cube``，**不**提交 ``search_box`` / ``resolution`` / ``prefer_x_min``；
+2. ``layout`` / ``plane`` 仍然提交（``core`` 的参数约定不变），值固定
+   ``vertices`` / ``xz``；
+3. 五点编号：P2/P3 在小 X 小 Z 一侧，P4/P5 在大 X 大 Z 一侧（ISO 9283）；
+4. 这一页不显示关节量：``q_seed`` / ``j5_min`` 两个输入也删了，``core`` 用默认值
+   （可达性验算的种子固定，见 ``core.iso_points``）。
 """
 
 import os
@@ -41,24 +42,23 @@ def app():
     return _APP
 
 
-#: 网页版 ``collect()`` 两种模式都会提交的键。
-WEB_COMMON_KEYS = frozenset({"robot", "cube_mode", "layout", "plane",
-                             "square_frac", "rpy", "euler", "q_seed", "j5_min"})
-#: ``cube_mode="bounds"``（网页版叫「给最大/最小点」）额外提交的键。
-WEB_BOUNDS_KEYS = WEB_COMMON_KEYS | {"cube"}
-#: ``cube_mode="auto"``（自动搜索）额外提交的键。
-WEB_AUTO_KEYS = WEB_COMMON_KEYS | {"search_box", "resolution", "prefer_x_min"}
-
-
-def visible_panels(page) -> list[int]:
-    """当前可见的立方体来源面板下标（``isVisibleTo`` 忽略窗口是否显示）。"""
-    stack = page.mode_stack
-    return [index for index in range(stack.count())
-            if stack.widget(index).isVisibleTo(stack)]
+#: ISO 页**唯一**的提交键集合（网页版 ``collect()`` 与本页
+#: ``form_to_params`` 逐键一致）：立方体只有一种给法，布点与截面固定，
+#: 没有 ``q_seed`` / ``j5_min``（界面不暴露，``core`` 用自己的默认值）。
+PAGE_KEYS = frozenset({"robot", "cube_mode", "cube", "layout", "plane",
+                       "rpy", "euler"})
+#: 界面上已经没有的键：自动搜索整组 + 布点参数 + IK 种子与 |J5| 阈值。
+SEARCH_KEYS = ("search_box", "resolution", "prefer_x_min", "square_frac",
+               "q_seed", "j5_min")
+#: 界面上已经没有的控件（来源切换 / 自动搜索 / 布点 / 截面 / 种子 / 告警）。
+REMOVED_FIELDS = ("cube_bounds", "cube_auto", "box_x0", "box_x1", "box_y0",
+                  "box_y1", "box_z0", "box_z1", "resolution",
+                  "prefer_x_min", "layout", "plane", "square_frac",
+                  "q_seed", "j5_min")
 
 
 class FormToParamsTest(unittest.TestCase):
-    """表单值 -> ``core.run_iso9283`` 的入参（两种 cube_mode 各一组）。"""
+    """表单值 -> ``core.run_iso9283`` 的入参（只有一组）。"""
 
     def setUp(self):
         app()
@@ -72,9 +72,13 @@ class FormToParamsTest(unittest.TestCase):
         """默认值全部来自 ``core.iso_defaults()``，界面不抄数字。"""
         defaults = core.iso_defaults()
         page_defaults = iso_page.iso_form_defaults()
-        for key in ("layout", "plane", "square_frac", "rpy", "euler",
-                    "q_seed", "j5_min", "resolution", "prefer_x_min"):
+        for key in ("rpy", "euler"):
             self.assertEqual(page_defaults[key], defaults[key], key)
+        # 布点 / 截面不可选：写死 ISO 9283 的取法（与 core 的 CLI 默认一致）
+        self.assertEqual(page_defaults["layout"], iso_page.FIXED_LAYOUT)
+        self.assertEqual(page_defaults["plane"], iso_page.FIXED_PLANE)
+        self.assertEqual(page_defaults["layout"], defaults["layout"])
+        self.assertEqual(page_defaults["plane"], defaults["plane"])
         # 两点输入的示例值来自网页版示例域（与「生成」页同源）
         self.assertEqual(page_defaults["cube"][0],
                          float(ui_state.SAMPLE_POINT_MIN[0]))
@@ -83,93 +87,56 @@ class FormToParamsTest(unittest.TestCase):
         # 打开页面时的实际表单值与默认值一致
         self.assertEqual(self.page.params(), iso_page.form_to_params(page_defaults))
 
-    def test_bounds_params_key_set(self):
-        """两点输入只提交 ``cube``，不带自动搜索的三个键。"""
+    def test_params_submit_only_the_cube(self):
+        """只提交 ``cube``：搜索相关的键一个不能有。"""
         params = self.page.params()
-        self.assertEqual(set(params), set(WEB_BOUNDS_KEYS))
-        self.assertNotIn("search_box", params)
-        self.assertNotIn("resolution", params)
-        self.assertNotIn("prefer_x_min", params)
+        self.assertEqual(set(params), set(PAGE_KEYS))
+        for key in SEARCH_KEYS:
+            self.assertNotIn(key, params)
         self.assertEqual(params["cube_mode"], "bounds")
         self.assertEqual(params["cube"],
                          [float(value) for value in
                           iso_page.iso_form_defaults()["cube"]])
+        # 布点 / 截面仍然提交（core 的参数约定不变）
+        self.assertEqual(params["layout"], iso_page.FIXED_LAYOUT)
+        self.assertEqual(params["plane"], iso_page.FIXED_PLANE)
 
-    def test_auto_params_key_set(self):
-        """自动搜索只提交 ``search_box`` / ``resolution`` / ``prefer_x_min``。"""
-        self.page.fields["cube_auto"].setChecked(True)
-        params = self.page.params()
-        self.assertEqual(set(params), set(WEB_AUTO_KEYS))
-        self.assertNotIn("cube", params)
-        self.assertEqual(params["cube_mode"], "auto")
-        self.assertEqual(params["search_box"],
-                         [float(value) for value in
-                          iso_page.SAMPLE_SEARCH_BOX])
-        self.assertEqual(params["resolution"],
-                         float(core.iso_defaults()["resolution"]))
-        self.assertIsNone(params["prefer_x_min"], "0 号位是「不限」= core 的 None")
+    def test_form_has_no_source_or_layout_widgets(self):
+        """界面上没有来源 / 布点 / 截面控件（连字段名都不存在）。"""
+        for key in REMOVED_FIELDS:
+            self.assertNotIn(key, self.page.fields, key)
+        self.assertFalse(hasattr(self.page, "mode_stack"))
+        self.assertFalse(hasattr(self.page, "mode_buttons"))
+        for method in ("switch_mode", "switch_layout", "mode_value",
+                       "prefer_min_value"):
+            self.assertFalse(hasattr(self.page, method), method)
 
     def test_params_values_match_widgets(self):
         """逐键核对：提交值就是控件里那一版（不是默认值）。"""
         fields = self.page.fields
-        fields["cube_bounds"].setChecked(True)
         for key, value in (("x0", 900.0), ("x1", 1100.0), ("y0", -100.0),
-                           ("y1", 100.0), ("z0", 500.0), ("z1", 700.0),
-                           ("j5_min", 20.0)):
+                           ("y1", 100.0), ("z0", 500.0), ("z1", 700.0)):
             fields[key].setValue(value)
-        fields["layout"].setCurrentIndex(fields["layout"].findData("circle"))
-        fields["plane"].setCurrentIndex(fields["plane"].findData("yz"))
         fields["rpy_a"].setValue(3.0)
         fields["rpy_b"].setValue(73.0)
         fields["rpy_c"].setValue(-167.0)
         fields["euler"].setCurrentIndex(fields["euler"].findData("zyx-intrinsic"))
-        fields["q_seed"].setText("43,-30,-36,42,-89,-1")
 
         params = self.page.params()
         self.assertEqual(params["cube"], [900.0, 1100.0, -100.0, 100.0,
                                           500.0, 700.0])
-        self.assertEqual(params["layout"], "circle")
-        self.assertEqual(params["plane"], "yz")
+        self.assertEqual(params["layout"], "vertices")
+        self.assertEqual(params["plane"], "xz")
         self.assertEqual(params["rpy"], [3.0, 73.0, -167.0])
         self.assertEqual(params["euler"], "zyx-intrinsic")
-        self.assertEqual(params["q_seed"], "43,-30,-36,42,-89,-1")
-        self.assertEqual(params["j5_min"], 20.0)
-        self.assertEqual(params["square_frac"],
-                         float(fields["square_frac"].value()))
+        self.assertNotIn("q_seed", params)
+        self.assertNotIn("j5_min", params)
 
-    def test_prefer_x_min_is_nullable(self):
-        """「中心 X 不小于」留空 = 不限（``None``）；0 是**合法值**，不当哨兵。
-
-        早先把 ``0`` 当“不限”（``setSpecialValueText``），于是“中心 X ≥ 0”
-        这个合法要求根本没法表达——那种用法现在得到 ``0.0``。
-        """
-        self.page.fields["cube_auto"].setChecked(True)
-        field = self.page.fields["prefer_x_min"]
-        field.setText("")
-        self.assertIsNone(self.page.params()["prefer_x_min"], "空 = 不限")
-        field.setText("0")
-        self.assertEqual(self.page.params()["prefer_x_min"], 0.0,
-                         "0 是合法下限（中心 X ≥ 0）")
-        field.setText("900")
-        self.assertEqual(self.page.params()["prefer_x_min"], 900.0)
-
-    def test_prefer_x_min_garbage_is_reported_not_swallowed(self):
-        """填了非数字：卡片红字报错（**不**静默当成“不限”）。"""
-        self.page.fields["cube_auto"].setChecked(True)
-        self.page.fields["prefer_x_min"].setText("abc")
-        preview = self.page.refresh_preview()
-        self.assertFalse(preview["ok"])
-        self.assertIn("要填数字", self.page.error_label.text())
-        self.assertFalse(self.page.generate_button.isEnabled())
-        # 改回合法值就恢复
-        self.page.fields["prefer_x_min"].setText("900")
-        self.assertTrue(self.page.refresh_preview()["ok"])
-
-    def test_only_active_group_reaches_core(self):
-        """两种模式都真的能被 ``core`` 接受（报错原文说明它读到了对的键）。"""
+    def test_parameters_reach_core(self):
+        """参数真的能被 ``core`` 接受（报错原文说明它读到了对的键）。"""
         core_params = self.page.params()
         self.assertIn("cube", core_params)
-        # 把 cube 换成下界 > 上界：core 的报错原文必须能出现在预览卡片里
+        # X 下界抬到上界之上：core 的报错原文必须能出现在预览卡片里
         self.page.fields["x0"].setValue(2000.0)
         preview = self.page.refresh_preview()
         self.assertFalse(preview["ok"])
@@ -178,8 +145,8 @@ class FormToParamsTest(unittest.TestCase):
         self.assertFalse(self.page.generate_button.isEnabled())
 
 
-class ModeSwitchTest(unittest.TestCase):
-    """立方体来源切换：**永远恰好一组可见**，且隐藏不清空（钉死 32136c6）。"""
+class CartesianOnlyTest(unittest.TestCase):
+    """这一页只算坐标：提示文案、没有种子/告警输入、没有任务机制。"""
 
     def setUp(self):
         app()
@@ -189,103 +156,31 @@ class ModeSwitchTest(unittest.TestCase):
         self.page.shutdown()
         self.page.deleteLater()
 
-    def test_exactly_one_group_visible_after_init(self):
-        """初始化按 radio 的当前值切，不许出现“两组都隐藏”。"""
-        self.assertEqual(len(visible_panels(self.page)), 1)
-        self.assertEqual(self.page.mode_value(), "bounds")
-        self.assertEqual(visible_panels(self.page), [0])
-        self.assertTrue(self.page.bounds_panel.isVisibleTo(self.page.mode_stack))
-        self.assertFalse(self.page.auto_panel.isVisibleTo(self.page.mode_stack))
+    def test_hint_matches_the_agreed_wording(self):
+        self.assertEqual(
+            iso_page.HINT,
+            "只算笛卡尔坐标；姿态固定、不加扰动；系统会解一次 IK 判断每点是否"
+            "可达，不输出关节角。")
+        # 页面上真的能看到这句（左栏姿态组 + 预览页签）
+        labels = [label.text() for label in self.page.findChildren(QtWidgets.QLabel)]
+        self.assertTrue(any(iso_page.HINT in text for text in labels),
+                        "页面上找不到那句提示")
 
-    def test_two_switches_each_way_keep_one_group_visible(self):
-        """两种模式各切 2 次，可见组始终恰好 1 个。"""
-        for _round in range(2):
-            self.page.fields["cube_auto"].setChecked(True)
-            self.assertEqual(len(visible_panels(self.page)), 1,
-                             "切到自动搜索后可见组数目")
-            self.assertEqual(visible_panels(self.page), [1])
-            self.assertEqual(self.page.mode_value(), "auto")
-            self.page.fields["cube_bounds"].setChecked(True)
-            self.assertEqual(len(visible_panels(self.page)), 1,
-                             "切回两点输入后可见组数目")
-            self.assertEqual(visible_panels(self.page), [0])
-            self.assertEqual(self.page.mode_value(), "bounds")
+    def test_no_job_machinery_and_no_joint_inputs(self):
+        for attribute in ("bridge", "progress_bar", "cancel_button",
+                          "log_edit", "log_page"):
+            self.assertFalse(hasattr(self.page, attribute), attribute)
+        for key in ("q_seed", "j5_min"):
+            self.assertNotIn(key, self.page.fields)
+        self.assertEqual(list(iso_page.TABS), ["路点", "预览"])
 
-    def test_values_survive_switching(self):
-        """切走再切回，两组输入填过的值都还在（隐藏 ≠ 清空）。"""
-        fields = self.page.fields
-        fields["x0"].setValue(901.5)
-        fields["box_x0"].setValue(705.0)
-        fields["resolution"].setValue(25.0)
-        fields["prefer_x_min"].setText("880")
-
-        fields["cube_auto"].setChecked(True)
-        self.assertEqual(fields["x0"].value(), 901.5)
-        fields["cube_bounds"].setChecked(True)
-        self.assertEqual(fields["box_x0"].value(), 705.0)
-        self.assertEqual(fields["resolution"].value(), 25.0)
-        self.assertEqual(fields["prefer_x_min"].text(), "880")
-
-        # 提交时两组各自带自己那一份，不串台
-        bounds = self.page.params()
-        self.assertEqual(bounds["cube"][0], 901.5)
-        fields["cube_auto"].setChecked(True)
-        auto = self.page.params()
-        self.assertEqual(auto["search_box"][0], 705.0)
-        self.assertEqual(auto["resolution"], 25.0)
-        self.assertEqual(auto["prefer_x_min"], 880.0)
-
-    def test_switch_mode_accepts_explicit_value(self):
-        """``switch_mode`` 也能被显式调用（初始化/程序化设置都走它）。"""
-        self.page.switch_mode("auto")
-        self.assertEqual(self.page.mode_value(), "auto")
-        self.assertEqual(visible_panels(self.page), [1])
-        self.page.switch_mode("bounds")
-        self.assertEqual(self.page.mode_value(), "bounds")
-        self.assertEqual(visible_panels(self.page), [0])
-        # 未知模式名不许把两组都藏起来（这就是 32136c6 那个 bug）
-        self.page.switch_mode("center")
-        self.assertEqual(len(visible_panels(self.page)), 1)
-
-    def test_switch_to_auto_recomputes_preview(self):
-        """切到「自动搜索」：预览卡立刻换成搜索箱，不挂上一种来源的边长。"""
-        self.assertEqual(self.page.preview["mode"], "bounds")
-        self.assertEqual(self.page.preview["side"], 550.0)
-        self.assertEqual(self.page.preview_table.rowCount(), 5)
-
-        self.page.fields["cube_auto"].setChecked(True)
-
-        self.assertEqual(self.page.preview["mode"], "auto")
-        self.assertIsNone(self.page.preview["side"])
-        self.assertEqual(self.page.preview_table.rowCount(), 0)
-        self.assertEqual(self.page.preview_labels["cube"].text(),
-                         "待真跑（自动搜索）", "不许还写着上一种来源的边长")
-        self.assertEqual(self.page.preview_labels["apothem"].text(), "—")
-        self.assertIn("搜索范围", self.page.preview_hint.text())
-        # 面心 / 候选点文本块也不许留着上一个立方体的内容
-        self.assertEqual(self.page.faces_edit.toPlainText(), "")
-        self.assertEqual(self.page.candidates_edit.toPlainText(), "")
-        # “三轴跨度不等”是 bounds 那组输入的提示，切走就不该还在
-        self.assertFalse(
-            any("跨度不等" in line
-                for line in self.page.warning_label.text().splitlines()),
-            self.page.warning_label.text())
-
-    def test_switch_back_to_bounds_restores_geometry(self):
-        """再切回「两点输入」：边长 / 五点表都回到 550 mm 那一版。"""
-        self.page.fields["cube_auto"].setChecked(True)
-        self.assertEqual(self.page.preview_table.rowCount(), 0)
-
-        self.page.fields["cube_bounds"].setChecked(True)
-
-        self.assertEqual(self.page.preview["mode"], "bounds")
-        self.assertEqual(self.page.preview["side"], 550.0)
-        self.assertEqual(self.page.preview_labels["cube"].text(), "边长 550 mm")
-        self.assertEqual(self.page.preview_table.rowCount(), 5)
+    def test_stat_keys_are_reachable_side_center(self):
+        self.assertEqual(list(iso_page.STAT_KEYS), ["reach", "side", "center"])
+        self.assertEqual(list(iso_page.STAT_KEYS), list(self.page.stat_labels))
 
 
-class LayoutGateTest(unittest.TestCase):
-    """``square_frac`` 只对 ``center-square`` 生效。"""
+class SingleCubeSourceTest(unittest.TestCase):
+    """只有一种立方体来源：改数值就重算预览，没有可切的“另一组”。"""
 
     def setUp(self):
         app()
@@ -295,25 +190,18 @@ class LayoutGateTest(unittest.TestCase):
         self.page.shutdown()
         self.page.deleteLater()
 
-    def test_square_frac_only_enabled_for_center_square(self):
-        fields = self.page.fields
-        for layout, enabled in (("vertices", False), ("circle", False),
-                                ("center-square", True),
-                                ("vertices", False)):
-            fields["layout"].setCurrentIndex(fields["layout"].findData(layout))
-            self.assertEqual(fields["square_frac"].isEnabled(), enabled, layout)
-
-    def test_layout_values_come_from_algorithm_module(self):
-        """下拉框的取值集合就是 ``iso9283_cube.LAYOUTS`` / ``PLANES``。"""
-        fields = self.page.fields
-        self.assertEqual([fields["layout"].itemData(index)
-                          for index in range(fields["layout"].count())],
-                         list(iso.LAYOUTS))
-        self.assertEqual([fields["plane"].itemData(index)
-                          for index in range(fields["plane"].count())],
-                         list(iso.PLANES))
-        self.assertEqual(set(iso_page.LAYOUTS), set(iso.LAYOUTS))
-        self.assertEqual(set(iso_page.PLANES), set(iso.PLANES))
+    def test_preview_recomputes_when_the_cube_changes(self):
+        """改极值点：边长 / 中心 / 五点表都跟着走。"""
+        self.assertEqual(self.page.preview["side"], 550.0)
+        self.assertEqual(self.page.preview_table.rowCount(), 5)
+        for key, value in (("x0", 925.0), ("x1", 1125.0), ("y0", -100.0),
+                           ("y1", 100.0), ("z0", 505.0), ("z1", 705.0)):
+            self.page.fields[key].setValue(value)
+        preview = self.page.refresh_preview()
+        self.assertEqual(preview["side"], 200.0)
+        self.assertEqual(preview["center"], [1025.0, 0.0, 605.0])
+        self.assertEqual(self.page.preview_table.rowCount(), 5)
+        self.assertEqual(self.page.preview_labels["cube"].text(), "边长 200 mm")
 
 
 class PreviewGeometryTest(unittest.TestCase):
@@ -367,32 +255,20 @@ class PreviewGeometryTest(unittest.TestCase):
             self.assertEqual(row["pos"],
                              [float(value) for value in expected[row["name"]]])
 
-    def test_points_carry_layout_labels(self):
-        """点 1..5 带 ``layout`` 标注（P1 总是中心）。"""
+    def test_points_carry_the_iso_numbering_labels(self):
+        """点 1..5 的位置标注按 ISO 9283 编号（P1 中心、P2/P3 小 X 小 Z）。"""
         preview = iso_page.preview_geometry(self.small_case())
-        self.assertEqual(preview["points"][0]["label"], "立方体中心")
-        self.assertIn("对角截面四角", preview["points"][1]["label"])
-        values = self.small_case()
-        values["layout"] = "center-square"
-        values["square_frac"] = 0.5
-        preview = iso_page.preview_geometry(values)
-        self.assertIn("正方形角", preview["points"][1]["label"])
-        self.assertIn("0.5", preview["points"][1]["label"])
-
-    def test_auto_mode_has_no_geometry(self):
-        """自动搜索：边长/中心要真跑才知道，预览只给搜索范围。"""
-        values = self.small_case()
-        values["cube_mode"] = "auto"
-        preview = iso_page.preview_geometry(values)
-        self.assertTrue(preview["ok"])
-        self.assertIsNone(preview["side"])
-        self.assertEqual(preview["search_box"],
-                         [float(value) for value in iso_page.SAMPLE_SEARCH_BOX])
-        self.assertTrue(preview["warnings"])
+        labels = [row["label"] for row in preview["points"]]
+        self.assertEqual(labels[0], "立方体中心")
+        for name, label in zip(("P2", "P3"), labels[1:3]):
+            self.assertIn("X 小", label, name)
+            self.assertIn("Z 小", label, name)
+        for name, label in zip(("P4", "P5"), labels[3:]):
+            self.assertIn("X 大", label, name)
+            self.assertIn("Z 大", label, name)
 
     def test_card_shows_preview_numbers(self):
-        """预览卡片：边长 / 边心距 / 中心 / 布点 / 截面 + 面心与候选点文本块。"""
-        self.page.fields["cube_bounds"].setChecked(True)
+        """预览卡片：边长 / 边心距 / 中心 + 面心与候选点文本块（没有布点/截面）。"""
         for key, value in (("x0", 925.0), ("x1", 1125.0), ("y0", -100.0),
                            ("y1", 100.0), ("z0", 505.0), ("z1", 705.0)):
             self.page.fields[key].setValue(value)
@@ -400,8 +276,17 @@ class PreviewGeometryTest(unittest.TestCase):
         self.assertEqual(self.page.preview_labels["cube"].text(), "边长 200 mm")
         self.assertEqual(self.page.preview_labels["apothem"].text(), "100 mm")
         self.assertIn("1025.0", self.page.preview_labels["center"].text())
-        self.assertIn("对角截面四角", self.page.preview_labels["layout"].text())
-        self.assertIn("XZ", self.page.preview_labels["plane"].text())
+        # 布点 / 截面不再是卡片上的一行（也不再是可选参数）
+        self.assertNotIn("layout", self.page.preview_labels)
+        self.assertNotIn("plane", self.page.preview_labels)
+        self.assertEqual(list(self.page.preview_labels),
+                         [key for key, _title in iso_page.PREVIEW_METRICS])
+        # 面心 6 个 / 候选点 9 个 / 五点 5 个：文案与行数都对得上
+        hint = self.page.preview_hint.text()
+        self.assertIn("面心 6 个", hint)
+        self.assertIn("候选点 9 个", hint)
+        self.assertIn("五点 5 个", hint)
+        self.assertIn("P2/P3 在 X 小 Z 小一侧", hint)
         self.assertEqual(self.page.preview_table.rowCount(), 5)
         self.assertEqual(len(self.page.faces_edit.toPlainText().splitlines()), 6)
         self.assertEqual(
@@ -460,18 +345,16 @@ class StaleResultTest(unittest.TestCase):
         self.page.deleteLater()
 
     def fake_result(self) -> dict:
-        """最小可渲染结果（够铺统计行与 5 行路点表，不跑 IK）。"""
+        """最小可渲染结果（够铺统计行与 5 行路点表，没有关节量）。"""
         points = [{"name": name, "pos": [1025.0, 0.0, 605.0],
-                   "q": [0.0] * 6, "config": [1, 0, 0], "ok": True,
-                   "j3_abs": 30.0, "j5_abs": 40.0 + index}
-                  for index, name in enumerate(iso.POINT_NAMES)]
-        return {"ok": True, "run_id": "20260101-000000-iso0",
-                "run_dir": "/tmp/iso-stale", "artifacts": {},
-                "stats": {"solved": 5, "total": 5, "j5_abs_min": 40.0,
-                          "j3_abs_min": 30.0, "config_consistent": True,
-                          "configs": [[1, 0, 0]] * 5, "cube_side": 550.0,
-                          "cube_center": [1025.0, 0.0, 605.0],
-                          "layout": "vertices", "plane": "xz"},
+                   "reachable": True}
+                  for name in iso.POINT_NAMES]
+        return {"ok": True,
+                "summary": {"reachable": 5, "total": 5},
+                "meta": {"cube_side": 550.0,
+                         "cube_center": [1025.0, 0.0, 605.0],
+                         "layout": "vertices", "plane": "xz",
+                         "rpy": [3.0, 73.0, -167.0]},
                 "points": points, "warnings": []}
 
     def test_changed_params_mark_the_table_as_stale(self):
@@ -484,13 +367,11 @@ class StaleResultTest(unittest.TestCase):
         self.page.fields["x0"].setValue(925.0)
 
         self.assertTrue(self.page.stale_label.isVisibleTo(self.page))
-        self.assertIn("上一次运行", self.page.stale_label.text())
-        self.assertIn("20260101-000000-iso0", self.page.stale_label.text())
+        self.assertIn("上一次的结果", self.page.stale_label.text())
         self.assertIn("color:#6b7280", self.page.stale_label.styleSheet())
         # 表确实是旧的那一份（路点表不会因为改参数而重算）
         self.assertEqual(self.page.point_table.rowCount(), 5)
-        self.assertEqual(self.page.last_result["run_id"],
-                         "20260101-000000-iso0")
+        self.assertEqual(self.page.last_result["summary"]["reachable"], 5)
 
     def test_hint_clears_when_a_new_result_arrives(self):
         """下一次真跑出结果时，灰字自己退场。"""
@@ -522,15 +403,13 @@ class PreviewStdoutIsolationTest(unittest.TestCase):
         return any("跨度不等" in line
                    for line in (preview or {}).get("warnings") or [])
 
-    def test_capture_is_skipped_while_a_job_runs(self):
-        """任务在跑时不抓 stdout；空闲时仍然抓（提示只有一个来源）。"""
+    def test_capture_is_skipped_while_another_page_runs_a_job(self):
+        """别的页有任务在跑就不抓 stdout；空闲时仍然抓（提示只有一个来源）。"""
         self.assertTrue(self.has_core_hint(self.page.preview))
         before = sys.stdout
-        self.page._busy = True
-        try:
+        with mock.patch.object(iso_page.IsoPage, "_job_running_elsewhere",
+                               staticmethod(lambda: True)):
             running = self.page.refresh_preview()
-        finally:
-            self.page._busy = False
         self.assertTrue(running["ok"])
         self.assertFalse(self.has_core_hint(running),
                          "任务在跑时不许抓 stdout（会吞掉工作线程的日志）")
@@ -538,13 +417,9 @@ class PreviewStdoutIsolationTest(unittest.TestCase):
         self.assertTrue(self.has_core_hint(self.page.refresh_preview()),
                         "空闲时仍然抓：提示文字只有一个来源")
 
-    def test_bridge_running_is_respected(self):
-        """接管来的任务（``bridge.is_running``）同样不抓。"""
-        with mock.patch.object(type(self.page.bridge), "is_running",
-                               property(lambda _self: True)):
-            preview = self.page.refresh_preview()
-        self.assertTrue(preview["ok"])
-        self.assertFalse(self.has_core_hint(preview))
+    def test_registry_probe_does_not_raise(self):
+        """登记表探针在任何状态下都要给出布尔值（判不出来就当“没在跑”）。"""
+        self.assertIn(iso_page.IsoPage._job_running_elsewhere(), (True, False))
 
 
 if __name__ == "__main__":                              # pragma: no cover

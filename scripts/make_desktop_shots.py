@@ -178,31 +178,26 @@ def shot_repair(window) -> None:
 
 
 def shot_iso(window) -> None:
-    """ISO 页：站点位置 200 mm 立方体 → 生成五点 → 停在「五点」表。"""
+    """ISO 页：站点位置 200 mm 立方体 → 算五点 → 停在「路点」表。"""
     print("· ISO 页")
     window.nav.setCurrentRow(2)
     page = window.iso
     pump(0.3)
     fields = page.fields
-    fields["cube_bounds"].setChecked(True)
     for key, value in (("x0", 925.0), ("x1", 1125.0), ("y0", -100.0),
                        ("y1", 100.0), ("z0", 505.0), ("z1", 705.0)):
         fields[key].setValue(value)
     page.refresh_preview()
     pump(0.2)
-    job_id = page.start_iso()
-    if not job_id:
-        raise SystemExit("  起 ISO 任务失败")
-    if not wait_until(lambda: page.run_state in ("done", "failed", "cancelled"),
-                      RUN_TIMEOUT, "ISO 五点跑完"):
-        raise SystemExit("  ISO 超时")
-    if page.run_state != "done":
-        raise SystemExit(f"  ISO 没有成功：{page.run_state}")
+    result = page.start_iso()               # 主线程算完（毫秒级），没有任务
+    if not result:
+        raise SystemExit("  ISO 五点没算出来")
     page.result_tabs.setCurrentWidget(page.points_page)
     pump(PLOT_SETTLE)
-    stats = (page.last_result or {}).get("stats") or {}
-    print(f"  结果：可达 {stats.get('solved')}/{stats.get('total')}，"
-          f"边长 {stats.get('cube_side')} mm")
+    summary = (page.last_result or {}).get("summary") or {}
+    meta = (page.last_result or {}).get("meta") or {}
+    print(f"  结果：可达 {summary.get('reachable')}/{summary.get('total')}，"
+          f"边长 {meta.get('cube_side')} mm，{page.last_elapsed_ms:.0f} ms")
     grab(window, "iso.png")
 
 

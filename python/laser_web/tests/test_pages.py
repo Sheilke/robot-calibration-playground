@@ -266,12 +266,57 @@ class GridVertexConversionTest(unittest.TestCase):
         self.assertEqual(segments_to_vertices(-3), 1)    # 至少 1 个格点
 
 
+class IsoPageRowsTest(unittest.TestCase):
+    """ISO 页的表格行与汇总行：只有坐标 + 可达（没有关节量）。"""
+
+    def result(self):
+        return {"ok": True,
+                "points": [{"name": "P1", "pos": [1000.0, 0.0, 600.0],
+                            "reachable": True},
+                           {"name": "P2", "pos": [900.0, 100.0, 500.0],
+                            "reachable": False}],
+                "summary": {"reachable": 1, "total": 2},
+                "meta": {"rpy": [3.0, 73.0, -167.0]}}
+
+    def test_rows_have_no_joint_fields(self):
+        from laser_web.pages import iso9283
+
+        rows = iso9283._point_rows(self.result())
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(set(row), {"name", "x", "y", "z", "reach",
+                                        "failed"})
+        self.assertEqual(rows[0]["reach"], "✓ 可达")
+        self.assertEqual(rows[1]["reach"], "✗ 不可达")
+        self.assertTrue(rows[1]["failed"])
+
+    def test_columns_are_cartesian_only(self):
+        from laser_web.pages import iso9283
+
+        labels = [label for _name, label, _field, _align
+                  in iso9283._POINT_COLUMNS]
+        self.assertEqual(labels, ["P", "X (mm)", "Y (mm)", "Z (mm)", "可达"])
+        self.assertNotIn("q1", labels)
+
+    def test_summary_says_reachable(self):
+        from laser_web.pages import iso9283
+
+        self.assertEqual(iso9283._summary_text(self.result()), "可达 1/2")
+        self.assertEqual(iso9283._summary_text({"ok": False}), "可达 —")
+        self.assertEqual(iso9283._HINT,
+                         "只算笛卡尔坐标；姿态固定、不加扰动；系统会解一次 IK "
+                         "判断每点是否可达，不输出关节角。")
+
+
 class PageInitUsesCurrentToggleTest(unittest.TestCase):
-    """页面初始化必须按 toggle 的**当前值**显示输入块，不能写死模式名。
+    """切换型页面初始化必须按 toggle 的**当前值**显示输入块，不能写死模式名。
 
     真实故障：ISO 页初始化写死 ``switch_mode("center")``，而立方体来源已经没有
     ``center`` 这一项（只有 bounds / auto）→ 打开页面后**两组输入全被隐藏**，
-    看起来"这一页没有输入框"。源码扫描守住这条，避免再出现写死旧模式名的写法。
+    看起来“这一页没有输入框”。源码扫描守住这条，避免再出现写死旧模式名的写法。
+
+    ISO 页后来又把两种来源一起删了（ISO 9283 只给最大/最小点，没有“布点 /
+    截面”可选），所以那里改成断言“没有切换控件”，同一个坑不可能再出现。
     """
 
     PAGES = ("generate", "repair", "iso9283")
@@ -279,10 +324,24 @@ class PageInitUsesCurrentToggleTest(unittest.TestCase):
     def _source(self, name: str) -> str:
         return (PAGES_DIR / f"{name}.py").read_text(encoding="utf-8")
 
-    def test_iso_initialises_from_the_toggle_value(self):
+    def test_iso_page_shows_no_joint_quantities(self):
+        """ISO 页不显示关节量：没有 q_seed / j5_min 输入、没有任务机制。"""
         source = self._source("iso9283")
-        self.assertIn('switch_mode(fields["cube_mode"].value)', source)
-        self.assertNotIn('switch_mode("center")', source)
+        for banned in ('fields["q_seed"]', 'fields["j5_min"]',
+                       "log_view", "linear_progress", "request_cancel",
+                       "iso_cube_figure", "jobs.submit"):
+            self.assertNotIn(banned, source, f"ISO 页里还有 {banned}")
+        for column in ("q1", "q2", "q3", "q4", "q5", "q6", "j3", "j5", "cfg"):
+            self.assertNotIn(f'("{column}",', source, f"表里还有 {column} 列")
+        self.assertIn('"reach", "可达", "reach", "center"', source)
+        self.assertIn("系统会解一次 IK 判断每点是否可达", source)
+
+    def test_iso_page_has_no_source_toggle_left(self):
+        source = self._source("iso9283")
+        self.assertNotIn("switch_mode", source)
+        self.assertNotIn("switch_layout", source)
+        self.assertNotIn('"cube_mode": fields[', source)
+        self.assertIn('"cube_mode": _CUBE_MODE', source)
 
     #: 切换函数 -> 它对应的 toggle 字段名。
     TOGGLES = {"mode": "cube_mode", "domain": "domain_mode", "grid": "grid_mode"}

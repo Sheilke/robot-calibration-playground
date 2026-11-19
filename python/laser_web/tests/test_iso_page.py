@@ -317,8 +317,9 @@ class ManualPointsModeTest(unittest.TestCase):
             "cube_mode": "points", "rpy": [3, 73, -167],
             "euler": "xyz-intrinsic",
             "q_seed": [43, -30, -36, 42, -89, -1], "j5_min": 20}
-    POINTS = [[1025, 0, 605], [1300, 275, 880], [1300, -275, 880],
-              [750, 275, 330], [750, -275, 330]]
+    #: 与 ``cube_points`` 的 ISO 9283 编号一致：P2/P3 小 X 小 Z、P4/P5 大 X 大 Z。
+    POINTS = [[1025, 0, 605], [750, 275, 330], [750, -275, 330],
+              [1300, 275, 880], [1300, -275, 880]]
 
     def test_manual_points_solve_without_a_cube(self):
         result = core.run_iso9283(dict(self.BASE, points=self.POINTS))

@@ -259,9 +259,20 @@ _SHELL_TEMPLATE = """<!DOCTYPE html>
   };
 
   // 供 Qt 侧自检：有没有图、多少点
+  // 供 Qt 侧自检：``points=N`` 里的 N 是“数据点”的数量，不是第一个 trace 的
+  // 点数。ISO 五点那张图的第一条 trace 是立方体 12 条棱的线框（36 个端点），
+  // 取 data[0] 会报 points=36，看着像有 36 个测点。带 customdata 的那条才是
+  // 真正的点位 trace（都没有就退回第一条）。
   window.__state = function () {
     if (gd === null || !gd.data || !gd.data.length) { return 'empty'; }
-    return 'points=' + (gd.data[0].x || []).length;
+    var trace = gd.data[0];
+    for (var i = 0; i < gd.data.length; i++) {
+      if (gd.data[i].customdata && gd.data[i].customdata.length) {
+        trace = gd.data[i];
+        break;
+      }
+    }
+    return 'points=' + ((trace && trace.x) || []).length;
   };
 
   // 供 Qt 侧自检：当前选了哪些键

@@ -89,6 +89,53 @@ class CubePointsGeometryTest(unittest.TestCase):
         for name in POINT_NAMES:
             np.testing.assert_allclose(points[name], expected[name], atol=1e-9)
 
+    #: 用户实测基准那一组数：中心 1000/0/600、边长 200（五点坐标逐点写死）。
+    NUMBERING_CENTER = (1000.0, 0.0, 600.0)
+    NUMBERING_SIDE = 200.0
+    NUMBERING_EXPECTED = {
+        "P1": (1000.0, 0.0, 600.0),
+        "P2": (900.0, 100.0, 500.0),     # X 小、Z 小
+        "P3": (900.0, -100.0, 500.0),    # X 小、Z 小
+        "P4": (1100.0, 100.0, 700.0),    # X 大、Z 大
+        "P5": (1100.0, -100.0, 700.0),   # X 大、Z 大
+    }
+
+    def test_five_points_follow_the_iso_numbering(self):
+        """编号按 ISO 9283：P2/P3 在小 X 小 Z 一侧，P4/P5 在大 X 大 Z 一侧。
+
+        这是**标准错误**级别的一条：旧实现把两侧对调了（P2/P3 给了大 X 大 Z），
+        五点顺序整体反了。坐标逐点写死，任何一次翻转都会当场炸。
+        """
+        points = cube_points(self.NUMBERING_CENTER, self.NUMBERING_SIDE,
+                             "vertices", plane="xz")
+        for name, coords in self.NUMBERING_EXPECTED.items():
+            np.testing.assert_allclose(points[name], coords, atol=1e-9,
+                                       err_msg=name)
+        center_x, _, center_z = self.NUMBERING_CENTER
+        for name in ("P2", "P3"):
+            self.assertLess(points[name][0], center_x, name)
+            self.assertLess(points[name][2], center_z, name)
+        for name in ("P4", "P5"):
+            self.assertGreater(points[name][0], center_x, name)
+            self.assertGreater(points[name][2], center_z, name)
+        # 同一侧的两点只差在 Y；P2/P4 取 Y=+h，P3/P5 取 Y=-h
+        h = self.NUMBERING_SIDE / 2.0
+        for name, sign in (("P2", 1.0), ("P3", -1.0), ("P4", 1.0),
+                           ("P5", -1.0)):
+            self.assertAlmostEqual(float(points[name][1]), sign * h, places=9)
+
+    def test_circle_keeps_the_same_numbering(self):
+        """``circle`` 与 ``vertices`` 共用同一对角：P2/P3 也在小 X 小 Z 一侧。"""
+        points = cube_points(self.NUMBERING_CENTER, self.NUMBERING_SIDE,
+                             "circle", plane="xz")
+        center_x, _, center_z = self.NUMBERING_CENTER
+        for name in ("P2", "P3"):
+            self.assertLess(points[name][0], center_x, name)
+            self.assertLess(points[name][2], center_z, name)
+        for name in ("P4", "P5"):
+            self.assertGreater(points[name][0], center_x, name)
+            self.assertGreater(points[name][2], center_z, name)
+
     def test_rejects_bad_input(self):
         for side in (0.0, -1.0, float("inf")):
             with self.assertRaises(ValueError):

@@ -2312,6 +2312,193 @@ def run_iso9283(params: dict, job=None, on_progress=None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# ISO 五点页（只算笛卡尔坐标 + 一次可达性验算）
+# ---------------------------------------------------------------------------
+#: 可达性验算用的固定 IK 种子（6 个 deg）。界面**不再**让用户填 ``q_seed``：
+#: 这里只问“这五个位置解不解得出来”，不是挑构型，所以固定取 CLI 的默认种子。
+ISO_REACHABILITY_SEED = "0,20,-20,0,40,0"
+
+
+def iso_reachability_seed() -> list[float]:
+    """可达性验算的固定种子（6 个 deg，来源就是 CLI 的 ``--q-seed`` 默认值）。
+
+    Returns:
+        list[float]: 6 个关节角（度）。
+
+    Raises:
+        _FormError: 默认值本身不是 6 个数（改了 ``iso9283_cube`` 的默认值时才会）。
+    """
+    raw = ISO_REACHABILITY_SEED or iso_defaults()["q_seed"]
+    return _iso_numbers(raw, 6, "q_seed")
+
+
+def _iso_point_meta(options: dict, *, center, side) -> dict:
+    """``iso_points`` 的 ``meta``：五点用同一姿态、立方体与布点回显。"""
+    return {"source": "iso9283_points",
+            "points_source": ("manual" if options["cube"]["mode"] == "points"
+                              else "cube"),
+            "layout": str(options["layout"]),
+            "plane": str(options["plane"]),
+            "cube_center": (None if center is None
+                            else [round(float(value), 6) for value in center]),
+            "cube_side": None if side is None else round(float(side), 6),
+            "rpy": [round(float(value), 6) for value in options["rpy"]],
+            "euler_convention": str(options["euler"]),
+            "point_count": len(iso.POINT_NAMES),
+            "motion": "MOVL",
+            "note": ("只算笛卡尔坐标；五点姿态完全相同、不加扰动；"
+                     "IK 只用来判断每点是否可达，不输出关节角")}
+
+
+def iso_points(params: dict) -> dict:
+    """只算 P1~P5 的**笛卡尔坐标**，并各解一次 IK 只为判“可达”（**不抛异常**）。
+
+    与 :func:`run_iso9283` 的区别是这里**不返回任何关节量**：``core.run_iso9283``
+    是给命令行/GP 用的（要 ``q``），ISO 页面只要坐标 + 可达性，所以走这一条。
+    IK 用固定种子（:data:`ISO_REACHABILITY_SEED`）解一次，结果只体现为
+    ``reachable``；姿态就是调用方给的参考姿态（不存在扰动）。
+
+    Args:
+        params: ``robot`` / ``cube_mode`` / ``cube``（或 ``center``+``side`` /
+            ``search_box`` / ``points``）/ ``layout`` / ``plane`` / ``rpy`` /
+            ``euler``；``q_seed`` / ``j5_min`` / ``square_frac`` 可省（用默认）。
+
+    Returns:
+        dict: 成功时 ``{"ok": True, "points": [{"name", "pos", "reachable"}],
+        "summary": {"reachable", "total"}, "meta", "warnings"}``；参数错 /
+        模型读不了 / 搜不到立方体时 ``{"ok": False, "error", "warnings"}``。
+        **点不可达不算失败**（``ok`` 仍为真）：可达性本身就是结果。
+    """
+    warnings: list[str] = []
+    try:
+        options = _iso_options(params or {})
+    except _FormError as error:
+        return {"ok": False, "error": str(error), "warnings": []}
+    except (TypeError, ValueError) as error:
+        return {"ok": False, "error": f"参数无法解析：{error}", "warnings": []}
+
+    from robot_model.nexbot_ik import Nexbot6R
+
+    order, extrinsic = iso._split_convention(
+        argparse.Namespace(euler_convention=options["euler"]))
+    try:
+        rbt = Nexbot6R(options["robot"])
+    except Exception as error:          # noqa: BLE001 - 模型读不了就是参数错
+        return {"ok": False,
+                "error": f"机器人模型无法加载：{type(error).__name__}: {error}",
+                "warnings": []}
+
+    manual = options["cube"]["mode"] == "points"
+    try:
+        center, side = _iso_cube(options, rbt, order=order,
+                                 extrinsic=extrinsic, q_seed=options["q_seed"])
+    except _FormError as error:
+        return {"ok": False, "error": str(error), "warnings": []}
+    if manual:
+        try:
+            points = {name: [float(v) for v in options["cube"]["points"][index]]
+                      for index, name in enumerate(iso.POINT_NAMES)}
+        except (TypeError, ValueError, IndexError) as error:
+            return {"ok": False, "error": f"人工指定五点无法解析：{error}",
+                    "warnings": []}
+    else:
+        try:
+            points = iso.cube_points(center, side, options["layout"],
+                                     options["square_frac"], options["plane"])
+        except ValueError as error:
+            return {"ok": False, "error": str(error), "warnings": []}
+
+    # 一次 IK，只为判“可达”；关节角既不返回也不打印。
+    solved = iso.solve_points(rbt, points, options["rpy"], order=order,
+                              extrinsic=extrinsic,
+                              q_seed=iso_reachability_seed())
+    rows = [{"name": name,
+             "pos": [round(float(value), 6) for value in solved[name]["pos"]],
+             "reachable": bool(solved[name]["ok"])}
+            for name in iso.POINT_NAMES]
+    reachable = sum(1 for row in rows if row["reachable"])
+    unreachable = [row["name"] for row in rows if not row["reachable"]]
+    if unreachable:
+        warnings.append(f"{len(unreachable)} 个点不可达（{','.join(unreachable)}）："
+                        f"缩小立方体或换参考姿态")
+    return {"ok": True,
+            "points": rows,
+            "summary": {"reachable": reachable, "total": len(rows)},
+            "meta": _iso_point_meta(options, center=center, side=side),
+            "warnings": warnings}
+
+
+def iso_points_payload(result: dict) -> dict:
+    """``iso_points`` 的结果 -> 落盘的 ``iso.json``（只有 X/Y/Z + 参考姿态）。
+
+    Args:
+        result: :func:`iso_points` 的返回值。
+
+    Returns:
+        dict: ``{"meta": {...}, "points": [{"name", "pos", "rpy",
+        "reachable"}]}``；每点的 ``rpy`` 就是参考姿态（五点完全相同）。
+    """
+    meta = dict((result or {}).get("meta") or {})
+    rpy = [round(float(value), 6) for value in meta.get("rpy") or []]
+    points = []
+    for row in (result or {}).get("points") or []:
+        points.append({"name": str(row["name"]),
+                       "pos": [round(float(value), 6) for value in row["pos"]],
+                       "rpy": list(rpy),
+                       "reachable": bool(row.get("reachable"))})
+    return {"meta": meta, "points": points}
+
+
+def save_iso_points(result: dict, run_dir=None) -> dict:
+    """把 ``iso.json`` 与五点图（PNG）写进运行目录，返回产物信息。
+
+    不建任务、不跑 IK：调用方已经把 :func:`iso_points` 的结果算好了。写盘是
+    唯一的重活（matplotlib 出图约 0.3 s），所以**只在导出时**调用，别塞进
+    “点一下就算完”的那条路径。
+
+    Args:
+        result: :func:`iso_points` 的返回值（``ok`` 必须为真）。
+        run_dir: 目标目录；``None`` 时按 ``runs/`` 的规矩新建一个。
+
+    Returns:
+        dict: ``{"run_id", "run_dir", "artifacts": {"iso_json": ...,
+        "plot": ...}}``。
+
+    Raises:
+        ValueError: ``result`` 不是一次成功的结果。
+    """
+    if not (result or {}).get("ok"):
+        raise ValueError("iso_points 没有成功，不能落盘")
+    if run_dir is None:
+        run_id, folder = jobs.make_run_dir()
+    else:
+        folder = Path(str(run_dir))
+        folder.mkdir(parents=True, exist_ok=True)
+        run_id = folder.name
+    payload = iso_points_payload(result)
+    with open(folder / ARTIFACT_ISO_JSON, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2,
+                  allow_nan=False)
+
+    meta = payload["meta"]
+    points = {row["name"]: np.asarray(row["pos"], dtype=float)
+              for row in payload["points"]}
+    summary = (result or {}).get("summary") or {}
+    # 标题只用 ASCII：matplotlib 的默认字体没有中文字形，带中文会打一排
+    # "Glyph ... missing from current font" 的警告（图里还是缺字）。
+    title = (f"ISO 9283 P1~P5 (reachable "
+             f"{summary.get('reachable', 0)}/{summary.get('total', len(points))}"
+             + ("" if meta.get("cube_side") is None
+                else f", L={float(meta['cube_side']):g} mm")
+             + ")")
+    iso.plot_points(points, meta.get("cube_center"), meta.get("cube_side"),
+                    str(folder / ARTIFACT_ISO_PLOT), title)
+    return {"run_id": run_id, "run_dir": str(folder),
+            "artifacts": {"iso_json": ARTIFACT_ISO_JSON,
+                          "plot": ARTIFACT_ISO_PLOT}}
+
+
+# ---------------------------------------------------------------------------
 # M3：工具页（GP 导出 / JSON -> URDF / 运行目录盘点与清理）
 # ---------------------------------------------------------------------------
 #: GP 模板里必须保持原样的元数据字段（写完回读比对，作为"模板未改动"的证据）。
@@ -2401,6 +2588,25 @@ def gp_defaults() -> dict:
             "euler": GP_DEFAULT_EULER}
 
 
+def _has_joint_data(path: Path) -> bool:
+    """``iso.json`` 里有没有关节角（决定了它能不能拿去导 GP）。
+
+    Args:
+        path: 待检查的 JSON 文件。
+
+    Returns:
+        bool: 至少有一步带了非空 ``q`` 才算“有关节角”；文件读不动/格式不认识
+        也返回 ``False``（后面 ``export_gp`` 会给出更具体的原因）。
+    """
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    steps = payload.get("perturbed_ik") or []
+    return any(step.get("q") for step in steps
+               if isinstance(step, dict))
+
+
 def _gp_scan_path(params: dict) -> Path:
     """解析 ``run_dir`` / ``scan`` 两种入参，返回 ``scan.json`` 的绝对路径。
 
@@ -2423,11 +2629,20 @@ def _gp_scan_path(params: dict) -> Path:
             path = jobs.repo_root() / path
         path = path.resolve()
         if path.is_dir():
-            # 正常扫描目录认 ``scan.json``；ISO 五点目录只有 ``iso.json``（同构，
-            # ``load_scan_points`` 一样能读），所以两种产物名都看。
+            # 正常扫描目录认 ``scan.json``；ISO 五点目录只有 ``iso.json``。
+            # 注意两种 ``iso.json`` 不是一回事：命令行 / ``run_iso9283`` 写的那份
+            # 与 ``scan.json`` 同构（带 ``q``，``load_scan_points`` 能读）；ISO 页
+            # 写的那份只有 X/Y/Z + 参考姿态（没有关节角），导 GP 会失败——那种
+            # 情况在这里就说清楚，别让现场以为是模板或路径的问题。
             for name in (ARTIFACT_SCAN_JSON, ARTIFACT_ISO_JSON):
-                if (path / name).is_file():
-                    return path / name
+                candidate = path / name
+                if not candidate.is_file():
+                    continue
+                if name == ARTIFACT_ISO_JSON and not _has_joint_data(candidate):
+                    raise _FormError(
+                        f"{candidate} 只有笛卡尔坐标、没有关节角，导不出 GP；"
+                        f"导 GP 请用「生成」页的 {ARTIFACT_SCAN_JSON}")
+                return candidate
             raise _FormError(f"{key} 里没有 {ARTIFACT_SCAN_JSON} 或 "
                              f"{ARTIFACT_ISO_JSON}：{path}")
         if not path.is_file():

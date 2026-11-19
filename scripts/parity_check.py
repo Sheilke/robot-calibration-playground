@@ -212,7 +212,9 @@ def web_iso_params() -> dict:
     """网页入口的 ``core.run_iso9283`` 入参（照抄 ``pages/iso9283.py::collect``）。
 
     Returns:
-        dict: 表单默认值收成的参数（``cube_mode="bounds"``，示例域立方体）。
+        dict: 表单默认值收成的参数（立方体来源只有 ``bounds`` 一种，布点与截面
+        固定 ``vertices`` / ``xz``，示例域立方体）。**没有** ``q_seed`` /
+        ``j5_min``：ISO 页不显示关节量，界面也不再暴露这两项。
     """
     from laser_web import core, ui_state
 
@@ -223,13 +225,10 @@ def web_iso_params() -> dict:
         "cube_mode": "bounds",
         "cube": [float(low[0]), float(high[0]), float(low[1]),
                  float(high[1]), float(low[2]), float(high[2])],
-        "layout": str(defaults["layout"]),
-        "plane": str(defaults["plane"]),
-        "square_frac": float(defaults["square_frac"]),
+        "layout": "vertices",
+        "plane": "xz",
         "rpy": [float(value) for value in defaults["rpy"]],
         "euler": str(defaults["euler"]),
-        "q_seed": str(defaults["q_seed"]),
-        "j5_min": float(defaults["j5_min"]),
     }
 
 
@@ -352,33 +351,26 @@ def desktop_iso_params(params: dict) -> dict:
     from laser_desktop import iso_page
 
     mode = str(params["cube_mode"])
-    if mode not in ("bounds", "auto"):
-        # 桌面表单只有两种来源（「中心+边长」只在命令行里有），别假装测到了。
+    if mode != "bounds":
+        # 桌面表单只有一种立方体来源（最大/最小点）；其余给法只在命令行里有。
         raise DesktopUnavailable(
-            f"桌面 ISO 表单不提供 cube_mode={mode!r}（只有 bounds / auto）")
+            f"桌面 ISO 表单不提供 cube_mode={mode!r}（只有 bounds）")
+    if (str(params.get("layout")) != iso_page.FIXED_LAYOUT
+            or str(params.get("plane")) != iso_page.FIXED_PLANE):
+        # 布点与截面在界面上不可选（固定为 ISO 9283 的取法）。
+        raise DesktopUnavailable(
+            "桌面 ISO 表单固定 layout=/plane="
+            f"{iso_page.FIXED_LAYOUT}/{iso_page.FIXED_PLANE}，"
+            f"参数表里是 {params.get('layout')!r}/{params.get('plane')!r}")
     page = iso_page.IsoPage(plot=None)
     fields = page.fields
     _set_choice(fields["robot"], params["robot"], "机器人模型")
-    fields[f"cube_{mode}"].setChecked(True)
-    if mode == "bounds":
-        for key, value in zip(("x0", "x1", "y0", "y1", "z0", "z1"),
-                              params["cube"]):
-            fields[key].setValue(float(value))
-    else:
-        for key, value in zip(("box_x0", "box_x1", "box_y0", "box_y1",
-                               "box_z0", "box_z1"), params["search_box"]):
-            fields[key].setValue(float(value))
-        fields["resolution"].setValue(float(params["resolution"]))
-        prefer = params.get("prefer_x_min")
-        fields["prefer_x_min"].setText("" if prefer is None else f"{float(prefer):g}")
-    _set_choice(fields["layout"], params["layout"], "布点")
-    _set_choice(fields["plane"], params["plane"], "对角截面")
-    fields["square_frac"].setValue(float(params["square_frac"]))
+    for key, value in zip(("x0", "x1", "y0", "y1", "z0", "z1"),
+                          params["cube"]):
+        fields[key].setValue(float(value))
     for key, value in zip(("rpy_a", "rpy_b", "rpy_c"), params["rpy"]):
         fields[key].setValue(float(value))
     _set_choice(fields["euler"], params["euler"], "欧拉约定")
-    fields["q_seed"].setText(str(params["q_seed"]))
-    fields["j5_min"].setValue(float(params["j5_min"]))
     return iso_page.form_to_params(page.values())
 
 
@@ -457,12 +449,15 @@ def iso_argv(params: dict, out_json: Path, out_png: Path) -> list[str]:
             f"命令行入口与界面口径不同：cube_mode={mode!r} 没有对应写法")
     argv += ["--layout", str(params["layout"]),
              "--plane", str(params["plane"]),
-             "--square-frac", _num(params["square_frac"]),
              "--rpy", *[_num(value) for value in params["rpy"]],
-             "--euler", str(params["euler"]),
-             "--q-seed", str(params["q_seed"]),
-             "--j5-min", _num(params["j5_min"]),
-             "--out", str(out_json), "--plot", str(out_png)]
+             "--euler", str(params["euler"])]
+    # 页面只提交坐标与姿态（没有 q_seed / j5_min）：命令行这边不传就是它自己的
+    # 默认值，两边算出来的 ``iso.json`` 仍然逐字节相同。
+    if params.get("q_seed") is not None:
+        argv += ["--q-seed", str(params["q_seed"])]
+    if params.get("j5_min") is not None:
+        argv += ["--j5-min", _num(params["j5_min"])]
+    argv += ["--out", str(out_json), "--plot", str(out_png)]
     return argv
 
 

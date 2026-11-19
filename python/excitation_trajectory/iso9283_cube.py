@@ -21,12 +21,20 @@ scipy 数值 IK        仓库的解析 IK ``Nexbot6R``    少一个依赖，且�
 ``vertices``（默认，ISO 9283 的对角截面）
     五点在立方体的**对角截面**上：P1 是立方体中心，P2～P5 是该截面矩形的四个角。
     截面取 XZ 平面的对角面 ``x = z``（从 XZ 最小角倾斜到最大角），四个角正是
-    立方体顶点 ``(h,h,h) (h,-h,h) (-h,h,-h) (-h,-h,-h)``（h = 边长/2）——
+    立方体顶点 ``(-h,h,-h) (-h,-h,-h) (h,h,h) (h,-h,h)``（h = 边长/2）——
     三轴都用满 ±h，空间利用率最大。
+
+    **编号（ISO 9283，不要翻转）**：P2 / P3 在**小 X 小 Z** 一侧，P4 / P5 在
+    **大 X 大 Z** 一侧；同一侧的两点只差在 Y（Y=+h 的那个先，Y=−h 的后）。所以
+    执行顺序从 XZ 最小的那个角起、到 XZ 最大的那个角止。ISO 9283 的 P2～P5 就是
+    这个编号——早先的实现把两侧对调了（P2/P3 给了大 X 大 Z），五点顺序整体反了，
+    已按标准改正。
 
 ``circle``
     P1 为中心，P2～P5 落在**同一对角截面**上的内切圆（半径 h，受截面短边 y 限制），
-    四点互成 90°。dev_1.0 分支里的旧实现就是这种；圆周点到不了截面四角。
+    四点互成 90°。编号沿用 ``vertices``：P2/P3 在小 X 小 Z 一侧、P4/P5 在大 X
+    大 Z 一侧（``circle`` 与 ``vertices`` 共用同一对角、不是从第一象限起算）。
+    dev_1.0 分支里的旧实现就是这种；圆周点到不了截面四角。
 
 ``center-square``
     复现原 Downloads 脚本的布点：P1 在立方体中心，P2～P5 是 ``z = -k·h`` 平面上
@@ -97,7 +105,8 @@ def cube_points(center, side: float, layout: str = "vertices",
         plane: 对角截面 ``xz`` / ``yz`` / ``xy``（只影响 vertices 与 circle）。
 
     Returns:
-        ``{"P1": ndarray(3), ..., "P5": ndarray(3)}``。
+        ``{"P1": ndarray(3), ..., "P5": ndarray(3)}``。编号按 ISO 9283：P2/P3
+        在小 X 小 Z 一侧，P4/P5 在大 X 大 Z 一侧（同侧两点差在 Y）。
 
     Raises:
         ValueError: 边长非正，layout / plane 不认识。
@@ -115,7 +124,10 @@ def cube_points(center, side: float, layout: str = "vertices",
         # ISO 9283 的**对角截面**：``coord[a] == coord[b]``，第三轴在截面内自由。
         # 截面是 u∈±h√2（对角方向）× h 的矩形，四个角 = 立方体四个间隔顶点。
         first, second, third = PLANES[plane]
-        sign_pairs = ((+1, +1), (+1, -1), (-1, +1), (-1, -1))
+        # 角点顺序 = ISO 9283 的编号：先（−1）对角给 P2/P3（小 X 小 Z 一侧），
+        # 再（＋1）对角给 P4/P5（大 X 大 Z 一侧）；同侧两点只差第三轴（Y）的符号。
+        # 别把这两组对调——那会让 P2/P3 落到大 X 大 Z 一侧（旧实现就是反的）。
+        sign_pairs = ((-1, +1), (-1, -1), (+1, +1), (+1, -1))
         # 对角方向分 h（vertices，取到截面四角）或 h/√2（circle，内切圆 45° 处）
         diagonal = h if layout == "vertices" else h * math.cos(math.pi / 4.0)
         # 直角坐标里对角两轴各占 u/√2；circle 时即 h/2，vertices 时即 h

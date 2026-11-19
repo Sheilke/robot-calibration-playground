@@ -17,16 +17,18 @@ S4 起再补一段**修复页**检查：切到「奇异修复」页 → 填 8 �
 ``/tmp/desktop_s4.png``。
 S5 起最后补两段：
 
-* **ISO 五点页**：切到该页 → 立方体来源两种模式各切 2 次（可见组必须恰好 1 个，
-  钉死网页版 32136c6 那类“两组都隐藏”的坑）→ 填 200 mm 立方体（站点位置）→
+* **ISO 五点页**：切到该页 → 确认**没有**“立方体来源 / 布点 / 截面”切换控件
+  （ISO 9283 只有一种取法：给最大/最小点）→ 填 200 mm 立方体（站点位置）→
   真跑一次（``core.run_iso9283``，实测 < 1 s），断言终态 ``done``、路点表 5 行、
   ``|J5|min`` 有值，截图存 ``/tmp/desktop_s5_iso.png``；
 * **工具页**：运行表非空、模板文件的摘要块说清楚自己看到的是什么（找到了就
   是 64 位十六进制 sha256；找不到就明说「—」并列出搜索路径 + 环境变量名，
   绝不允许“两眼一抹黑但显示一个 sha256”），截图存 ``/tmp/desktop_s5_tools.png``。
 
-S5 评审后补的一条回归（T1）：**切立方体来源必须同时换预览**——切到「自动搜索」
-后预览卡必须是搜索箱（不是上一种来源的边长 550 mm）。
+S5 评审后补的一条回归（T1）：当初“切立方体来源必须同时换预览”钉的是
+``bounds`` / ``auto`` 两种来源并存时的预览串台。两种来源已经一起删掉（ISO 9283
+只有一种取法），这条改成**确认界面上没有来源 / 布点 / 截面切换控件**——控件不在，
+串台就不可能再发生。
 
 S4 评审后的三条回归（都是“界面状态与盘子里的文件自相矛盾”那类问题）：
 
@@ -82,6 +84,7 @@ from laser_desktop.qt_compat import configure_webengine_environment, QtWidgets, 
 configure_webengine_environment()
 app = QtWidgets.QApplication(sys.argv)
 from laser_desktop.main_window import MainWindow, build_preview_figure
+from laser_desktop import iso_page
 from laser_desktop import page_layout
 from laser_desktop import paths
 from laser_desktop import tools_page
@@ -529,69 +532,57 @@ def after_infeasible():
 
 
 # ---------------------------------------------------------------------------
-# S5：ISO 五点页（切两次来源 + 真跑 200 mm 立方体）
+# S5：ISO 五点页（真跑 200 mm 立方体）
 # ---------------------------------------------------------------------------
 def configure_iso_case(iso) -> None:
     """把 ISO 页改成 200 mm 立方体（站点位置，5 点全可解）。"""
     fields = iso.fields
-    fields["cube_bounds"].setChecked(True)
     for key, value in (("x0", 925.0), ("x1", 1125.0), ("y0", -100.0),
                        ("y1", 100.0), ("z0", 505.0), ("z1", 705.0)):
         fields[key].setValue(value)
-    fields["layout"].setCurrentIndex(fields["layout"].findData("vertices"))
-    fields["plane"].setCurrentIndex(fields["plane"].findData("xz"))
     fields["rpy_a"].setValue(3.0)
     fields["rpy_b"].setValue(73.0)
     fields["rpy_c"].setValue(-167.0)
     fields["euler"].setCurrentIndex(fields["euler"].findData("xyz-intrinsic"))
-    fields["q_seed"].setText("43,-30,-36,42,-89,-1")
-    fields["j5_min"].setValue(20.0)
     iso.refresh_preview()
 
 
-def visible_iso_panels(iso) -> list[int]:
-    """当前可见的立方体来源面板下标（``isVisible``；窗口已显示）。"""
-    stack = iso.mode_stack
-    return [index for index in range(stack.count())
-            if stack.widget(index).isVisible()]
+#: 界面上**不该**再有的控件（值 -> 说明）：ISO 9283 只有一种取法，
+#: 而且这一页只算坐标（不显示关节量，也就不需要 IK 种子与 |J5| 阈值）。
+FORBIDDEN_ISO_FIELDS = {
+    "cube_bounds": "立方体来源切换（给最大/最小点）",
+    "cube_auto": "立方体来源切换（自动搜索）",
+    "box_x0": "自动搜索的搜索箱",
+    "resolution": "自动搜索的步长",
+    "prefer_x_min": "自动搜索的中心 X 下限",
+    "layout": "布点下拉框",
+    "plane": "截面下拉框",
+    "square_frac": "布点参数 k",
+    "q_seed": "IK 种子（可达性验算用固定种子）",
+    "j5_min": "|J5| 告警下限（不再显示腕部裕度）",
+}
 
 
 def start_iso_page():
-    """S5：切到「ISO 五点」页 → 切两次立方体来源 → 真跑一次 → 截图。"""
+    """S5：切到「ISO 五点」页 → 确认没有来源/布点/截面控件 → 真跑一次 → 截图。"""
     window.nav.setCurrentRow(2)
     iso = window.iso
     step("切到 ISO 五点页", window.stack.currentWidget() is iso,
          type(window.stack.currentWidget()).__name__)
 
-    seen = []
-    for _round in range(2):
-        iso.fields["cube_auto"].setChecked(True)
-        seen.append(len(visible_iso_panels(iso)))
-        iso.fields["cube_bounds"].setChecked(True)
-        seen.append(len(visible_iso_panels(iso)))
-    step("立方体来源切两次仍恰好 1 组可见",
-         seen == [1, 1, 1, 1], f"每次可见组数={seen}")
-
-    # T1：切来源必须**同时换预览**（预览卡 / 预览页签 / 提示全跟着走）
-    iso.fields["cube_auto"].setChecked(True)
-    auto = iso.preview or {}
-    step("切到自动搜索后预览卡是搜索箱",
-         auto.get("mode") == "auto"
-         and iso.preview_labels["cube"].text() == "待真跑（自动搜索）"
-         and "边长" not in iso.preview_labels["cube"].text()
-         and "搜索范围" in iso.preview_hint.text()
-         and iso.preview_table.rowCount() == 0,
-         f"mode={auto.get('mode')} 卡片={iso.preview_labels['cube'].text()} "
-         f"提示={iso.preview_hint.text()[:36]}… "
-         f"五点行={iso.preview_table.rowCount()}")
-    iso.fields["cube_bounds"].setChecked(True)
-    bounds = iso.preview or {}
-    step("切回两点输入后预览卡是立方体",
-         bounds.get("mode") == "bounds"
-         and iso.preview_labels["cube"].text().startswith("边长")
-         and iso.preview_table.rowCount() == 5,
-         f"mode={bounds.get('mode')} 卡片={iso.preview_labels['cube'].text()} "
-         f"五点行={iso.preview_table.rowCount()}")
+    leftovers = {key: label for key, label in FORBIDDEN_ISO_FIELDS.items()
+                 if key in iso.fields}
+    step("ISO 页没有来源/布点/截面/种子控件",
+         not leftovers and not hasattr(iso, "mode_stack"),
+         "残留：" + (", ".join(f"{key}={label}"
+                              for key, label in leftovers.items()) or "无"))
+    step("ISO 页没有任务机制（进度条/取消/日志）",
+         not any(hasattr(iso, name) for name in ("progress_bar",
+                                                 "cancel_button",
+                                                 "log_edit", "bridge")),
+         "属性：" + ",".join(name for name in
+                            ("progress_bar", "cancel_button", "log_edit",
+                             "bridge") if hasattr(iso, name)))
 
     configure_iso_case(iso)
     preview = iso.preview or {}
@@ -601,47 +592,71 @@ def start_iso_page():
          f"边长={preview.get('side')} 面心={len(preview.get('faces') or [])} "
          f"候选点={len(preview.get('candidates') or [])} "
          f"五点={len(preview.get('points') or [])}")
-    job_id = iso.start_iso()
-    step("起 ISO 五点任务", bool(job_id),
-         f"job={job_id} 进度={iso.progress_bar.format()}")
-    if not job_id:
-        finish(); return
-    state["deadline"] = time.time() + RUN_TIMEOUT
-    QtCore.QTimer.singleShot(100, poll_iso_run)
-
-
-def poll_iso_run():
-    iso = window.iso
-    if iso.run_state in ("done", "failed", "cancelled"):
-        after_iso_run(); return
-    if time.time() > state.get("deadline", 0):
-        step("ISO 五点跑完", False, f"超时 {RUN_TIMEOUT} s")
-        after_iso_run(); return
-    QtCore.QTimer.singleShot(100, poll_iso_run)
+    result = iso.start_iso()
+    step("ISO 五点算完（主线程，无任务）", bool(result)
+         and iso.run_state == "done",
+         f"ok={bool(result)} state={iso.run_state} "
+         f"耗时={iso.last_elapsed_ms and round(iso.last_elapsed_ms, 1)} ms")
+    after_iso_run()
 
 
 def after_iso_run():
-    """ISO 真跑：5 行路点、|J5|min 有值、产物按钮全开。"""
+    """ISO 算完：5 行坐标、可达 5/5、表头没有关节列、导出可点。"""
     iso = window.iso
     result = iso.last_result or {}
-    stats = result.get("stats") or {}
-    step("ISO 终态 done", iso.run_state == "done" and result.get("ok") is True,
+    summary = result.get("summary") or {}
+    step("ISO 算完且全可达",
+         iso.run_state == "done" and result.get("ok") is True
+         and summary.get("reachable") == summary.get("total") == 5,
          f"state={iso.run_state} ok={result.get('ok')} "
+         f"可达={summary.get('reachable')}/{summary.get('total')} "
          f"err={str(result.get('error') or '')[:32]}")
-    step("ISO 路点表 5 行", iso.point_table.rowCount() == 5,
-         f"{stats.get('solved')}/{stats.get('total')} 行={iso.point_table.rowCount()}")
-    step("ISO |J5|min 有值",
-         stats.get("j5_abs_min") is not None
-         and iso.stat_labels["j5"].text() != "|J5|min —",
-         f"{iso.stat_labels['j5'].text()} · {iso.stat_labels['solved'].text()}")
+    headers = [iso.point_table.horizontalHeaderItem(index).text()
+               for index in range(iso.point_table.columnCount())]
+    step("ISO 路点表 5 行且没有关节列",
+         iso.point_table.rowCount() == 5
+         and headers == list(iso_page.POINT_HEADERS)
+         and not any("q" == header[:1] for header in headers),
+         f"行={iso.point_table.rowCount()} 列={headers}")
+    step("ISO 汇总行是「可达 5/5」",
+         iso.stat_labels["reach"].text() == "可达 5/5"
+         and "IK" not in iso.stat_labels["reach"].text(),
+         f"{iso.stat_labels['reach'].text()} · "
+         f"{iso.stat_labels['side'].text()} · {iso.stat_labels['center'].text()}")
     step("ISO 导出按钮全开",
          all(button.isEnabled() for button in iso.export_buttons.values()),
          ",".join(f"{key}={button.isEnabled()}"
                   for key, button in iso.export_buttons.items()))
-    step("ISO 进度条到 100%", iso.progress_bar.value() == 1000,
-         iso.progress_bar.format())
     iso.result_tabs.setCurrentWidget(iso.points_page)
-    QtCore.QTimer.singleShot(400, grab_s5_iso)
+    # 图必须真的换成了 ISO 那张：``__keys`` 里应当是 P1..P5，``__state`` 是 5 点。
+    # 之前没有这条断言，截图里留着生成页的图也能"通过"。
+    QtCore.QTimer.singleShot(300, check_iso_figure)
+
+
+def check_iso_figure():
+    def got_keys(raw):
+        keys = []
+        try:
+            parsed = json.loads(str(raw or "[]"))
+            # 壳页里 ``__keys()`` 返回的是 JSON **字符串**，再包一层 JSON.stringify
+            # 就会拿到双重编码的串：解一次得到字符串，逐字符迭代会得到 'P'。
+            if isinstance(parsed, str):
+                parsed = json.loads(parsed)
+        except (TypeError, ValueError):
+            parsed = []
+        for trace_keys in parsed:
+            for key in trace_keys:
+                if isinstance(key, str) and key.startswith("P"):
+                    keys.append(key)
+        step("ISO 结果图进了共享视图", sorted(keys) == ["P1", "P2", "P3", "P4", "P5"],
+             f"keys={keys}")
+
+        def got_state(state):
+            step("ISO 图上点数 = 5（不是线框的 36）", str(state) == "points=5",
+                 f"__state()={state!r}")
+            QtCore.QTimer.singleShot(300, grab_s5_iso)
+        window.plot.page().runJavaScript("window.__state()", 0, got_state)
+    window.plot.page().runJavaScript("JSON.stringify(window.__keys())", 0, got_keys)
 
 
 def grab_s5_iso():
@@ -1049,13 +1064,21 @@ def buttons_of(page) -> dict:
     return {page.generate_button.text(): page.generate_button}
 
 
+#: 预览卡里要检查的键：**按页面真有的那几项**（生成 / 修复 = 边长…欧拉约定；
+#: ISO = 立方体 / 边心距 / 中心——ISO 页的布点与截面已不可选，那两行撤了；
+#: 生成页的「体积」在 commit ebe5b2f 已换成「边长」）。
+METRIC_KEYS = {"generate": ("edges", "grid", "points", "design", "euler"),
+               "repair": ("edges", "grid", "points", "design", "euler"),
+               "iso": ("cube", "apothem", "center")}
+
+
 def metric_labels_of(page) -> dict:
-    """预览卡里的五项数值（生成 / 修复 = 体积…欧拉约定；ISO = 立方体…截面）。"""
-    if page is window.iso:
-        keys = ("cube", "apothem", "center", "layout", "plane")
-        return {key: page.preview_labels[key] for key in keys}
-    keys = ("volume", "grid", "points", "design", "euler")
-    return {key: page.metric_labels[key] for key in keys}
+    """预览卡里的数值标签（键见 :data:`METRIC_KEYS`）。"""
+    labels = (page.preview_labels if page is window.iso
+              else page.metric_labels)
+    kind = ("iso" if page is window.iso
+            else "repair" if page is window.repair else "generate")
+    return {key: labels[key] for key in METRIC_KEYS[kind] if key in labels}
 
 
 def s6c_start():

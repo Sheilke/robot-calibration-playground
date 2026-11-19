@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ISO 五点页真跑（S5）：一次 200 mm 立方体解算（走 ``JobBridge``）。
+"""ISO 五点页真算（S5）：点一次「生成五点」得到坐标与可达性（主线程）。
 
-案子照站点参数缩到 200 mm 边长：域 ``925..1125 / -100..100 / 505..705``、
-``rpy 3 73 -167``、``euler xyz-intrinsic``、``q-seed 43,-30,-36,42,-89,-1``。
-本机实测**整次解算 0.4 s 左右**（5 点 IK + matplotlib 出图 + 写 JSON），远低于
-60 s 的验收上限；耗时在测试里打印出来（报告里也写了）。
+案子：200 mm 边长、站点位置 ``925..1125 / -100..100 / 505..705``、参考姿态
+``rpy 3 73 -167``、``xyz-intrinsic``。这一页按用户要求**不显示关节量**，所以
+这里断言的也是“坐标 + 可达性 + 没有 IK 展示”：
 
-断言：
-
-1. 终态 ``done``、``ok`` 为真、5 个点全可解；
-2. 路点表 5 行、``|J5|min`` 有值、构型一致；
-3. ``runs/<id>/`` 里真的有 ``iso.json`` 与 ``iso.png``，导出按钮点亮；
-4. 线程安全沿用 S3/S4 的判据：``sys.excepthook`` / ``threading.excepthook``
-   抓到的异常必须为空，且 ``finished`` 信号在**主线程**发出（跨线程碰控件会
-   在这里炸）。
+1. 算得完（主线程，实测 10 ms 量级）、``run_state=done``；
+2. 五点全可达、路点表 5 行、统计行是 ``可达 5/5``（不是 ``IK 成功 5/5``）；
+3. 表头**没有** ``q1`` 之类的关节列；
+4. 导出的 ``iso.json`` 里每点是 X/Y/Z + 参考姿态，**没有** ``q`` / ``waypoints``；
+5. 线程安全沿用 S3/S4 的判据：``sys.excepthook`` / ``threading.excepthook``
+   抓到的异常必须为空（这一页现在连线程都不起）。
 """
 
 import json
@@ -26,16 +23,16 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from laser_desktop import iso_page
-from laser_desktop.job_bridge import JobBridge
 from laser_desktop.qt_compat import QtWidgets
 from laser_web import core, jobs
 
-#: 真跑的上限（秒）：本机实测 0.4 s，慢机器/CI 也远用不到这么多。
-TIMEOUT = 180.0
+#: 算五点的上限（秒）：本机实测 0.01 s，慢机器也远用不到这么多。
+TIMEOUT = 60.0
 
 _APP = None
 
@@ -49,65 +46,46 @@ def app():
     return _APP
 
 
-def wait_until(predicate, timeout: float = TIMEOUT) -> bool:
-    """转事件循环直到 ``predicate()`` 为真（超时返回 False）。"""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        app().processEvents()
-        if predicate():
-            return True
-        time.sleep(0.01)
-    app().processEvents()
-    return bool(predicate())
-
-
-def configure_small_cube(page) -> None:
-    """把表单改成 200 mm 立方体（站点位置，5 点全可解）。"""
+def configure_small_cube(page, bounds=None) -> None:
+    """把表单改成 200 mm 立方体（默认站点位置，5 点全可解；不填种子）。"""
     fields = page.fields
-    fields["cube_bounds"].setChecked(True)
-    for key, value in (("x0", 925.0), ("x1", 1125.0), ("y0", -100.0),
-                       ("y1", 100.0), ("z0", 505.0), ("z1", 705.0)):
+    bounds = bounds or (925.0, 1125.0, -100.0, 100.0, 505.0, 705.0)
+    for key, value in zip(("x0", "x1", "y0", "y1", "z0", "z1"), bounds):
         fields[key].setValue(value)
-    fields["layout"].setCurrentIndex(fields["layout"].findData("vertices"))
-    fields["plane"].setCurrentIndex(fields["plane"].findData("xz"))
     fields["rpy_a"].setValue(3.0)
     fields["rpy_b"].setValue(73.0)
     fields["rpy_c"].setValue(-167.0)
     fields["euler"].setCurrentIndex(fields["euler"].findData("xyz-intrinsic"))
-    fields["q_seed"].setText("43,-30,-36,42,-89,-1")
-    fields["j5_min"].setValue(20.0)
 
 
 class RealIsoRunTest(unittest.TestCase):
-    """从「生成五点」到结果表、图、产物、导出的全链路。"""
+    """从「生成五点」到结果表、图、产物的全链路（没有任务队列）。"""
 
     def setUp(self):
         app()
         self.root = Path(tempfile.mkdtemp(prefix="iso-run-"))
-        self.registry = jobs.JobRegistry(root=self.root)
-        self.bridge = JobBridge(registry=self.registry, flush_ms=50)
-        self.page = iso_page.IsoPage(plot=None, bridge=self.bridge)
+        self._previous_runs = os.environ.get(jobs.RUNS_ENV)
+        os.environ[jobs.RUNS_ENV] = str(self.root)
+        self.page = iso_page.IsoPage(plot=None)
         self.errors = []
-        self.finished_threads = []
         self._previous_excepthook = sys.excepthook
         self._previous_thread_hook = getattr(threading, "excepthook", None)
         sys.excepthook = lambda *info: self.errors.append(info)
         threading.excepthook = lambda info: self.errors.append(info)
-        # 记录 finished 是在哪个线程发出的（Qt 的排队连接必须落在主线程）
-        self.bridge.finished.connect(
-            lambda _payload: self.finished_threads.append(
-                threading.current_thread().name))
 
     def tearDown(self):
         sys.excepthook = self._previous_excepthook
         if self._previous_thread_hook is not None:
             threading.excepthook = self._previous_thread_hook
+        if self._previous_runs is None:
+            os.environ.pop(jobs.RUNS_ENV, None)
+        else:
+            os.environ[jobs.RUNS_ENV] = self._previous_runs
         self.page.shutdown()
         self.page.deleteLater()
-        self.registry.shutdown(timeout=30)
         shutil.rmtree(self.root, ignore_errors=True)
 
-    def test_real_run_produces_five_points(self):
+    def test_real_run_produces_coordinates_and_reachability(self):
         configure_small_cube(self.page)
         preview = self.page.refresh_preview()
         self.assertTrue(preview["ok"], preview.get("error"))
@@ -115,65 +93,99 @@ class RealIsoRunTest(unittest.TestCase):
         self.assertTrue(self.page.generate_button.isEnabled())
 
         started = time.monotonic()
-        job_id = self.page.start_iso()
-        self.assertTrue(job_id, "应当起任务")
-        self.assertTrue(self.page.cancel_button.isVisibleTo(self.page))
-        self.assertTrue(wait_until(
-            lambda: self.page.run_state in ("done", "failed", "cancelled")))
+        result = self.page.start_iso()
         elapsed = time.monotonic() - started
-        print(f"  [ISO 真跑] {elapsed:.2f} s（上限 {TIMEOUT:.0f} s）")
+        print(f"  [ISO 真算] {elapsed:.3f} s（上限 {TIMEOUT:.0f} s）")
+        self.assertIsNotNone(result, "应当算出结果")
+        self.assertLess(elapsed, TIMEOUT)
+        # 主线程算完，不需要任务机制：实测 10 ms 量级（远低于 300 ms 的门槛）
+        self.assertLess(elapsed, 0.3, "点击到出结果应当在 300 ms 内")
+        self.assertEqual(self.page.run_state, "done")
 
-        result = self.page.last_result or {}
-        self.assertEqual(self.page.run_state, "done", result.get("error"))
-        self.assertTrue(result.get("ok"), result.get("error"))
-        self.assertEqual(result["stats"]["total"], 5)
-        self.assertEqual(result["stats"]["solved"], 5)
-        j5_min = result["stats"]["j5_abs_min"]
-        self.assertIsNotNone(j5_min)
-        # 有值、而且是“真的算过”（不是 0 / nan）：默认模型下这组参数约 65°
-        self.assertGreater(j5_min, 0.0)
-        self.assertLess(j5_min, 90.0)
-        self.assertTrue(all(point["j5_abs"] is not None
-                            for point in result["points"]))
-        self.assertTrue(result["stats"]["config_consistent"])
+        summary = result["summary"]
+        self.assertEqual(summary, {"reachable": 5, "total": 5})
+        for row in result["points"]:
+            self.assertTrue(row["reachable"], row["name"])
+            self.assertEqual(set(row), {"name", "pos", "reachable"},
+                             "结果里不许出现关节量")
 
-        # 结果区
-        self.assertEqual(self.page.point_table.rowCount(), 5)
-        self.assertEqual(self.page.stat_labels["solved"].text(), "IK 成功 5/5")
-        self.assertNotEqual(self.page.stat_labels["j5"].text(), "|J5|min —")
-        self.assertEqual(self.page.progress_bar.value(), 1000)
+        # 结果区：5 行、可达 5/5、没有关节列
+        table = self.page.point_table
+        self.assertEqual(table.rowCount(), 5)
+        headers = [table.horizontalHeaderItem(index).text()
+                   for index in range(table.columnCount())]
+        self.assertEqual(headers, list(iso_page.POINT_HEADERS))
+        self.assertEqual(headers[-1], "可达")
+        for header in headers:
+            self.assertNotIn("q1", header)
+        self.assertEqual(self.page.stat_labels["reach"].text(), "可达 5/5")
+        self.assertNotIn("IK 成功", self.page.stat_labels["reach"].text())
 
-        # 产物：iso.json / iso.png 都在 run_dir 里
-        run_dir = Path(result["run_dir"])
-        self.assertTrue((run_dir / core.ARTIFACT_ISO_JSON).is_file())
-        self.assertTrue((run_dir / core.ARTIFACT_ISO_PLOT).is_file())
-        for key, button in self.page.export_buttons.items():
-            self.assertTrue(button.isEnabled(), f"{key} 导出按钮应当点亮")
+        # 图：立方体 + 可达点（trace 名带点数，不含关节 hover）
+        names = [str(trace.name) for trace in self.page.last_figure.data]
+        self.assertTrue(any(name.startswith("可达 5/5") for name in names), names)
 
-        # iso.json 与 scan.json 同构：5 条路点，export_gp 能直接吃
-        payload = json.loads((run_dir / core.ARTIFACT_ISO_JSON)
-                             .read_text(encoding="utf-8"))
-        self.assertEqual(len(payload["waypoints"]), 5)
-        self.assertEqual(payload["meta"]["motion"], "MOVL")
+        # 导出：物化一次，iso.json 里只有坐标 + 参考姿态
+        result = self.page.start_iso()
+        self.assertIsNotNone(result)
+        target = self.root / "iso-out.json"
+        with mock.patch.object(QtWidgets.QFileDialog, "getSaveFileName",
+                               return_value=(str(target), "")):
+            self.page._on_export("iso_json")
+        self.assertTrue(target.is_file(), self.page.status_label.text())
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(len(payload["points"]), 5)
+        self.assertEqual(payload["meta"]["point_count"], 5)
+        self.assertEqual(payload["meta"]["rpy"], [3.0, 73.0, -167.0])
+        for row in payload["points"]:
+            self.assertEqual(row["rpy"], [3.0, 73.0, -167.0])
+            self.assertNotIn("q", row)
+        self.assertNotIn("waypoints", payload)
+        self.assertNotIn("perturbed_ik", payload)
 
-        # 线程安全：没有异常逃逸，finished 在主线程发出
+        # 线程安全：没有异常逃逸（这一页连线程都不起）
         self.assertEqual(self.errors, [])
-        self.assertTrue(self.finished_threads)
-        self.assertEqual(set(self.finished_threads),
-                         {threading.main_thread().name})
-        self.assertFalse(self.bridge.is_running)
-        self.assertTrue(self.page.generate_button.isEnabled(),
-                        "任务结束后按钮要放开")
 
-    def test_validation_error_is_shown_without_starting_job(self):
-        """下界 > 上界：不起任务，报错原文红字写在卡片和状态行。"""
+    def test_numbering_is_p2p3_small_p4p5_large(self):
+        """编号回归：P2/P3 在小 X 小 Z 一侧，P4/P5 在大 X 大 Z 一侧。
+
+        真算一次 200 mm 立方体（中心 ``1000 0 600``），断言结果里的坐标就是
+        ISO 9283 的编号——这条是给“编号被悄悄翻转”准备的（旧实现把两侧对调过）。
+        """
+        configure_small_cube(self.page,
+                             bounds=(900.0, 1100.0, -100.0, 100.0,
+                                     500.0, 700.0))
+        preview = self.page.refresh_preview()
+        self.assertTrue(preview["ok"], preview.get("error"))
+        self.assertEqual(preview["center"], [1000.0, 0.0, 600.0])
+        self.assertEqual(preview["side"], 200.0)
+
+        result = self.page.start_iso()
+        self.assertIsNotNone(result)
+        points = {row["name"]: row["pos"] for row in result["points"]}
+        center = (1000.0, 600.0)
+        for name in ("P2", "P3"):
+            self.assertLess(points[name][0], center[0], name)
+            self.assertLess(points[name][2], center[1], name)
+        for name in ("P4", "P5"):
+            self.assertGreater(points[name][0], center[0], name)
+            self.assertGreater(points[name][2], center[1], name)
+        # 表里看到的也是同一份坐标（不是只对了返回的 dict）
+        table = self.page.point_table
+        self.assertEqual(table.rowCount(), 5)
+        rows = {table.item(row, 0).text(): table.item(row, 1).text()
+                for row in range(table.rowCount())}
+        self.assertEqual(rows["P2"], "900.0")
+        self.assertEqual(rows["P4"], "1100.0")
+
+    def test_validation_error_is_shown_without_computing(self):
+        """下界 > 上界：不算，报错原文红字写在卡片和状态行。"""
         self.page.fields["x0"].setValue(5000.0)
-        job_id = self.page.start_iso()
-        self.assertIsNone(job_id)
+        self.assertIsNone(self.page.start_iso())
         self.assertIn("下界必须小于上界", self.page.error_label.text())
         self.assertIn("参数不合法", self.page.status_label.text())
         self.assertIn("color:#c0392b", self.page.status_label.styleSheet())
-        self.assertFalse(self.bridge.is_running)
+        self.assertIsNone(self.page.last_result)
 
 
 if __name__ == "__main__":                              # pragma: no cover
