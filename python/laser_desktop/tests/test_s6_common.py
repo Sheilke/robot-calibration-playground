@@ -477,7 +477,17 @@ class _CountingTable(generate_page.ResultTable):
 
 
 class SegmentTableLimitTest(unittest.TestCase):
-    """5000 段：只显示 500 行、给出提示、不逐列量宽、200 ms 内出表。"""
+    """5000 段：只显示 500 行、给出提示、不逐列量宽、耗时与 500 段同量级。
+
+    这里**不写绝对毫秒阈值**。原来那条是"200 ms 内出表"，在 Linux 上 11 ms、
+    在 Windows 上 212 ms —— 同一次提交、同一份代码，差的只是机器与字体。绝对
+    阈值测的是"这台机器多快"，不是"截断有没有生效"，于是它会在下一台机器上红，
+    然后被人调大到一个同样随意的新数字。
+
+    要守的是**复杂度**：填 5000 段的时间应当与填 500 段同量级（因为都只画 500
+    行），而不是按 5000 行线性增长。另加一个很宽的绝对上限（2 s）只用来兜住
+    "真的卡死了"这种退化。
+    """
 
     @staticmethod
     def _segments(count: int):
@@ -501,7 +511,23 @@ class SegmentTableLimitTest(unittest.TestCase):
         self.assertIn(str(generate_page.SEGMENT_ROW_LIMIT), caption.text())
         self.assertEqual(table.resize_calls, 0,
                          "超过 200 行还逐列量宽（会卡住界面）")
-        self.assertLess(elapsed, 200.0, f"5000 段出表用了 {elapsed:.0f} ms")
+
+        # 同量级检查：5000 段（只画 500 行）不该比 500 段慢一个数量级。
+        small = _CountingTable(0, len(generate_page.SEGMENT_HEADERS))
+        small.setHorizontalHeaderLabels(list(generate_page.SEGMENT_HEADERS))
+        started = time.perf_counter()
+        generate_page.fill_segment_table(
+            small, self._segments(500), caption=QtWidgets.QLabel(""),
+            caption_text="段诊断表")
+        baseline = (time.perf_counter() - started) * 1000.0
+        # 比值上限给 8 倍：两次测量都在几十~几百毫秒量级，抖动本来就大；
+        # 真要按 5000 行画，比值会是 10 倍以上且绝对值上千毫秒。
+        self.assertLess(
+            elapsed, max(baseline, 5.0) * 8.0,
+            f"5000 段用了 {elapsed:.0f} ms，500 段用了 {baseline:.0f} ms —— "
+            f"截断没生效？")
+        self.assertLess(elapsed, 2000.0,
+                        f"5000 段出表用了 {elapsed:.0f} ms，慢到会卡界面")
 
     def test_small_tables_still_autofit(self):
         table = _CountingTable(0, len(generate_page.SEGMENT_HEADERS))
